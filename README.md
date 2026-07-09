@@ -1,5 +1,8 @@
 # kafka-batch-go
 
+[![CI](https://github.com/y-shashank/kafka-batch-go/actions/workflows/ci.yml/badge.svg)](https://github.com/y-shashank/kafka-batch-go/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/y-shashank/kafka-batch-go/badges/coverage.json)](https://github.com/y-shashank/kafka-batch-go/actions/workflows/ci.yml)
+
 Go implementation of [KafkaBatch](https://github.com/y-shashank/kafka-batch) — Sidekiq Pro Batches on Kafka. Install as a library in your Go services or run the bundled `kbatch` CLI.
 
 Wire-compatible with the Ruby gem: same Redis batch keys, job JSON envelope, handler manifest, schedule index, and uniq fingerprints.
@@ -170,25 +173,7 @@ kbatch worker --config config/daemon.example.yml --manifest config/kafka_batch_h
 
 ## Config
 
-Daemon and worker load `config/daemon.example.yml` (or your app copy), then **environment variables override YAML** when set:
-
-| Variable | Used by | Purpose |
-|----------|---------|---------|
-| `KAFKA_BROKERS` | client, daemon, worker | Comma-separated broker list |
-| `REDIS_URL` | client, daemon, worker | Redis URL |
-| `KAFKA_PREFIX` | all | Topic + consumer_group prefix |
-| `KAFKA_BATCH_HANDLER_MANIFEST` | all | Path to `kafka_batch_handlers.yml` |
-| `KAFKA_BATCH_SCHEDULE_MYSQL_DSN` | client, daemon | MySQL schedule index |
-| `KAFKA_BATCH_PRIORITY_CONFIG(S)` | daemon, worker | Priority YAML path(s) |
-| `KAFKA_BATCH_STORE_MYSQL_DSN` | daemon, worker | MySQL failures / pause store |
-| `KAFKA_BATCH_METRICS_*` | daemon, worker | StatsD metrics |
-| `KAFKA_BATCH_LIVENESS_*` | daemon, worker | HTTP health probes |
-
-Client library: pass `client.DefaultConfig()` (or YAML-derived values) and call `client.New(cfg)` — `ApplyEnv` runs automatically inside `New`.
-
-Daemon/worker CLI: `kbatch daemon --config path/to/daemon.yml` — `config.LoadDaemon` applies the same env overrides after YAML parse.
-
-See `config/daemon.example.yml` for the full YAML surface.
+See `config/daemon.example.yml` and `config/priority.example.yml`.
 
 ## Wire protocol
 

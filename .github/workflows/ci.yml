@@ -6,9 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: write
+
 jobs:
-  test:
-    name: Go tests
+  unit:
+    name: Unit tests
     runs-on: ubuntu-latest
 
     services:
@@ -28,18 +31,49 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version-file: go.mod
+          cache: true
 
-      - name: Run tests
-        run: go test ./...
+      - name: Run unit tests
+        run: go test ./... -coverprofile=coverage.out -covermode=atomic
+
+      - name: Read coverage %
+        id: cov
+        run: |
+          pct=$(go tool cover -func=coverage.out | awk '/^total:/ { sub(/%/, "", $3); printf "%.1f", $3 }')
+          echo "pct=$pct" >> "$GITHUB_OUTPUT"
+
+      - name: Publish coverage badge
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PCT: ${{ steps.cov.outputs.pct }}
+        run: |
+          int=${PCT%.*}
+          if   [ "$int" -ge 90 ]; then color=brightgreen
+          elif [ "$int" -ge 80 ]; then color=green
+          elif [ "$int" -ge 70 ]; then color=yellowgreen
+          elif [ "$int" -ge 60 ]; then color=yellow
+          elif [ "$int" -ge 50 ]; then color=orange
+          else color=red
+          fi
+          tmp="$(mktemp -d)"
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$PCT" "$color" > "$tmp/coverage.json"
+          cd "$tmp"
+          git init -q
+          git checkout -q -b badges
+          git add coverage.json
+          git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "ci: update coverage badge (${PCT}%)"
+          git push -q -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" badges
 
       - name: Build CLI
         run: go build -o kbatch ./cmd/kbatch
 
   integration:
-    name: Go E2E integration
+    name: Integration tests
     runs-on: ubuntu-latest
-    needs: test
+    needs: unit
 
     services:
       redis:
@@ -52,42 +86,54 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+    env:
+      KAFKA_BATCH_INTEGRATION: "1"
+      KAFKA_BATCH_TEST_BROKERS: localhost:9092
+      KAFKA_BATCH_TEST_REDIS_URL: redis://localhost:6379/15
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version-file: go.mod
+          cache: true
 
-      - name: Start Kafka
+      - name: Start Kafka (KRaft)
         run: |
           docker run -d --name kafka -p 9092:9092 \
             -e KAFKA_NODE_ID=1 \
             -e KAFKA_PROCESS_ROLES=broker,controller \
-            -e KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093 \
+            -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
             -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
             -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
             -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
             -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+            -e KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT \
             -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
             -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
             -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
             -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+            -e KAFKA_AUTO_CREATE_TOPICS_ENABLE=true \
             apache/kafka:3.7.0
-          for i in $(seq 1 30); do
-            docker exec kafka /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 && break
+
+      - name: Wait for Kafka
+        run: |
+          for i in $(seq 1 60); do
+            if docker exec kafka /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 2>/dev/null; then
+              exit 0
+            fi
             sleep 2
           done
+          echo "Kafka did not become ready in time" >&2
+          exit 1
 
       - name: Build itest binaries
         run: |
+          mkdir -p bin
           go build -o bin/kbatch-daemon-ittest ./cmd/kbatch-daemon-ittest
           go build -o bin/kbatch-worker-ittest ./cmd/kbatch-worker-ittest
 
       - name: Run E2E tests
-        env:
-          KAFKA_BATCH_INTEGRATION: "1"
-          KAFKA_BATCH_TEST_BROKERS: localhost:9092
-          KAFKA_BATCH_TEST_REDIS_URL: redis://localhost:6379/15
-        run: go test -tags=integration ./integration/e2e/ -count=1 -timeout 15m
+        run: go test -tags=integration ./integration/e2e/ -count=1 -timeout 15m -v
