@@ -1,8 +1,16 @@
 # Example kbatch daemon config (Phase 3).
 # Copy to your app as config/kbatch_daemon.yml and adjust.
 #
-# Environment overrides: KAFKA_BROKERS, KAFKA_PREFIX, REDIS_URL,
-# KAFKA_BATCH_HANDLER_MANIFEST
+# Environment overrides (applied on top of YAML when set):
+#   KAFKA_BROKERS              comma-separated broker list
+#   KAFKA_PREFIX               topic + consumer_group prefix
+#   REDIS_URL                  Redis connection URL
+#   KAFKA_BATCH_HANDLER_MANIFEST  path to kafka_batch_handlers.yml
+#   KAFKA_BATCH_SCHEDULE_MYSQL_DSN  when schedule_store is mysql
+#   KAFKA_BATCH_PRIORITY_CONFIG(S)  priority YAML path(s) — daemon/worker only
+#   KAFKA_BATCH_STORE_MYSQL_DSN     batch failures / pause MySQL — daemon/worker only
+#   KAFKA_BATCH_METRICS_*           metrics — daemon/worker only
+#   KAFKA_BATCH_LIVENESS_*          health HTTP — daemon/worker only
 
 brokers:
   - localhost:9092

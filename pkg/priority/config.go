@@ -117,6 +117,13 @@ func (c Config) WithTopics(topics []string) Config {
 	return out
 }
 
+// WithConsumerGroup returns a copy with an alternate Kafka consumer group id.
+func (c Config) WithConsumerGroup(group string) Config {
+	out := c
+	out.ConsumerGroup = group
+	return out
+}
+
 func (c Config) TopicSpecs() []TopicSpec {
 	specs := make([]TopicSpec, len(c.Topics))
 	for i, topic := range c.Topics {

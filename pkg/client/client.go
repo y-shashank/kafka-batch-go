@@ -34,6 +34,7 @@ type Client struct {
 
 // New connects to Kafka and Redis and loads the handler manifest.
 func New(cfg Config) (*Client, error) {
+	ApplyEnv(&cfg)
 	if len(cfg.Brokers) == 0 {
 		return nil, ConfigurationError{Message: "brokers are required"}
 	}

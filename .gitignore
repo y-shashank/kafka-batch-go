@@ -1,6 +1,6 @@
-# Binaries
+# Binaries (local builds / itest harnesses)
+bin/
 /kbatch
-/bin/
 
 # Test / coverage
 *.test

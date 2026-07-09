@@ -78,7 +78,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 		}
 		jobTopics = filtered
 	}
-	goPrio := goPriorityConfigs(prioReg, manifest, defaultTopic)
+	goPrio := goPriorityConfigs(cfg, prioReg, manifest, defaultTopic)
 	fairReadyTopics := workerFairReadyTopics(cfg, manifest)
 
 	if len(jobTopics) == 0 && len(fairReadyTopics) == 0 && len(goPrio) == 0 {
@@ -197,14 +197,14 @@ func fairReadyTopicNames(specs []fairReadySpec) []string {
 	return out
 }
 
-func goPriorityConfigs(reg priority.Registry, manifest config.Manifest, defaultTopic string) []priority.Config {
+func goPriorityConfigs(cfg config.Daemon, reg priority.Registry, manifest config.Manifest, defaultTopic string) []priority.Config {
 	var out []priority.Config
 	for _, pc := range reg.Configs {
 		topics := manifest.FilterTopicsForRuntime(config.RuntimeGo, pc.Topics, defaultTopic)
 		if len(topics) == 0 {
 			continue
 		}
-		out = append(out, pc.WithTopics(topics))
+		out = append(out, pc.WithTopics(topics).WithConsumerGroup(cfg.GoWorkerPriorityGroup(pc.ConsumerGroupSuffix)))
 	}
 	return out
 }
