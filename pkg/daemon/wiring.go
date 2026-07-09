@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -61,13 +62,22 @@ func BuildTenantPartitions(cfg config.Daemon, rdb *redis.Client, prod *kafkaclie
 	})
 }
 
-func StartHealthServer(ctx context.Context, cfg config.Daemon, process string) {
+func StartHealthServer(ctx context.Context, cfg config.Daemon, process string, checker health.Checker) {
 	if !cfg.LivenessEnabled {
 		return
 	}
 	go func() {
-		_ = (&health.Server{Addr: cfg.LivenessHTTPAddr, Process: process}).ListenAndServe(ctx)
+		_ = (&health.Server{Addr: cfg.LivenessHTTPAddr, Process: process, Checker: checker}).ListenAndServe(ctx)
 	}()
+}
+
+// NewConsumerHealth builds poll tracking for HTTP probes from daemon liveness settings.
+func NewConsumerHealth(cfg config.Daemon) *ConsumerHealth {
+	maxStale := cfg.LivenessTTL * 2
+	if maxStale < 60*time.Second {
+		maxStale = 60 * time.Second
+	}
+	return NewConsumerHealthTracker(maxStale, 45*time.Second)
 }
 
 func NewLivenessReporter(cfg config.Daemon, rdb *redis.Client) *liveness.Reporter {

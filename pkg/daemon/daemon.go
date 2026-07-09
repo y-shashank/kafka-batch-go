@@ -80,6 +80,9 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	}
 	rdb := redis.NewClient(rOpts)
 	defer rdb.Close()
+	if err := PingRedis(ctx, rdb); err != nil {
+		return err
+	}
 
 	st := store.NewRedisStore(rdb, cfg.BatchTTL)
 	prod, err := kafkaclient.New(cfg.Brokers)
@@ -96,12 +99,11 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	defer closeFailures()
 	live := NewLivenessReporter(cfg, rdb)
 	tenants := BuildTenantPartitions(cfg, rdb, prod)
-	StartHealthServer(ctx, cfg, "daemon")
+	consumerHealth := NewConsumerHealth(cfg)
+	StartHealthServer(ctx, cfg, "daemon", consumerHealth)
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
-	errCh := make(chan error, 8)
 
 	lagClient, err := kgo.NewClient(kgo.SeedBrokers(cfg.Brokers...))
 	if err != nil {
@@ -110,22 +112,22 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	defer lagClient.Close()
 	ingestLag := priority.NewLagReader(lagClient)
 
-	go RunConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-events", []string{cfg.EventsTopic}, func(rec *kgo.Record) error {
+	RunConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-events", []string{cfg.EventsTopic}, func(rec *kgo.Record) error {
 		reconciler.MaybeRun(ctx, cfg, st, prod)
 		_, err := eventProc.ProcessBatch(ctx, [][]byte{rec.Value})
 		return err
-	}, errCh, nil, nil)
+	}, consumerHealth, nil, nil)
 
 	retryTopics := cfg.RetryTopics()
 	if len(retryTopics) > 0 {
-		go RunConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-retry", retryTopics, func(rec *kgo.Record) error {
+		RunConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-retry", retryTopics, func(rec *kgo.Record) error {
 			src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
 			out, err := retryProc.Process(ctx, rec.Value, src)
 			if err != nil {
 				return err
 			}
 			return applyRetryOutcome(ctx, cfg, prod, out, src)
-		}, errCh, pauseCtl, live)
+		}, consumerHealth, pauseCtl, live)
 	}
 
 	if cfg.SchedulePollerEnabled {
@@ -166,9 +168,9 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	}
 
 	if cfg.FairnessEnabled {
-		wireFairLane(ctx, cfg, manifest, rdb, prod, st, failures, errCh, pauseCtl, live, ingestLag,
+		wireFairLane(ctx, cfg, manifest, rdb, prod, st, failures, consumerHealth, pauseCtl, live, ingestLag,
 			fairness.LaneTime, cfg.FairnessTimeIngest, cfg.FairnessTimeSettings())
-		wireFairLane(ctx, cfg, manifest, rdb, prod, st, failures, errCh, pauseCtl, live, ingestLag,
+		wireFairLane(ctx, cfg, manifest, rdb, prod, st, failures, consumerHealth, pauseCtl, live, ingestLag,
 			fairness.LaneThroughput, cfg.FairnessThroughputIngest, cfg.FairnessThroughputSettings())
 		log.Printf("kbatch fairness ingest dispatch enabled time=%s throughput=%s",
 			cfg.FairnessTimeIngest, cfg.FairnessThroughputIngest)
@@ -178,12 +180,8 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	if ready := os.Getenv("KBATCH_DAEMON_READY_FILE"); ready != "" {
 		_ = os.WriteFile(ready, []byte("ok\n"), 0o644)
 	}
-	select {
-	case <-ctx.Done():
-		return nil
-	case err := <-errCh:
-		return err
-	}
+	<-ctx.Done()
+	return nil
 }
 
 func wireFairLane(
@@ -194,7 +192,7 @@ func wireFairLane(
 	prod *kafkaclient.Client,
 	st *store.RedisStore,
 	failures store.FailureRecorder,
-	errCh chan<- error,
+	consumerHealth *ConsumerHealth,
 	pauseCtl pauseChecker,
 	live *liveness.Reporter,
 	ingestLag fairness.IngestLagCounter,
@@ -230,7 +228,7 @@ func wireFairLane(
 	}
 	suffix := string(lane)
 	dispatchGroup := cfg.DispatchConsumerGroup(suffix)
-	go RunConsumer(ctx, cfg.Brokers, dispatchGroup,
+	RunConsumer(ctx, cfg.Brokers, dispatchGroup,
 		[]string{ingest}, func(rec *kgo.Record) error {
 			src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
 			out, err := disp.Process(ctx, rec.Value, src)
@@ -241,7 +239,7 @@ func wireFairLane(
 				return fmt.Errorf("fair ingest backpressure lane=%s tenant=%s", lane, out.TenantID)
 			}
 			return nil
-		}, errCh, pauseCtl, live)
+		}, consumerHealth, pauseCtl, live)
 }
 
 func prefixOr(prefix, base string) string {

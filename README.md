@@ -193,6 +193,20 @@ Daemon/worker CLI: `kbatch daemon --config path/to/daemon.yml` — `config.LoadD
 
 See `config/daemon.example.yml` for the full YAML surface.
 
+## Operations (daemon / worker)
+
+**Startup:** Redis is pinged before consumers start; unreachable Redis fails fast at boot.
+
+**Consumer resilience:** Each Kafka consumer runs in a supervised loop — broker blips restart that consumer with exponential backoff (1s → 30s) instead of killing the whole process. Handler errors and panics log and skip commit (offset redelivered); panics no longer crash the pod.
+
+**Health probes:** Enable `liveness_enabled: true` (or `KAFKA_BATCH_LIVENESS_ENABLED=true`). `GET /health` and `GET /live` return **503** when any registered consumer group has not polled Kafka within `2 × liveness_ttl` (min 60s). Wire Kubernetes liveness/readiness probes to `/health` with `restartPolicy: Always` so stale consumers trigger a pod restart.
+
+```yaml
+liveness_enabled: true
+liveness_http_addr: ":8080"
+liveness_ttl: 30s
+```
+
 ## Wire protocol
 
 JSON job/event fixtures and legacy notes: `protocol/`.

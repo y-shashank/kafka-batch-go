@@ -91,6 +91,9 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	}
 	rdb := redis.NewClient(rOpts)
 	defer rdb.Close()
+	if err := daemon.PingRedis(ctx, rdb); err != nil {
+		return err
+	}
 
 	st := store.NewRedisStore(rdb, cfg.BatchTTL)
 	prod, err := kafkaclient.New(cfg.Brokers)
@@ -118,16 +121,16 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	handleJob := daemon.BuildJobHandler(cfg, prod, jobProc)
 	pauseCtl, _, closePauseCtl := daemon.BuildPauseControl(cfg, rdb)
 	defer closePauseCtl()
-	daemon.StartHealthServer(ctx, cfg, "worker")
+	consumerHealth := daemon.NewConsumerHealth(cfg)
+	daemon.StartHealthServer(ctx, cfg, "worker", consumerHealth)
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	errCh := make(chan error, 8)
 	group := cfg.ConsumerGroup + "-go-worker"
 
 	if len(jobTopics) > 0 {
-		go daemon.RunConsumer(ctx, cfg.Brokers, group+"-jobs", jobTopics, handleJob, errCh, pauseCtl, live)
+		daemon.RunConsumer(ctx, cfg.Brokers, group+"-jobs", jobTopics, handleJob, consumerHealth, pauseCtl, live)
 	}
 
 	lagClient, err := kgo.NewClient(kgo.SeedBrokers(cfg.Brokers...))
@@ -139,12 +142,12 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	for _, pc := range goPrio {
 		gate := priority.NewGate(priorityLag, cfg.PriorityLagCheckInterval)
 		gate.Consumption = pauseCtl
-		go daemon.RunPriorityGroup(ctx, cfg, pc, gate, handleJob, errCh, pauseCtl, live)
+		daemon.RunPriorityGroup(ctx, cfg, pc, gate, handleJob, consumerHealth, pauseCtl, live)
 	}
 
 	for _, spec := range fairReadyTopics {
-		go daemon.RunConsumer(ctx, cfg.Brokers, cfg.GoWorkerFairReadyGroup(spec.lane),
-			[]string{spec.topic}, handleJob, errCh, pauseCtl, live)
+		daemon.RunConsumer(ctx, cfg.Brokers, cfg.GoWorkerFairReadyGroup(spec.lane),
+			[]string{spec.topic}, handleJob, consumerHealth, pauseCtl, live)
 	}
 
 	log.Printf("kbatch go-worker running group=%s plain=%v priority_groups=%d fair_ready=%v",
@@ -153,12 +156,8 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 		_ = os.WriteFile(ready, []byte("ok\n"), 0o644)
 	}
 
-	select {
-	case <-ctx.Done():
-		return nil
-	case err := <-errCh:
-		return err
-	}
+	<-ctx.Done()
+	return nil
 }
 
 type fairReadySpec struct {

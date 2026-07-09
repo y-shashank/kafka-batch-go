@@ -71,3 +71,8 @@ retry_tiers:
   short: 30
   medium: 420
   large: 1200
+
+# HTTP health — consumer poll activity; K8s liveness/readiness should hit /health
+# liveness_enabled: true
+# liveness_http_addr: ":8080"
+# liveness_ttl: 30s

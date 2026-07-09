@@ -9,10 +9,11 @@ import (
 	"time"
 )
 
-// Server exposes a minimal HTTP liveness endpoint for Kubernetes probes.
+// Server exposes HTTP liveness/readiness endpoints for Kubernetes probes.
 type Server struct {
 	Addr    string
 	Process string
+	Checker Checker // optional — when set, /health and /live reflect consumer activity
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
@@ -20,20 +21,8 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		s.Addr = ":8080"
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"ok":      true,
-			"process": s.Process,
-		})
-	})
-	mux.HandleFunc("/live", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"ok":      true,
-			"process": s.Process,
-		})
-	})
+	mux.HandleFunc("/health", s.handleProbe)
+	mux.HandleFunc("/live", s.handleProbe)
 	srv := &http.Server{Addr: s.Addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
@@ -46,4 +35,22 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		return fmt.Errorf("health server: %w", err)
 	}
 	return nil
+}
+
+func (s *Server) handleProbe(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	ok, detail := true, ""
+	if s.Checker != nil {
+		ok, detail = s.Checker.Healthy(r.Context())
+	}
+	status := http.StatusOK
+	if !ok {
+		status = http.StatusServiceUnavailable
+	}
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":      ok,
+		"process": s.Process,
+		"detail":  detail,
+	})
 }
