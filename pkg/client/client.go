@@ -139,7 +139,8 @@ func (c *Client) CreateBatch(ctx context.Context, opts BatchOptions, populate fu
 	created, err := c.store.CreateBatch(ctx, store.CreateBatchParams{
 		ID: id, TotalJobs: 0,
 		OnSuccess: opts.OnSuccess, OnComplete: opts.OnComplete,
-		Meta: opts.Meta, Description: opts.Description,
+		Meta: opts.Meta, CallbackArgs: opts.CallbackArgs,
+		Description: opts.Description,
 		TenantID: opts.TenantID, Sealed: sealed,
 	})
 	if err != nil {
@@ -248,17 +249,13 @@ func (c *Client) lookupHandler(jobType string) (config.HandlerEntry, error) {
 }
 
 func (c *Client) produceCallback(ctx context.Context, batch *store.Batch, outcome string) error {
-	meta := map[string]interface{}{}
-	if batch.Meta != "" {
-		_ = json.Unmarshal([]byte(batch.Meta), &meta)
-	}
 	cb := protocol.CallbackMessage{
 		BatchID: batch.ID, Outcome: outcome,
 		TotalJobs: batch.TotalJobs, CompletedCount: batch.CompletedCount,
 		FailedCount: batch.FailedCount,
 		OnSuccess: batch.OnSuccess, OnComplete: batch.OnComplete,
 		FinishedAt: batch.FinishedAt,
-		Meta: meta,
+		CallbackArgs: protocol.DecodeJSONMap(batch.CallbackArgs),
 	}
 	if cb.FinishedAt == "" {
 		cb.FinishedAt = protocol.NowISO()

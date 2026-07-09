@@ -11,12 +11,13 @@ import (
 
 // BatchOptions configures batch creation.
 type BatchOptions struct {
-	ID          string
-	OnSuccess   string
-	OnComplete  string
-	Meta        map[string]interface{}
-	Description string
-	TenantID    string
+	ID           string
+	OnSuccess    string
+	OnComplete   string
+	Meta         map[string]interface{}
+	CallbackArgs map[string]interface{}
+	Description  string
+	TenantID     string
 }
 
 // PushOptions configures a single enqueue/push.

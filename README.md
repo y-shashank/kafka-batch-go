@@ -41,12 +41,31 @@ defer c.Close()
 // Standalone job (routes ruby or go runtime via manifest)
 _, _ = c.EnqueueJob(ctx, "orders.process", map[string]interface{}{"id": 1}, client.PushOptions{})
 
-// Batch
-_, _ = c.CreateBatch(ctx, client.BatchOptions{OnComplete: "MyCallback"}, func(b *client.Batch) error {
+// Batch — callback_args are passed only to on_success / on_complete handlers (not work jobs)
+_, _ = c.CreateBatch(ctx, client.BatchOptions{
+    OnComplete:   "MyCallback",
+    Meta:         map[string]interface{}{"source": "api"},              // batch metadata only
+    CallbackArgs: map[string]interface{}{"run_id": "42", "channel": "#ops"},
+}, func(b *client.Batch) error {
     _, err := b.PushJob(ctx, "orders.process", map[string]interface{}{"id": 1}, client.PushOptions{})
     return err
 })
 ```
+
+`meta` is stored on the batch hash for dashboards and APIs. `callback_args` is stored separately and included in callback job payloads / legacy callback messages — work jobs never see it.
+
+## Batches & callbacks
+
+When a batch finalizes, kafka-batch enqueues callback jobs (or legacy Ruby class callbacks) with a batch summary payload. Use `BatchOptions.CallbackArgs` for custom data your callback handler needs:
+
+```go
+kbatch.Register("import.on_complete", func(ctx *kbatch.Context) error {
+    runID := ctx.Payload["callback_args"].(map[string]interface{})["run_id"]
+    return notify(runID, ctx.Payload["failed_count"])
+})
+```
+
+Ruby Karafka `CallbackConsumer` handles legacy `on_success` / `on_complete` class strings; job-style callbacks run on your chosen Go or Ruby execution topic (same as the Ruby gem).
 
 ## Tier 2 — Control plane
 
@@ -109,10 +128,23 @@ handlers:
   orders.process:
     runtime: ruby
     worker_class: Orders::ProcessWorker
-    topic: kafka_batch.jobs
+    topic: kafka_batch.jobs.ruby
 ```
 
-One execution topic = one runtime. Fair jobs use shared **ingest** topics; forwarder routes to `.go` / `.ruby` **ready** topics.
+One execution topic = one runtime. Fair jobs use shared **ingest** topics; control forwards to `.go` / `.ruby` **ready** topics.
+
+## Go E2E integration tests
+
+Full three-tier tests (client → daemon → worker) against live Kafka + Redis:
+
+```bash
+go build -o bin/kbatch-daemon-ittest ./cmd/kbatch-daemon-ittest
+go build -o bin/kbatch-worker-ittest ./cmd/kbatch-worker-ittest
+
+export KAFKA_BATCH_INTEGRATION=1
+export KAFKA_BATCH_TEST_REDIS_URL=redis://127.0.0.1:6379/15
+go test -tags=integration ./integration/e2e/ -v -count=1
+```
 
 ## CLI
 
@@ -130,10 +162,10 @@ export KAFKA_PREFIX=dev
 export REDIS_URL=redis://localhost:6379/0
 
 # Terminal A — control
-kbatch daemon --config config/kafka_daemon.example.yml --manifest config/kafka_batch_handlers.yml
+kbatch daemon --config config/daemon.example.yml --manifest config/kafka_batch_handlers.yml
 
 # Terminal B — execution (link your handlers via kbatch.Register in worker main)
-kbatch worker --config config/kafka_daemon.example.yml --manifest config/kafka_batch_handlers.yml
+kbatch worker --config config/daemon.example.yml --manifest config/kafka_batch_handlers.yml
 ```
 
 ## Config
@@ -144,9 +176,9 @@ See `config/daemon.example.yml` and `config/priority.example.yml`.
 
 JSON job/event fixtures and legacy notes: `protocol/`.
 
-## Ruby compatibility tests
+## Ruby compatibility tests (mixed tier — deferred)
 
-Optional cross-language integration specs (Kafka + Redis + Ruby gem) live under `compat/ruby/`. See `compat/ruby/README.md`.
+Optional cross-language integration specs live under `compat/ruby/`. See `compat/ruby/README.md`.
 
 ## Related
 

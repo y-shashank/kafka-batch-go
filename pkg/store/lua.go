@@ -70,7 +70,8 @@ redis.call('HMSET', KEYS[1],
   'created_at',      ARGV[6],
   'locked_at',       ARGV[8],
   'description',     ARGV[9],
-  'tenant_id',       ARGV[10]
+  'tenant_id',       ARGV[10],
+  'callback_args',   ARGV[11]
 )
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[7]))
 return 1

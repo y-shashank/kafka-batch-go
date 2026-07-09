@@ -42,6 +42,38 @@ func TestCreateAddSealBatch(t *testing.T) {
 	}
 }
 
+func TestCreateBatchWithCallbackArgs(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := NewRedisStore(rdb, time.Hour)
+	ctx := context.Background()
+	id := "cb-args-1"
+
+	ok, err := st.CreateBatch(ctx, CreateBatchParams{
+		ID:           id,
+		Meta:         map[string]interface{}{"source": "api"},
+		CallbackArgs: map[string]interface{}{"run_id": "42", "channel": "#ops"},
+		Sealed:       true,
+	})
+	if err != nil || !ok {
+		t.Fatalf("create ok=%v err=%v", ok, err)
+	}
+
+	row, err := st.FindBatch(ctx, id)
+	if err != nil || row == nil {
+		t.Fatalf("find err=%v row=%v", err, row)
+	}
+	if row.Meta == "" {
+		t.Fatal("expected meta JSON")
+	}
+	if row.CallbackArgs == "" {
+		t.Fatal("expected callback_args JSON")
+	}
+	if mr.HGet("kafka_batch:b:"+id, "callback_args") == "" {
+		t.Fatal("redis hash missing callback_args field")
+	}
+}
+
 func TestAddJobsRejectsClosedBatch(t *testing.T) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})

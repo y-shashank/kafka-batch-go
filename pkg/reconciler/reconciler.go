@@ -180,10 +180,6 @@ func refireCallback(ctx context.Context, st *store.RedisStore, prod Producer, cf
 }
 
 func produceCallback(ctx context.Context, prod Producer, cfg config.Daemon, batch *store.Batch, outcome string, reconciled bool) bool {
-	meta := map[string]interface{}{}
-	if batch.Meta != "" {
-		_ = json.Unmarshal([]byte(batch.Meta), &meta)
-	}
 	cb := protocol.CallbackMessage{
 		BatchID:        batch.ID,
 		Outcome:        outcome,
@@ -192,9 +188,9 @@ func produceCallback(ctx context.Context, prod Producer, cfg config.Daemon, batc
 		FailedCount:    batch.FailedCount,
 		OnSuccess:      batch.OnSuccess,
 		OnComplete:     batch.OnComplete,
-		Meta:           meta,
 		FinishedAt:     batch.FinishedAt,
 		Reconciled:     reconciled,
+		CallbackArgs:   protocol.DecodeJSONMap(batch.CallbackArgs),
 	}
 	if cb.FinishedAt == "" {
 		cb.FinishedAt = protocol.NowISO()

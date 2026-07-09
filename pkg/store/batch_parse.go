@@ -8,7 +8,8 @@ func hashToBatch(h map[string]string) *Batch {
 	}
 	b := &Batch{
 		ID: h["id"], Status: h["status"], OnSuccess: h["on_success"], OnComplete: h["on_complete"],
-		Meta: h["meta"], Description: h["description"], TenantID: h["tenant_id"],
+		Meta: h["meta"], CallbackArgs: h["callback_args"],
+		Description: h["description"], TenantID: h["tenant_id"],
 		LockedAt: h["locked_at"], FinishedAt: h["finished_at"],
 	}
 	b.TotalJobs, _ = strconv.ParseInt(h["total_jobs"], 10, 64)

@@ -27,6 +27,7 @@ type Batch struct {
 	OnSuccess       string
 	OnComplete      string
 	Meta            string
+	CallbackArgs    string
 	Description     string
 	TenantID        string
 	LockedAt        string

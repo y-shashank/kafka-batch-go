@@ -12,14 +12,15 @@ import (
 
 // CreateBatchParams mirrors KafkaBatch.store.create_batch.
 type CreateBatchParams struct {
-	ID          string
-	TotalJobs   int64
-	OnSuccess   string
-	OnComplete  string
-	Meta        map[string]interface{}
-	Description string
-	TenantID    string
-	Sealed      bool
+	ID           string
+	TotalJobs    int64
+	OnSuccess    string
+	OnComplete   string
+	Meta         map[string]interface{}
+	CallbackArgs map[string]interface{}
+	Description  string
+	TenantID     string
+	Sealed       bool
 }
 
 // AddJobsResult is the outcome of reserving batch job slots.
@@ -50,6 +51,14 @@ func (s *RedisStore) CreateBatch(ctx context.Context, p CreateBatchParams) (bool
 		}
 		metaJSON = string(b)
 	}
+	callbackArgsJSON := ""
+	if p.CallbackArgs != nil {
+		b, err := json.Marshal(p.CallbackArgs)
+		if err != nil {
+			return false, err
+		}
+		callbackArgsJSON = string(b)
+	}
 	lockedAt := ""
 	if p.Sealed {
 		lockedAt = now.Format(time.RFC3339)
@@ -66,6 +75,7 @@ func (s *RedisStore) CreateBatch(ctx context.Context, p CreateBatchParams) (bool
 		lockedAt,
 		p.Description,
 		p.TenantID,
+		callbackArgsJSON,
 	).Int()
 	if err != nil {
 		return false, err

@@ -1,6 +1,21 @@
 package protocol
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
+
+// DecodeJSONMap parses a JSON object stored in Redis (empty → nil).
+func DecodeJSONMap(raw string) map[string]interface{} {
+	if raw == "" {
+		return nil
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return nil
+	}
+	return m
+}
 
 // JobMessage is the Kafka job envelope (Ruby Batch.build_message_for).
 type JobMessage struct {
@@ -46,6 +61,7 @@ type CallbackMessage struct {
 	OnSuccess      string                 `json:"on_success,omitempty"`
 	OnComplete     string                 `json:"on_complete,omitempty"`
 	Meta           map[string]interface{} `json:"meta,omitempty"`
+	CallbackArgs   map[string]interface{} `json:"callback_args,omitempty"`
 	FinishedAt     string                 `json:"finished_at"`
 	Reconciled     bool                   `json:"reconciled,omitempty"`
 }

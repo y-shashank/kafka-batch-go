@@ -69,6 +69,7 @@ func (p *Processor) ProcessBatch(ctx context.Context, rawEvents [][]byte) (Outco
 			OnSuccess:      fin.Batch.OnSuccess,
 			OnComplete:     fin.Batch.OnComplete,
 			FinishedAt:     fin.Batch.FinishedAt,
+			CallbackArgs:   protocol.DecodeJSONMap(fin.Batch.CallbackArgs),
 		}
 		out.Callbacks = append(out.Callbacks, cb)
 	}
@@ -98,6 +99,7 @@ func (p *Processor) ProcessBatch(ctx context.Context, rawEvents [][]byte) (Outco
 			OnSuccess:      batch.OnSuccess,
 			OnComplete:     batch.OnComplete,
 			FinishedAt:     batch.FinishedAt,
+			CallbackArgs:   protocol.DecodeJSONMap(batch.CallbackArgs),
 		})
 	}
 
