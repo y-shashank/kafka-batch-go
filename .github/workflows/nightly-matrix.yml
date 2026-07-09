@@ -98,4 +98,4 @@ jobs:
         env:
           KAFKA_BATCH_GEM_PATH: ${{ github.workspace }}/kafka-batch
         run: |
-          go test -tags=integration ./integration/matrix/ -run TestMatrix_Full -count=1 -timeout 45m -v
+          go test -tags=integration -p 1 ./integration/matrix/ -run TestMatrix_Full -count=1 -timeout 45m -v

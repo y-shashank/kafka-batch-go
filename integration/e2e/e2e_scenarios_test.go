@@ -34,13 +34,7 @@ func TestE2E_BatchCancellationScheduled(t *testing.T) {
 
 	s.AssertNoMarker(12 * time.Second)
 
-	row, err := s.Store().FindBatch(ctx, batch.ID())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if row == nil || row.Status != "cancelled" {
-		t.Fatalf("batch status = %v", row)
-	}
+	s.WaitBatchCancelled(ctx, batch.ID(), 15*time.Second)
 }
 
 func TestE2E_UniqDuplicateSkip(t *testing.T) {

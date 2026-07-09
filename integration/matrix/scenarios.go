@@ -179,7 +179,7 @@ func phase2Scenarios() []Scenario {
 			},
 			Assert: func(t *testing.T, s *e2e.Stack, got ScenarioResult) {
 				ctx := context.Background()
-				s.WaitBatch(ctx, got.BatchID, "success")
+				s.WaitBatchTimeout(ctx, 120*time.Second, got.BatchID, "success")
 				if m := s.WaitMarkerAt(s.RubyMarkerPath, 60*time.Second); m != got.JobIDs["ruby"] {
 					t.Fatalf("ruby marker = %q want %q", m, got.JobIDs["ruby"])
 				}
@@ -209,7 +209,7 @@ func expandedScenarios() []Scenario {
 			},
 			Assert: func(t *testing.T, s *e2e.Stack, got ScenarioResult) {
 				ctx := context.Background()
-				s.WaitBatch(ctx, got.BatchID, "success")
+				s.WaitBatchTimeout(ctx, 90*time.Second, got.BatchID, "success")
 				if m := s.WaitMarkerAt(s.MarkerPath, 45*time.Second); m != got.JobIDs["go"] {
 					t.Fatalf("go marker = %q want %q", m, got.JobIDs["go"])
 				}

@@ -165,6 +165,6 @@ jobs:
         env:
           KAFKA_BATCH_GEM_PATH: ${{ github.workspace }}/kafka-batch
         run: |
-          go test -tags=integration ./integration/e2e/ ./integration/matrix/ ./pkg/kafkaclient/ \
+          go test -tags=integration -p 1 ./integration/e2e/ ./integration/matrix/ ./pkg/kafkaclient/ \
             -run 'TestMatrix_Phase1|TestMatrix_PR|TestMatrix_Phase2|TestMatrix_Phase3|TestMatrix_Phase4|TestE2E' \
             -count=1 -timeout 35m -v

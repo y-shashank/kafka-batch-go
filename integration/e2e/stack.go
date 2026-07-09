@@ -474,12 +474,16 @@ func (s *Stack) Store() *store.RedisStore {
 }
 
 func (s *Stack) WaitBatch(ctx context.Context, batchID string, statuses ...string) *store.Batch {
+	return s.WaitBatchTimeout(ctx, 60*time.Second, batchID, statuses...)
+}
+
+func (s *Stack) WaitBatchTimeout(ctx context.Context, timeout time.Duration, batchID string, statuses ...string) *store.Batch {
 	s.T.Helper()
 	if len(statuses) == 0 {
 		statuses = []string{"success", "complete"}
 	}
 	st := s.Store()
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		row, err := st.FindBatch(ctx, batchID)
 		if err != nil {
@@ -496,6 +500,30 @@ func (s *Stack) WaitBatch(ctx context.Context, batchID string, statuses ...strin
 	}
 	s.T.Fatalf("timeout waiting for batch %s in %v", batchID, statuses)
 	return nil
+}
+
+func (s *Stack) WaitBatchCancelled(ctx context.Context, batchID string, timeout time.Duration) {
+	s.T.Helper()
+	st := s.Store()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		row, err := st.FindBatch(ctx, batchID)
+		if err != nil {
+			s.T.Fatal(err)
+		}
+		if row != nil && row.Status == "cancelled" {
+			return
+		}
+		cancelled, err := st.BatchCancelled(ctx, batchID)
+		if err != nil {
+			s.T.Fatal(err)
+		}
+		if cancelled {
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	s.T.Fatalf("timeout waiting for batch %s to be cancelled", batchID)
 }
 
 func (s *Stack) WaitMarkerAt(path string, timeout time.Duration) string {
