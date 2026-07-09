@@ -5,11 +5,11 @@ source "https://rubygems.org"
 def kafka_batch_gem_path
   ENV.fetch("KAFKA_BATCH_GEM_PATH") do
     candidates = [
-      File.expand_path("../../kafka-batch", __dir__),
-      File.expand_path("../../../kafka-batch", __dir__)
+      File.expand_path("../kafka-batch", __dir__),       # CI checkout at repo/kafka-batch
+      File.expand_path("../../../kafka-batch", __dir__)  # local sibling clone
     ]
-    found = candidates.find { |p| File.directory?(p) }
-    raise "kafka-batch gem not found — set KAFKA_BATCH_GEM_PATH" unless found
+    found = candidates.find { |p| File.directory?(File.join(p, "lib")) }
+    raise "kafka-batch gem not found — clone to ../kafka-batch or set KAFKA_BATCH_GEM_PATH" unless found
 
     found
   end

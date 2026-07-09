@@ -60,12 +60,14 @@ type Stack struct {
 	P0MarkerPath string
 	RubyMarkerPath string
 
-	daemonPID     *exec.Cmd
-	workerPID     *exec.Cmd
-	rubyWorkerPID *exec.Cmd
-	rdb           *redis.Client
-	healthAddr    string
-	rubyExecMode  bool
+	daemonPID       *exec.Cmd
+	workerPID       *exec.Cmd
+	rubyWorkerPID   *exec.Cmd
+	rubyControlPID  *exec.Cmd
+	rdb             *redis.Client
+	healthAddr      string
+	rubyExecMode    bool
+	rubyControlMode bool
 }
 
 func NewStack(t *testing.T, handlersFn func(*Stack) map[string]handlerYAML, extra func(*Stack, *daemonYAML)) *Stack {
@@ -241,16 +243,38 @@ type ExecMode struct {
 	Ruby bool
 }
 
+// StackStartOptions selects control, execution, and optional client wiring.
+type StackStartOptions struct {
+	Control ControlMode
+	Exec    ExecMode
+}
+
+// ControlMode selects Go or Ruby control plane.
+type ControlMode string
+
+const (
+	ControlGo   ControlMode = "go"
+	ControlRuby ControlMode = "ruby"
+)
+
 func (s *Stack) Start() {
-	s.StartWith(ExecMode{Go: true})
+	s.StartWithOptions(StackStartOptions{Control: ControlGo, Exec: ExecMode{Go: true}})
 }
 
 func (s *Stack) StartWith(mode ExecMode) {
-	s.T.Helper()
-	s.startControl(mode)
+	s.StartWithOptions(StackStartOptions{Control: ControlGo, Exec: mode})
 }
 
-func (s *Stack) startControl(mode ExecMode) {
+func (s *Stack) StartWithOptions(opts StackStartOptions) {
+	s.T.Helper()
+	if opts.Control == ControlRuby {
+		s.startRubyControl(opts.Exec)
+		return
+	}
+	s.startGoControl(opts.Exec)
+}
+
+func (s *Stack) startGoControl(mode ExecMode) {
 	s.T.Helper()
 	ensureItestBinaries(s.T)
 
@@ -284,6 +308,53 @@ func (s *Stack) startControl(mode ExecMode) {
 		s.workerPID.Dir = repoRoot()
 		if err := s.workerPID.Start(); err != nil {
 			s.stopDaemon()
+			s.T.Fatalf("start go worker: %v", err)
+		}
+		waitFile(s.T, readyWorker, 45*time.Second, s.workerPID.Process)
+	}
+
+	s.rubyExecMode = mode.Ruby
+}
+
+func (s *Stack) startRubyControl(mode ExecMode) {
+	s.T.Helper()
+	if !rubyItestAvailable() {
+		s.T.Skip("Ruby control unavailable (compat/ruby bundle install && kafka-batch gem)")
+	}
+	ensureItestBinaries(s.T)
+
+	readyControl := filepath.Join(s.TmpDir, "ruby_control_ready")
+	readyWorker := filepath.Join(s.TmpDir, "worker_ready")
+
+	env := os.Environ()
+	env = append(env,
+		"KBATCH_DAEMON_ITEST_MARKER="+s.MarkerPath,
+		"KBATCH_DAEMON_ITEST_MARKER_P0="+s.P0MarkerPath,
+		"KBATCH_RUBY_ITEST_MARKER="+s.RubyMarkerPath,
+		"KBATCH_RUBY_CONTROL_READY_FILE="+readyControl,
+		"KBATCH_WORKER_READY_FILE="+readyWorker,
+		"REDIS_URL="+s.Redis,
+		"KBATCH_RUBY_GEM_ROOT="+kafkaBatchGemRoot(),
+	)
+
+	cmd := rubyScriptCommand("ruby_control_ittest.rb", s.ConfigPath, s.ManifestPath)
+	cmd.Env = env
+	cmd.Dir = compatRubyRoot()
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		s.T.Fatalf("start ruby control: %v", err)
+	}
+	s.rubyControlPID = cmd
+	s.rubyControlMode = true
+	waitFile(s.T, readyControl, 60*time.Second, s.rubyControlPID.Process)
+
+	if mode.Go {
+		workerBin := itestBin("worker")
+		s.workerPID = exec.Command(workerBin, "--config", s.ConfigPath, "--manifest", s.ManifestPath)
+		s.workerPID.Env = env
+		s.workerPID.Dir = repoRoot()
+		if err := s.workerPID.Start(); err != nil {
+			s.stopRubyControl()
 			s.T.Fatalf("start go worker: %v", err)
 		}
 		waitFile(s.T, readyWorker, 45*time.Second, s.workerPID.Process)
@@ -334,10 +405,20 @@ func (s *Stack) Stop() {
 	s.T.Helper()
 	s.stopRubyWorker()
 	s.stopWorker()
+	s.stopRubyControl()
 	s.stopDaemon()
 	if s.rdb != nil {
 		_ = s.rdb.Close()
 	}
+}
+
+func (s *Stack) stopRubyControl() {
+	if s.rubyControlPID != nil && s.rubyControlPID.Process != nil {
+		_ = s.rubyControlPID.Process.Signal(syscall.SIGTERM)
+		_ = s.rubyControlPID.Wait()
+	}
+	s.rubyControlPID = nil
+	s.rubyControlMode = false
 }
 
 func (s *Stack) stopDaemon() {
@@ -648,8 +729,22 @@ func repoRoot() string {
 	return filepath.Clean(filepath.Join(filepath.Dir(file), "../.."))
 }
 
+// RepoRoot returns the kafka-batch-go repository root.
+func RepoRoot() string {
+	return repoRoot()
+}
+
 func compatRubyRoot() string {
 	return filepath.Join(repoRoot(), "compat", "ruby")
+}
+
+func rubyScriptCommand(script, configPath, manifestPath string) *exec.Cmd {
+	scriptPath := filepath.Join(compatRubyRoot(), "bin", script)
+	args := []string{scriptPath, "--config", configPath, "--manifest", manifestPath}
+	if _, err := os.Stat(filepath.Join(compatRubyRoot(), "Gemfile.lock")); err == nil {
+		return exec.Command("bundle", append([]string{"exec", "ruby"}, args...)...)
+	}
+	return exec.Command("ruby", args...)
 }
 
 func rubyDrainCommand(configPath, manifestPath string, timeout time.Duration, idleSec int) *exec.Cmd {
@@ -756,6 +851,12 @@ func applyHealthConfig(s *Stack, cfg *daemonYAML) {
 	s.healthAddr = fmt.Sprintf("127.0.0.1:%d", port)
 	cfg.LivenessEnabled = true
 	cfg.LivenessHTTPAddr = s.healthAddr
+}
+
+func applyPriorityConfig(s *Stack, cfg *daemonYAML) {
+	prioPath := writePriorityConfig(s.T, s.TmpDir, s.Suffix, s.P0Topic, s.P1Topic)
+	cfg.PriorityConfigPaths = []string{prioPath}
+	cfg.PriorityLagCheckInterval = 1
 }
 
 func freePort(t *testing.T) int {

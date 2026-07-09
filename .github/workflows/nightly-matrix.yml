@@ -1,86 +1,19 @@
-name: CI
+name: Nightly Matrix
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  schedule:
+    - cron: "0 2 * * *"
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: nightly-matrix-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: write
-
 jobs:
-  unit:
-    name: Unit tests
+  matrix-full:
+    name: Full cross-runtime matrix
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
-    services:
-      redis:
-        image: redis:7
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Run unit tests
-        run: go test ./... -coverprofile=coverage.out -covermode=atomic
-
-      - name: Read coverage %
-        id: cov
-        run: |
-          pct=$(go tool cover -func=coverage.out | awk '/^total:/ { sub(/%/, "", $3); printf "%.1f", $3 }')
-          echo "pct=$pct" >> "$GITHUB_OUTPUT"
-
-      - name: Publish coverage badge
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PCT: ${{ steps.cov.outputs.pct }}
-        run: |
-          int=${PCT%.*}
-          if   [ "$int" -ge 90 ]; then color=brightgreen
-          elif [ "$int" -ge 80 ]; then color=green
-          elif [ "$int" -ge 70 ]; then color=yellowgreen
-          elif [ "$int" -ge 60 ]; then color=yellow
-          elif [ "$int" -ge 50 ]; then color=orange
-          else color=red
-          fi
-          tmp="$(mktemp -d)"
-          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$PCT" "$color" > "$tmp/coverage.json"
-          cd "$tmp"
-          git init -q
-          git checkout -q -b badges
-          git add coverage.json
-          git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" \
-              commit -q -m "ci: update coverage badge (${PCT}%)"
-          git push -q -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" badges
-
-      - name: Build CLI
-        run: go build -o kbatch ./cmd/kbatch
-
-  integration:
-    name: Integration tests
-    runs-on: ubuntu-latest
-    needs: unit
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     services:
       redis:
@@ -161,10 +94,8 @@ jobs:
           go build -o bin/kbatch-daemon-ittest ./cmd/kbatch-daemon-ittest
           go build -o bin/kbatch-worker-ittest ./cmd/kbatch-worker-ittest
 
-      - name: Run E2E tests
+      - name: Run full matrix
         env:
           KAFKA_BATCH_GEM_PATH: ${{ github.workspace }}/kafka-batch
         run: |
-          go test -tags=integration ./integration/e2e/ ./integration/matrix/ ./pkg/kafkaclient/ \
-            -run 'TestMatrix_Phase1|TestMatrix_PR|TestMatrix_Phase2|TestMatrix_Phase3|TestMatrix_Phase4|TestE2E' \
-            -count=1 -timeout 35m -v
+          go test -tags=integration ./integration/matrix/ -run TestMatrix_Full -count=1 -timeout 45m -v

@@ -9,3 +9,6 @@ coverage.out
 
 # Ruby compat runtime logs
 compat/ruby/log/
+
+# Local kafka-batch gem symlink (CI checks out to this path)
+/kafka-batch

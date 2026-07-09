@@ -23,6 +23,16 @@ func ApplyScheduleConfig(s *Stack, cfg *DaemonYAML) {
 	applyScheduleConfig(s, cfg)
 }
 
+// ApplyPriorityConfig enables priority routing on a daemon config.
+func ApplyPriorityConfig(s *Stack, cfg *DaemonYAML) {
+	applyPriorityConfig(s, cfg)
+}
+
+// PriorityHandlersStack returns handlers with P0/P1 topics configured.
+func PriorityHandlersStack(s *Stack) map[string]HandlerYAML {
+	return priorityHandlersForStack(s)
+}
+
 // KafkaBatchGemRoot returns the path to the kafka-batch Ruby gem for itest workers.
 func KafkaBatchGemRoot() string {
 	return kafkaBatchGemRoot()

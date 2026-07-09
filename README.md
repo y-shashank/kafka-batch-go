@@ -136,23 +136,26 @@ handlers:
 
 One execution topic = one runtime. Fair jobs use shared **ingest** topics; control forwards to `.go` / `.ruby` **ready** topics.
 
-## Cross-runtime matrix tests (Phase 1)
+## Cross-runtime matrix tests
 
 Go client + Go control + mixed Go/Ruby execution against live Kafka/Redis:
 
 ```bash
-# Requires kafka-batch gem sibling clone and Ruby bundle:
 cd compat/ruby && bundle install
 
 export KAFKA_BATCH_INTEGRATION=1
-go test -tags=integration ./integration/matrix/ -count=1 -timeout 20m -v
+go test -tags=integration ./integration/matrix/ -count=1 -timeout 45m -v
 ```
 
-Phase 1 matrix (CI): `go_control_go_exec`, `go_control_ruby_exec`, `go_control_go_and_ruby_exec` × batch completion (go/ruby), mixed batch.
+| Phase | Test | Combos |
+|-------|------|--------|
+| 1 / PR | `TestMatrix_Phase1`, `TestMatrix_PR` | Go client + Go control × Go/Ruby/mixed exec |
+| 2 | `TestMatrix_Phase2_RubyFairAndRetry` | Fair + retry through Ruby JobConsumer |
+| 3 | `TestMatrix_Phase3_RubyClient` | Ruby client + Go control |
+| 4 | `TestMatrix_Phase4_RubyControl` | Ruby Karafka control + Go/Ruby exec |
+| Nightly | `TestMatrix_Full` | All combos × all scenarios (`.github/workflows/nightly-matrix.yml`) |
 
-Phase 2 (local, optional): `TestMatrix_Phase2_RubyFairAndRetry` — fair routing + retry through Ruby JobConsumer.
-
-Set `KAFKA_BATCH_GEM_PATH` or clone [kafka-batch](https://github.com/y-shashank/kafka-batch) as `../kafka-batch`.
+Set `KAFKA_BATCH_GEM_PATH` or clone [kafka-batch](https://github.com/y-shashank/kafka-batch) as `kafka-batch/` in this repo (or sibling `../kafka-batch` locally).
 
 ## Go E2E integration tests
 
