@@ -52,6 +52,54 @@ module KafkaBatchSpec
       stop_daemon!
     end
 
+    def daemon_binary
+      ENV.fetch("KBATCH_DAEMON_ITEST_BIN") do
+        File.expand_path("../../../../bin/kbatch-daemon-ittest", __dir__)
+      end
+    end
+
+    def start_daemon!
+      @ready_path = File.join(@tmpdir, "daemon_ready") unless defined?(@ready_path) && @ready_path
+      env = ENV.to_h.merge(
+        "KBATCH_DAEMON_ITEST_MARKER" => @marker_path,
+        "KBATCH_DAEMON_READY_FILE" => @ready_path,
+        "REDIS_URL" => KafkaBatchSpec::RedisHelper::TEST_URL,
+        "KAFKA_PREFIX" => ""
+      )
+      cmd = if File.executable?(daemon_binary)
+              [daemon_binary, "--config", @config_path, "--manifest", @manifest_path]
+            else
+              ["go", "run", "./cmd/kbatch-daemon-ittest", "--config", @config_path, "--manifest", @manifest_path]
+            end
+      @daemon_pid = Process.spawn(env, *cmd, chdir: go_repo_root,
+                                  out: File::NULL, err: File.join(@tmpdir, "daemon.err"))
+      wait_for_daemon!
+    end
+
+    def wait_for_daemon!(timeout: 30)
+      deadline = Time.now + timeout
+      while Time.now < deadline
+        return if File.exist?(@ready_path)
+        Process.kill(0, @daemon_pid)
+        sleep 0.2
+      end
+      err = File.exist?(File.join(@tmpdir, "daemon.err")) ? File.read(File.join(@tmpdir, "daemon.err")) : ""
+      raise "daemon did not become ready within #{timeout}s\n#{err}"
+    rescue Errno::ESRCH
+      raise "daemon process died during startup"
+    end
+
+    def stop_daemon!
+      return unless @daemon_pid
+
+      Process.kill("TERM", @daemon_pid)
+      Timeout.timeout(5) { Process.wait(@daemon_pid) }
+    rescue Errno::ESRCH, Timeout::Error
+      Process.kill("KILL", @daemon_pid) rescue nil
+    ensure
+      @daemon_pid = nil
+    end
+
     def start_go_worker!
       @worker_ready_path = File.join(@tmpdir, "worker_ready")
       env = ENV.to_h.merge(

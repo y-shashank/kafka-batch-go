@@ -1,0 +1,30 @@
+# Shared handler manifest (Ruby kafka-batch gem + kafka-batch-go).
+# One Kafka topic = one runtime. Fair jobs use shared ingest; control forwards to .go / .ruby ready.
+
+handlers:
+  segment.export:
+    runtime: go
+    topic: segment.exports
+    max_retries: 5
+
+  orders.process:
+    runtime: ruby
+    worker_class: Orders::ProcessWorker
+    topic: kafka_batch.jobs.ruby
+
+  campaigns.dispatch:
+    runtime: go
+    topic: campaigns.jobs
+    fairness_type: time
+    max_retries: 3
+
+  segments.recompute:
+    runtime: ruby
+    worker_class: Segments::RecomputeWorker
+    topic: kafka_batch.jobs.ruby
+    fairness_type: time
+
+  bulk.export:
+    runtime: go
+    topic: bulk.exports
+    fairness_type: throughput

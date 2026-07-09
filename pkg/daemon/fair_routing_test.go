@@ -9,7 +9,8 @@ import (
 func TestFairReadyResolver(t *testing.T) {
 	manifest := config.Manifest{
 		Handlers: map[string]config.HandlerEntry{
-			"job.go": {Runtime: "go"},
+			"job.go":   {Runtime: "go"},
+			"job.ruby": {Runtime: "ruby"},
 		},
 	}
 	cfg := config.DefaultDaemon()
@@ -23,5 +24,13 @@ func TestFairReadyResolver(t *testing.T) {
 	}
 	if topic != "ready.go" {
 		t.Fatalf("topic = %q", topic)
+	}
+
+	topic, err = resolve([]byte(`{"job_type":"job.ruby"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if topic != "ready.ruby" {
+		t.Fatalf("ruby topic = %q", topic)
 	}
 }

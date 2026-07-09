@@ -35,3 +35,59 @@ jobs:
 
       - name: Build CLI
         run: go build -o kbatch ./cmd/kbatch
+
+  integration:
+    name: Go E2E integration
+    runs-on: ubuntu-latest
+    needs: test
+
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Start Kafka
+        run: |
+          docker run -d --name kafka -p 9092:9092 \
+            -e KAFKA_NODE_ID=1 \
+            -e KAFKA_PROCESS_ROLES=broker,controller \
+            -e KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093 \
+            -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+            -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+            -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+            -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+            -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+            -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+            apache/kafka:3.7.0
+          for i in $(seq 1 30); do
+            docker exec kafka /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 && break
+            sleep 2
+          done
+
+      - name: Build itest binaries
+        run: |
+          go build -o bin/kbatch-daemon-ittest ./cmd/kbatch-daemon-ittest
+          go build -o bin/kbatch-worker-ittest ./cmd/kbatch-worker-ittest
+
+      - name: Run E2E tests
+        env:
+          KAFKA_BATCH_INTEGRATION: "1"
+          KAFKA_BATCH_TEST_BROKERS: localhost:9092
+          KAFKA_BATCH_TEST_REDIS_URL: redis://localhost:6379/15
+        run: go test -tags=integration ./integration/e2e/ -count=1 -timeout 15m

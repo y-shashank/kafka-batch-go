@@ -603,25 +603,32 @@ func (m Manifest) HasGoHandlers() bool {
 	return false
 }
 
-func (m Manifest) Validate(defaultTopic string) error {
-	if err := m.ValidateTopicRuntimeExclusivity(defaultTopic); err != nil {
-		return err
-	}
+// ValidateRouting checks manifest shape and topic/runtime exclusivity.
+// Safe for client and control tiers (no local handler registration required).
+func (m Manifest) ValidateRouting(defaultTopic string) error {
+	return m.ValidateTopicRuntimeExclusivity(defaultTopic)
+}
+
+// ValidateGoHandlersRegistered ensures runtime:go handlers are registered via kbatch.Register.
+// Call from the execution tier (kbatch worker) only.
+func (m Manifest) ValidateGoHandlersRegistered() error {
 	for jobType, h := range m.Handlers {
-		switch strings.ToLower(strings.TrimSpace(h.Runtime)) {
-		case "go":
-			if _, ok := lookupRegistered(jobType); !ok {
-				return fmt.Errorf("handler %q not registered in Go (missing kbatch.Register)", jobType)
-			}
-		case "ruby":
-			// Ruby handlers execute via worker-server socket (Phase 4).
-		case "":
-			return fmt.Errorf("handler %q missing runtime", jobType)
-		default:
-			return fmt.Errorf("handler %q has unsupported runtime %q", jobType, h.Runtime)
+		if strings.ToLower(strings.TrimSpace(h.Runtime)) != RuntimeGo {
+			continue
+		}
+		if _, ok := lookupRegistered(jobType); !ok {
+			return fmt.Errorf("handler %q not registered in Go (missing kbatch.Register)", jobType)
 		}
 	}
 	return nil
+}
+
+// Validate runs routing checks plus Go handler registration (execution tier).
+func (m Manifest) Validate(defaultTopic string) error {
+	if err := m.ValidateRouting(defaultTopic); err != nil {
+		return err
+	}
+	return m.ValidateGoHandlersRegistered()
 }
 
 // lookupRegistered is set by manifest package init from kbatch package.

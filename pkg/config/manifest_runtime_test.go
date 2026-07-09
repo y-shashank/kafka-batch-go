@@ -80,3 +80,38 @@ func TestRuntimeFor(t *testing.T) {
 		t.Fatalf("runtime = %q", got)
 	}
 }
+
+func TestValidateGoHandlersRegistered(t *testing.T) {
+	SetHandlerLookup(func(s string) bool { return s == "registered.go" })
+	defer SetHandlerLookup(func(string) bool { return true })
+
+	m := Manifest{
+		Handlers: map[string]HandlerEntry{
+			"registered.go": {Runtime: "go"},
+			"ruby.job":      {Runtime: "ruby"},
+		},
+	}
+	if err := m.ValidateGoHandlersRegistered(); err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+
+	m.Handlers["missing.go"] = HandlerEntry{Runtime: "go"}
+	if err := m.ValidateGoHandlersRegistered(); err == nil {
+		t.Fatal("expected missing handler error")
+	}
+}
+
+func TestValidateRoutingWithoutRegistration(t *testing.T) {
+	SetHandlerLookup(func(string) bool { return false })
+	defer SetHandlerLookup(func(string) bool { return true })
+
+	m := Manifest{
+		Handlers: map[string]HandlerEntry{
+			"go.job":   {Runtime: "go", Topic: "go.jobs"},
+			"ruby.job": {Runtime: "ruby", Topic: "ruby.jobs"},
+		},
+	}
+	if err := m.ValidateRouting("default.jobs"); err != nil {
+		t.Fatalf("routing should not require registration: %v", err)
+	}
+}

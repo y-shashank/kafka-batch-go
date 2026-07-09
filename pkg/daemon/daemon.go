@@ -19,7 +19,6 @@ import (
 	"github.com/y-shashank/kafka-batch-go/pkg/fairness"
 	"github.com/y-shashank/kafka-batch-go/pkg/jobexpiry"
 	"github.com/y-shashank/kafka-batch-go/pkg/kafkaclient"
-	"github.com/y-shashank/kafka-batch-go/pkg/kbatch"
 	"github.com/y-shashank/kafka-batch-go/pkg/liveness"
 	"github.com/y-shashank/kafka-batch-go/pkg/metrics"
 	"github.com/y-shashank/kafka-batch-go/pkg/priority"
@@ -43,9 +42,8 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	if err != nil {
 		return err
 	}
-	config.SetHandlerLookup(func(jt string) bool { _, ok := kbatch.Lookup(jt); return ok })
 	defaultTopic := prefixOr(cfg.TopicPrefix, "") + "kafka_batch.jobs"
-	if err := manifest.Validate(defaultTopic); err != nil {
+	if err := manifest.ValidateRouting(defaultTopic); err != nil {
 		return err
 	}
 	if err := cfg.ValidateFairReadySplit(manifest); err != nil {

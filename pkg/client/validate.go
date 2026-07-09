@@ -14,10 +14,7 @@ func (c *Client) validateManifest() error {
 		return ConfigurationError{Message: "handler manifest has no handlers"}
 	}
 	defaultTopic := c.cfg.defaultJobsTopic()
-	if err := c.manifest.Validate(defaultTopic); err != nil {
-		return fmt.Errorf("manifest: %w", err)
-	}
-	if err := c.manifest.ValidateTopicRuntimeExclusivity(defaultTopic); err != nil {
+	if err := c.manifest.ValidateRouting(defaultTopic); err != nil {
 		return fmt.Errorf("manifest: %w", err)
 	}
 	return nil
