@@ -141,13 +141,12 @@ One execution topic = one runtime. Fair jobs use shared **ingest** topics; contr
 Full three-tier tests (client → daemon → worker) against live Kafka + Redis:
 
 ```bash
-go build -o bin/kbatch-daemon-ittest ./cmd/kbatch-daemon-ittest
-go build -o bin/kbatch-worker-ittest ./cmd/kbatch-worker-ittest
-
 export KAFKA_BATCH_INTEGRATION=1
 export KAFKA_BATCH_TEST_REDIS_URL=redis://127.0.0.1:6379/15
-go test -tags=integration ./integration/e2e/ -v -count=1
+go test -tags=integration ./integration/e2e/ ./pkg/kafkaclient/ -v -count=1
 ```
+
+Itest daemon/worker binaries are built automatically on first run (or pre-build with `go build -o bin/kbatch-daemon-ittest ./cmd/kbatch-daemon-ittest` and `go build -o bin/kbatch-worker-ittest ./cmd/kbatch-worker-ittest`).
 
 ## CLI
 

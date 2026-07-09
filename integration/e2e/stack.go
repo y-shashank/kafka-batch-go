@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -232,6 +233,8 @@ func (s *Stack) flushRedis() {
 
 func (s *Stack) Start() {
 	s.T.Helper()
+	ensureItestBinaries(s.T)
+
 	readyDaemon := filepath.Join(s.TmpDir, "daemon_ready")
 	readyWorker := filepath.Join(s.TmpDir, "worker_ready")
 
@@ -529,6 +532,37 @@ func itestBin(role string) string {
 		return p
 	}
 	return filepath.Join(repoRoot(), "bin", "kbatch-"+role+"-ittest")
+}
+
+var (
+	itestBuildOnce sync.Once
+	itestBuildErr  error
+)
+
+func ensureItestBinaries(t *testing.T) {
+	t.Helper()
+	itestBuildOnce.Do(func() {
+		root := repoRoot()
+		for _, role := range []string{"daemon", "worker"} {
+			path := itestBin(role)
+			if _, err := os.Stat(path); err == nil {
+				continue
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				itestBuildErr = err
+				return
+			}
+			cmd := exec.Command("go", "build", "-o", path, "./cmd/kbatch-"+role+"-ittest")
+			cmd.Dir = root
+			if out, err := cmd.CombinedOutput(); err != nil {
+				itestBuildErr = fmt.Errorf("build kbatch-%s-ittest: %w\n%s", role, err, strings.TrimSpace(string(out)))
+				return
+			}
+		}
+	})
+	if itestBuildErr != nil {
+		t.Fatal(itestBuildErr)
+	}
 }
 
 func repoRoot() string {
