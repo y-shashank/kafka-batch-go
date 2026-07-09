@@ -136,6 +136,21 @@ jobs:
           echo "Kafka did not become ready in time" >&2
           exit 1
 
+      - name: Checkout kafka-batch gem
+        uses: actions/checkout@v4
+        with:
+          repository: y-shashank/kafka-batch
+          path: kafka-batch
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: compat/ruby
+        env:
+          KAFKA_BATCH_GEM_PATH: ${{ github.workspace }}/kafka-batch
+
       - name: Build itest binaries
         run: |
           mkdir -p bin
@@ -144,4 +159,4 @@ jobs:
 
       - name: Run E2E tests
         run: |
-          go test -tags=integration ./integration/e2e/ ./pkg/kafkaclient/ -count=1 -timeout 15m -v
+          go test -tags=integration ./integration/e2e/ ./integration/matrix/ ./pkg/kafkaclient/ -count=1 -timeout 20m -v

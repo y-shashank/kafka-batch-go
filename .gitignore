@@ -1,7 +1,11 @@
 # Binaries (local builds / itest harnesses)
 bin/
+!compat/ruby/bin/
 /kbatch
 
 # Test / coverage
 *.test
 coverage.out
+
+# Ruby compat runtime logs
+compat/ruby/log/

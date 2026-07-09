@@ -136,6 +136,24 @@ handlers:
 
 One execution topic = one runtime. Fair jobs use shared **ingest** topics; control forwards to `.go` / `.ruby` **ready** topics.
 
+## Cross-runtime matrix tests (Phase 1)
+
+Go client + Go control + mixed Go/Ruby execution against live Kafka/Redis:
+
+```bash
+# Requires kafka-batch gem sibling clone and Ruby bundle:
+cd compat/ruby && bundle install
+
+export KAFKA_BATCH_INTEGRATION=1
+go test -tags=integration ./integration/matrix/ -count=1 -timeout 20m -v
+```
+
+Phase 1 matrix (CI): `go_control_go_exec`, `go_control_ruby_exec`, `go_control_go_and_ruby_exec` × batch completion (go/ruby), mixed batch.
+
+Phase 2 (local, optional): `TestMatrix_Phase2_RubyFairAndRetry` — fair routing + retry through Ruby JobConsumer.
+
+Set `KAFKA_BATCH_GEM_PATH` or clone [kafka-batch](https://github.com/y-shashank/kafka-batch) as `../kafka-batch`.
+
 ## Go E2E integration tests
 
 Full three-tier tests (client → daemon → worker) against live Kafka + Redis:

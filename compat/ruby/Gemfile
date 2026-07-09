@@ -1,0 +1,25 @@
+# frozen_string_literal: true
+
+source "https://rubygems.org"
+
+def kafka_batch_gem_path
+  ENV.fetch("KAFKA_BATCH_GEM_PATH") do
+    candidates = [
+      File.expand_path("../../kafka-batch", __dir__),
+      File.expand_path("../../../kafka-batch", __dir__)
+    ]
+    found = candidates.find { |p| File.directory?(p) }
+    raise "kafka-batch gem not found — set KAFKA_BATCH_GEM_PATH" unless found
+
+    found
+  end
+end
+
+gem "kafka-batch", path: kafka_batch_gem_path
+gem "activerecord", ">= 6.0"
+gem "railties", ">= 6.0"
+gem "sqlite3"
+gem "oj"
+gem "redis"
+gem "karafka", ">= 2.0"
+gem "waterdrop"

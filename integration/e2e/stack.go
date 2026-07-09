@@ -58,11 +58,14 @@ type Stack struct {
 	ConfigPath   string
 	MarkerPath   string
 	P0MarkerPath string
+	RubyMarkerPath string
 
-	daemonPID  *exec.Cmd
-	workerPID  *exec.Cmd
-	rdb        *redis.Client
-	healthAddr string
+	daemonPID     *exec.Cmd
+	workerPID     *exec.Cmd
+	rubyWorkerPID *exec.Cmd
+	rdb           *redis.Client
+	healthAddr    string
+	rubyExecMode  bool
 }
 
 func NewStack(t *testing.T, handlersFn func(*Stack) map[string]handlerYAML, extra func(*Stack, *daemonYAML)) *Stack {
@@ -104,8 +107,9 @@ func NewStack(t *testing.T, handlersFn func(*Stack) map[string]handlerYAML, extr
 		P0Topic: "kb.e2e.p0." + suffix,
 		P1Topic: "kb.e2e.p1." + suffix,
 
-		MarkerPath:   filepath.Join(tmp, "marker"),
-		P0MarkerPath: filepath.Join(tmp, "marker_p0"),
+		MarkerPath:     filepath.Join(tmp, "marker"),
+		P0MarkerPath:   filepath.Join(tmp, "marker_p0"),
+		RubyMarkerPath: filepath.Join(tmp, "marker_ruby"),
 	}
 	s.writeManifest(handlersFn(s))
 	s.writeConfig(extra)
@@ -231,7 +235,22 @@ func (s *Stack) flushRedis() {
 	}
 }
 
+// ExecMode selects which execution tiers to start alongside control.
+type ExecMode struct {
+	Go   bool
+	Ruby bool
+}
+
 func (s *Stack) Start() {
+	s.StartWith(ExecMode{Go: true})
+}
+
+func (s *Stack) StartWith(mode ExecMode) {
+	s.T.Helper()
+	s.startControl(mode)
+}
+
+func (s *Stack) startControl(mode ExecMode) {
 	s.T.Helper()
 	ensureItestBinaries(s.T)
 
@@ -245,32 +264,75 @@ func (s *Stack) Start() {
 		"KBATCH_DAEMON_ITEST_MARKER_TP="+s.MarkerPath,
 		"KBATCH_DAEMON_READY_FILE="+readyDaemon,
 		"KBATCH_WORKER_READY_FILE="+readyWorker,
+		"KBATCH_RUBY_ITEST_MARKER="+s.RubyMarkerPath,
+		"REDIS_URL="+s.Redis,
 	)
 
 	daemonBin := itestBin("daemon")
-	workerBin := itestBin("worker")
-
 	s.daemonPID = exec.Command(daemonBin, "--config", s.ConfigPath, "--manifest", s.ManifestPath)
 	s.daemonPID.Env = env
 	s.daemonPID.Dir = repoRoot()
 	if err := s.daemonPID.Start(); err != nil {
 		s.T.Fatalf("start daemon: %v", err)
 	}
+	waitFile(s.T, readyDaemon, 45*time.Second, s.daemonPID.Process)
 
-	s.workerPID = exec.Command(workerBin, "--config", s.ConfigPath, "--manifest", s.ManifestPath)
-	s.workerPID.Env = env
-	s.workerPID.Dir = repoRoot()
-	if err := s.workerPID.Start(); err != nil {
-		s.stopDaemon()
-		s.T.Fatalf("start worker: %v", err)
+	if mode.Go {
+		workerBin := itestBin("worker")
+		s.workerPID = exec.Command(workerBin, "--config", s.ConfigPath, "--manifest", s.ManifestPath)
+		s.workerPID.Env = env
+		s.workerPID.Dir = repoRoot()
+		if err := s.workerPID.Start(); err != nil {
+			s.stopDaemon()
+			s.T.Fatalf("start go worker: %v", err)
+		}
+		waitFile(s.T, readyWorker, 45*time.Second, s.workerPID.Process)
 	}
 
-	waitFile(s.T, readyDaemon, 45*time.Second, s.daemonPID.Process)
-	waitFile(s.T, readyWorker, 45*time.Second, s.workerPID.Process)
+	s.rubyExecMode = mode.Ruby
+}
+
+// DrainRubyExecution runs the Ruby JobConsumer drain loop (for matrix tests).
+// Optional topics limits consumption (e.g. fair ready.ruby only).
+func (s *Stack) DrainRubyExecution(timeout time.Duration, topics ...string) {
+	s.T.Helper()
+	if !s.rubyExecMode {
+		return
+	}
+	if !rubyItestAvailable() {
+		s.T.Skip("Ruby drain unavailable (compat/ruby bundle install && kafka-batch gem)")
+	}
+	idle := 3
+	if timeout >= 90*time.Second {
+		idle = 50 // cover Ruby default retry delay + Go retry consumer re-enqueue
+	}
+	if timeout >= 120*time.Second {
+		idle = 55
+	}
+	cmd := rubyDrainCommand(s.ConfigPath, s.ManifestPath, timeout, idle)
+	env := append(os.Environ(),
+		"REDIS_URL="+s.Redis,
+		"KBATCH_RUBY_GEM_ROOT="+kafkaBatchGemRoot(),
+		"KBATCH_RUBY_ITEST_MARKER="+s.RubyMarkerPath,
+	)
+	if len(topics) > 0 {
+		env = append(env, "KBATCH_RUBY_DRAIN_TOPICS="+strings.Join(topics, ","))
+	}
+	cmd.Env = env
+	cmd.Dir = compatRubyRoot()
+	out, err := cmd.CombinedOutput()
+	outStr := strings.TrimSpace(string(out))
+	if outStr != "" {
+		s.T.Logf("ruby drain:\n%s", outStr)
+	}
+	if err != nil {
+		s.T.Fatalf("ruby drain: %v", err)
+	}
 }
 
 func (s *Stack) Stop() {
 	s.T.Helper()
+	s.stopRubyWorker()
 	s.stopWorker()
 	s.stopDaemon()
 	if s.rdb != nil {
@@ -290,6 +352,15 @@ func (s *Stack) stopWorker() {
 		_ = s.workerPID.Process.Signal(syscall.SIGTERM)
 		_ = s.workerPID.Wait()
 	}
+	s.workerPID = nil
+}
+
+func (s *Stack) stopRubyWorker() {
+	if s.rubyWorkerPID != nil && s.rubyWorkerPID.Process != nil {
+		_ = s.rubyWorkerPID.Process.Signal(syscall.SIGTERM)
+		_ = s.rubyWorkerPID.Wait()
+	}
+	s.rubyWorkerPID = nil
 }
 
 func (s *Stack) NewClient() *client.Client {
@@ -476,10 +547,17 @@ func baseHandlers(workerTopic string) map[string]handlerYAML {
 			Runtime: "go", Topic: "", MaxRetries: 1,
 		},
 		"integration.ruby_plain": {
-			Runtime: "ruby", Topic: workerTopic + ".ruby", WorkerClass: "RubyPlainWorker",
+			Runtime: "ruby", Topic: workerTopic + ".ruby", WorkerClass: "RubyPlainWorker", ApplyTopicPrefix: false,
 		},
 		"integration.ruby_fair": {
 			Runtime: "ruby", FairnessType: "time", WorkerClass: "RubyFairWorker",
+		},
+		"integration.ruby_retry_once": {
+			Runtime: "ruby", Topic: workerTopic + ".ruby", WorkerClass: "RubyRetryOnceWorker", ApplyTopicPrefix: false, MaxRetries: 2,
+		},
+		"integration.ruby_always_fail": {
+			Runtime: "ruby", Topic: workerTopic + ".ruby", WorkerClass: "RubyAlwaysFailWorker", ApplyTopicPrefix: false,
+			MaxRetries: 1, CompleteAfterRetries: 1,
 		},
 	}
 }
@@ -568,6 +646,61 @@ func ensureItestBinaries(t *testing.T) {
 func repoRoot() string {
 	_, file, _, _ := runtime.Caller(0)
 	return filepath.Clean(filepath.Join(filepath.Dir(file), "../.."))
+}
+
+func compatRubyRoot() string {
+	return filepath.Join(repoRoot(), "compat", "ruby")
+}
+
+func rubyDrainCommand(configPath, manifestPath string, timeout time.Duration, idleSec int) *exec.Cmd {
+	sec := int(timeout.Seconds())
+	if sec < 1 {
+		sec = 1
+	}
+	script := filepath.Join(compatRubyRoot(), "bin", "ruby_drain.rb")
+	args := []string{script, "--config", configPath, "--manifest", manifestPath,
+		"--timeout", fmt.Sprintf("%d", sec), "--idle", fmt.Sprintf("%d", idleSec)}
+	if _, err := os.Stat(filepath.Join(compatRubyRoot(), "Gemfile.lock")); err == nil {
+		return exec.Command("bundle", append([]string{"exec", "ruby"}, args...)...)
+	}
+	return exec.Command("ruby", args...)
+}
+
+func rubyItestAvailable() bool {
+	if os.Getenv("KBATCH_RUBY_WORKER_ITEST_BIN") != "" {
+		return true
+	}
+	script := filepath.Join(compatRubyRoot(), "bin", "ruby_worker_ittest.rb")
+	if _, err := os.Stat(script); err != nil {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(kafkaBatchGemRoot(), "lib", "kafka_batch.rb")); err != nil {
+		return false
+	}
+	if _, err := exec.LookPath("ruby"); err != nil {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(compatRubyRoot(), "Gemfile.lock")); err == nil {
+		cmd := exec.Command("bundle", "check", "--dry-run")
+		cmd.Dir = compatRubyRoot()
+		return cmd.Run() == nil
+	}
+	return true
+}
+
+func kafkaBatchGemRoot() string {
+	if v := os.Getenv("KBATCH_RUBY_GEM_ROOT"); v != "" {
+		return v
+	}
+	for _, p := range []string{
+		filepath.Join(repoRoot(), "kafka-batch"),
+		filepath.Join(repoRoot(), "..", "kafka-batch"),
+	} {
+		if _, err := os.Stat(filepath.Join(p, "lib", "kafka_batch.rb")); err == nil {
+			return p
+		}
+	}
+	return filepath.Join(repoRoot(), "..", "kafka-batch")
 }
 
 func waitFile(t *testing.T, path string, timeout time.Duration, proc *os.Process) {
