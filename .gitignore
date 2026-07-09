@@ -1,0 +1,7 @@
+# Binaries
+/kbatch
+/bin/
+
+# Test / coverage
+*.test
+coverage.out
