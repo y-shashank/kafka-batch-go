@@ -5,6 +5,10 @@ package e2e
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -54,9 +58,10 @@ type Stack struct {
 	MarkerPath   string
 	P0MarkerPath string
 
-	daemonPID *exec.Cmd
-	workerPID *exec.Cmd
-	rdb       *redis.Client
+	daemonPID  *exec.Cmd
+	workerPID  *exec.Cmd
+	rdb        *redis.Client
+	healthAddr string
 }
 
 func NewStack(t *testing.T, handlersFn func(*Stack) map[string]handlerYAML, extra func(*Stack, *daemonYAML)) *Stack {
@@ -116,6 +121,7 @@ type handlerYAML struct {
 	CompleteAfterRetries int    `yaml:"complete_after_retries,omitempty"`
 	FairnessType         string `yaml:"fairness_type,omitempty"`
 	WorkerClass          string `yaml:"worker_class,omitempty"`
+	Uniq                 bool   `yaml:"uniq,omitempty"`
 }
 
 type manifestDoc struct {
@@ -146,6 +152,8 @@ type daemonYAML struct {
 	FairnessThroughputReadyRuby string     `yaml:"fairness_throughput_ready_ruby,omitempty"`
 	PriorityConfigPaths  []string          `yaml:"priority_config_paths,omitempty"`
 	PriorityLagCheckInterval float64       `yaml:"priority_lag_check_interval,omitempty"`
+	LivenessEnabled      bool              `yaml:"liveness_enabled,omitempty"`
+	LivenessHTTPAddr     string            `yaml:"liveness_http_addr,omitempty"`
 }
 
 func (s *Stack) writeManifest(handlers map[string]handlerYAML) {
@@ -282,12 +290,17 @@ func (s *Stack) stopWorker() {
 }
 
 func (s *Stack) NewClient() *client.Client {
+	return s.NewClientOptions(false)
+}
+
+func (s *Stack) NewClientOptions(uniqEnabled bool) *client.Client {
 	s.T.Helper()
 	cfg := client.DefaultConfig()
 	cfg.Brokers = s.Brokers
 	cfg.RedisURL = s.Redis
 	cfg.ManifestPath = s.ManifestPath
-	cfg.UniqEnabled = false
+	cfg.UniqEnabled = uniqEnabled
+	cfg.UniqOnDuplicate = "skip"
 	cfg.EventsTopic = s.EventsTopic
 	cfg.CallbacksTopic = s.CallbacksTopic
 	cfg.DeadLetterTopic = s.DLTTopic
@@ -345,6 +358,47 @@ func (s *Stack) WaitMarkerAt(path string, timeout time.Duration) string {
 
 func (s *Stack) WaitMarker(timeout time.Duration) string {
 	return s.WaitMarkerAt(s.MarkerPath, timeout)
+}
+
+func (s *Stack) AssertNoMarkerAt(path string, wait time.Duration) {
+	s.T.Helper()
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(b))) > 0 {
+			s.T.Fatalf("unexpected marker at %s: %q", path, strings.TrimSpace(string(b)))
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+func (s *Stack) AssertNoMarker(wait time.Duration) {
+	s.AssertNoMarkerAt(s.MarkerPath, wait)
+}
+
+func (s *Stack) HealthURL() string {
+	return "http://" + s.healthAddr + "/health"
+}
+
+func (s *Stack) WaitHealthOK(timeout time.Duration) {
+	s.T.Helper()
+	if s.healthAddr == "" {
+		s.T.Fatal("health endpoint not configured on stack")
+	}
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: 2 * time.Second}
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(s.HealthURL())
+		if err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
+			s.T.Logf("health not ok yet: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	s.T.Fatalf("timeout waiting for health OK at %s", s.HealthURL())
 }
 
 func (s *Stack) PollTopic(ctx context.Context, topic string, match func(map[string]interface{}) bool, timeout time.Duration) map[string]interface{} {
@@ -405,6 +459,12 @@ func baseHandlers(workerTopic string) map[string]handlerYAML {
 		},
 		"integration.go_scheduled": {
 			Runtime: "go", Topic: workerTopic, MaxRetries: 1,
+		},
+		"integration.go_expired": {
+			Runtime: "go", Topic: workerTopic, MaxRetries: 1,
+		},
+		"integration.go_uniq": {
+			Runtime: "go", Topic: workerTopic, MaxRetries: 1, Uniq: true,
 		},
 		"integration.go_p0": {
 			Runtime: "go", Topic: "", MaxRetries: 1,
@@ -522,6 +582,24 @@ func applyFairConfig(s *Stack, cfg *daemonYAML) {
 func applyScheduleConfig(s *Stack, cfg *daemonYAML) {
 	cfg.SchedulePollerEnabled = true
 	cfg.ScheduledTopic = s.ScheduledTopic
+}
+
+func applyHealthConfig(s *Stack, cfg *daemonYAML) {
+	port := freePort(s.T)
+	s.healthAddr = fmt.Sprintf("127.0.0.1:%d", port)
+	cfg.LivenessEnabled = true
+	cfg.LivenessHTTPAddr = s.healthAddr
+}
+
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
 }
 
 func priorityHandlersForStack(s *Stack) map[string]handlerYAML {

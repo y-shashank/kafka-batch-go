@@ -78,6 +78,20 @@ func init() {
 		}
 		return nil
 	})
+
+	kbatch.Register("integration.go_expired", func(ctx *kbatch.Context) error {
+		if marker := os.Getenv("KBATCH_DAEMON_ITEST_MARKER"); marker != "" {
+			return os.WriteFile(marker, []byte("expired-ran:"+ctx.JobID), 0o644)
+		}
+		return nil
+	})
+
+	kbatch.Register("integration.go_uniq", func(ctx *kbatch.Context) error {
+		if marker := os.Getenv("KBATCH_DAEMON_ITEST_MARKER"); marker != "" {
+			return os.WriteFile(marker, []byte(ctx.JobID), 0o644)
+		}
+		return nil
+	})
 }
 
 func main() {
