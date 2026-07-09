@@ -15,6 +15,7 @@ import (
 	"github.com/y-shashank/kafka-batch-go/pkg/reconciler"
 	"github.com/y-shashank/kafka-batch-go/pkg/store"
 	"github.com/y-shashank/kafka-batch-go/pkg/topics"
+	"github.com/y-shashank/kafka-batch-go/pkg/version"
 	"github.com/y-shashank/kafka-batch-go/pkg/worker"
 
 	"github.com/redis/go-redis/v9"
@@ -35,6 +36,8 @@ func main() {
 		runReconcile(os.Args[2:])
 	case "topics":
 		runTopics(os.Args[2:])
+	case "version":
+		fmt.Println(version.Version)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -223,6 +226,7 @@ Usage:
   kbatch reconcile --config PATH                  # one-shot stuck-batch sweep
   kbatch topics create [--brokers HOST:PORT] [--manifest PATH]
   kbatch topics validate [--brokers HOST:PORT] [--manifest PATH]
+  kbatch version
 
 Environment:
   KAFKA_BROKERS, KAFKA_PREFIX, REDIS_URL, KAFKA_BATCH_HANDLER_MANIFEST
