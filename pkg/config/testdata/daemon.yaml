@@ -1,0 +1,16 @@
+brokers:
+  - yaml-broker:9092
+consumer_group: test-batch
+topic_prefix: acme
+redis_url: redis://127.0.0.1:6379/0
+handler_manifest: handlers.yaml
+events_topic: acme.events
+callbacks_topic: acme.callbacks
+schedule_poller_enabled: true
+fairness_enabled: true
+fairness_time_ready_go: acme.fair_time_ready.go
+fairness_time_ready_ruby: acme.fair_time_ready.ruby
+liveness_enabled: true
+liveness_ttl: 45
+priority_config_paths:
+  - priority.yaml

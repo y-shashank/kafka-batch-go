@@ -1,0 +1,5 @@
+consumer_group_suffix: jobs-fast
+mode: weighted
+topics:
+  - acme.jobs.p0
+  - acme.jobs.p1

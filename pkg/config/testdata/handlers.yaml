@@ -1,0 +1,14 @@
+handlers:
+  segment.export:
+    runtime: go
+    topic: segment.exports
+    max_retries: 25
+  reports.build:
+    runtime: ruby
+    topic: reports.build
+  fair.time:
+    runtime: go
+    fairness_type: time
+  fair.ruby:
+    runtime: ruby
+    fairness_type: time
