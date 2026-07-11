@@ -134,6 +134,21 @@ func (s *RedisStore) FindBatch(ctx context.Context, id string) (*Batch, error) {
 	return b, nil
 }
 
+// CompletionRecorded reports whether the batch dedup bitmap already has the bit
+// for this job's sequence set — i.e. the job's completion was already counted.
+// Used to decide whether a fair-slot skip is a genuine duplicate (safe to drop)
+// or an orphaned slot whose holder died before counting (must be re-run).
+func (s *RedisStore) CompletionRecorded(ctx context.Context, batchID string, seq int64) (bool, error) {
+	if s == nil || s.client == nil || seq < 1 {
+		return false, nil
+	}
+	bit, err := s.client.GetBit(ctx, bitmapKey(batchID), seq-1).Result()
+	if err != nil {
+		return false, err
+	}
+	return bit == 1, nil
+}
+
 func (s *RedisStore) ClaimCallback(ctx context.Context, batchID, nodeID string) (bool, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	res, err := s.client.Eval(ctx, claimCallbackLua,

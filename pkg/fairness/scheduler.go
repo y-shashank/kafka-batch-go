@@ -208,6 +208,26 @@ func (s *Scheduler) rearmLease(ctx context.Context, tenantID, slotID string) err
 	return err
 }
 
+// SlotLeaseActive reports whether the slot still holds a live lease — i.e. its
+// holder is presumed alive and renewing. Returns the lease expiry (unix seconds)
+// when present. Used to distinguish an orphaned slot (holder died, lease gone or
+// expired → safe to re-run) from a slot whose holder is still working (defer and
+// re-check after expiry rather than double-run).
+func (s *Scheduler) SlotLeaseActive(ctx context.Context, slotID string) (active bool, expiry float64, err error) {
+	if slotID == "" {
+		return false, 0, nil
+	}
+	score, err := s.Client.ZScore(ctx, leasesKey(s.Lane), slotID).Result()
+	if err == redis.Nil {
+		return false, 0, nil
+	}
+	if err != nil {
+		return false, 0, err
+	}
+	now := float64(time.Now().UnixNano()) / 1e9
+	return score > now, score, nil
+}
+
 func (s *Scheduler) ClaimSlotExecution(ctx context.Context, slotID string) (bool, error) {
 	if slotID == "" {
 		return true, nil
