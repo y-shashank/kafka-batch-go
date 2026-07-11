@@ -32,6 +32,7 @@ type Daemon struct {
 	HandlerManifest    string
 	SkipCancelledJobs  bool
 	NodeID             string
+	RetryTransactionalEnabled bool
 	SchedulePollerEnabled bool
 	ScheduledTopic        string
 	SchedulePollInterval  time.Duration
@@ -159,6 +160,7 @@ func LoadDaemon(path string) (Daemon, error) {
 		HandlerManifest string            `yaml:"handler_manifest"`
 		MaxRetries         int            `yaml:"max_retries"`
 		CompleteAfter      int            `yaml:"complete_after_retries"`
+		RetryTransactionalEnabled bool     `yaml:"retry_transactional_enabled"`
 		SchedulePollerEnabled bool          `yaml:"schedule_poller_enabled"`
 		ScheduledTopic        string        `yaml:"scheduled_topic"`
 		ScheduleLeaseSeconds  int           `yaml:"schedule_lease_seconds"`
@@ -247,6 +249,9 @@ func LoadDaemon(path string) (Daemon, error) {
 	}
 	if doc.CompleteAfter > 0 {
 		cfg.CompleteAfter = doc.CompleteAfter
+	}
+	if doc.RetryTransactionalEnabled {
+		cfg.RetryTransactionalEnabled = true
 	}
 	if doc.SchedulePollerEnabled {
 		cfg.SchedulePollerEnabled = true

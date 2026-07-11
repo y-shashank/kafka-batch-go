@@ -15,6 +15,10 @@ func forwardingKey(lane Lane) string      { return ns(lane) + ":forwarding" }
 func forwardingMetaKey(lane Lane) string  { return ns(lane) + ":forwarding_meta" }
 func slotDedupPrefix(lane Lane) string    { return ns(lane) + ":slot_dedup:" }
 func reclaimLockKey(lane Lane) string     { return ns(lane) + ":reclaim_lock" }
+func reclaimClaimPrefix(lane Lane) string { return ns(lane) + ":reclaim_claim:" }
+func reclaimClaimKey(lane Lane, slotID string) string {
+	return reclaimClaimPrefix(lane) + slotID
+}
 
 // ReadyKey returns the per-tenant ready list key.
 func ReadyKey(lane Lane, tenantID string) string {

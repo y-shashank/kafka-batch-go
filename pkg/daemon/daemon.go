@@ -120,14 +120,21 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 
 	retryTopics := cfg.RetryTopics()
 	if len(retryTopics) > 0 {
-		RunConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-retry", retryTopics, func(rec *kgo.Record) error {
-			src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
-			out, err := retryProc.Process(ctx, rec.Value, src)
-			if err != nil {
-				return err
-			}
-			return applyRetryOutcome(ctx, cfg, prod, out, src)
-		}, consumerHealth, pauseCtl, live)
+		if cfg.RetryTransactionalEnabled {
+			// Exactly-once retry pipeline (produce + offset commit atomic via Kafka
+			// transactions). Opt-in: requires broker/topic transaction support, so it is
+			// off by default and the non-transactional path below remains the fallback.
+			RunRetryConsumerTransactional(ctx, cfg, retryTopics, retryProc, consumerHealth)
+		} else {
+			RunConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-retry", retryTopics, func(rec *kgo.Record) error {
+				src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
+				out, err := retryProc.Process(ctx, rec.Value, src)
+				if err != nil {
+					return err
+				}
+				return applyRetryOutcome(ctx, cfg, prod, out, src)
+			}, consumerHealth, pauseCtl, live)
+		}
 	}
 
 	if cfg.SchedulePollerEnabled {

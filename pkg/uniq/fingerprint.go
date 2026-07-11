@@ -11,7 +11,12 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const keyPrefix = "kafka_batch:uniq:"
+// KeyPrefix is the Redis key prefix for uniqueness locks (wire-compatible with the Ruby
+// gem's KafkaBatch::Uniqueness keys). Exported so callers that need to build/inspect the
+// key directly (e.g. tests) don't have to hardcode the literal.
+const KeyPrefix = "kafka_batch:uniq:"
+
+const keyPrefix = KeyPrefix
 
 const releaseLua = `
 if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -49,7 +54,21 @@ func (l *Locker) Claim(ctx context.Context, workerClassName string, payload map[
 
 // Release drops a lock by fingerprint hex from the wire message.
 func (l *Locker) Release(ctx context.Context, fpHex, jobID string) error {
-	if l == nil || l.client == nil || fpHex == "" || jobID == "" {
+	if l == nil || l.client == nil {
+		return nil
+	}
+	return ReleaseLock(ctx, l.client, fpHex, jobID)
+}
+
+// ReleaseLock drops a per-worker uniqueness lock given the wire fingerprint hex and the
+// owning job id. This is the single implementation of the release path: pkg/client (via
+// Locker.Release, after a failed produce) and pkg/store (via RedisStore.ReleaseUniqLock,
+// after a job finishes or expires) both call into this instead of each keeping their own
+// copy of the Lua script and key prefix — two independent copies previously existed and
+// could silently drift out of sync (e.g. TTL handling, key prefix) without either caller
+// noticing.
+func ReleaseLock(ctx context.Context, client *redis.Client, fpHex, jobID string) error {
+	if client == nil || fpHex == "" || jobID == "" {
 		return nil
 	}
 	bin, err := hex.DecodeString(fpHex)
@@ -57,7 +76,7 @@ func (l *Locker) Release(ctx context.Context, fpHex, jobID string) error {
 		return nil
 	}
 	key := keyPrefix + string(bin)
-	return l.client.Eval(ctx, releaseLua, []string{key}, jobID).Err()
+	return client.Eval(ctx, releaseLua, []string{key}, jobID).Err()
 }
 
 // DigestHex returns the 32-char hex fingerprint for _uniq_fp on the wire.

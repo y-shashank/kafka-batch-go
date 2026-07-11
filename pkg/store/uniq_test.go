@@ -8,6 +8,8 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/y-shashank/kafka-batch-go/pkg/uniq"
 )
 
 func TestReleaseUniqLock(t *testing.T) {
@@ -21,7 +23,7 @@ func TestReleaseUniqLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := uniqKeyPrefix + string(bin)
+	key := uniq.KeyPrefix + string(bin)
 	mr.Set(key, "job-1")
 
 	if err := st.ReleaseUniqLock(ctx, fp, "job-1"); err != nil {
