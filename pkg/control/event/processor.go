@@ -7,6 +7,7 @@ import (
 
 	"github.com/y-shashank/kafka-batch-go/pkg/config"
 	"github.com/y-shashank/kafka-batch-go/pkg/instrument"
+	"github.com/y-shashank/kafka-batch-go/pkg/kafkaclient"
 	"github.com/y-shashank/kafka-batch-go/pkg/protocol"
 	"github.com/y-shashank/kafka-batch-go/pkg/store"
 )
@@ -14,6 +15,11 @@ import (
 // Producer publishes Kafka messages.
 type Producer interface {
 	Produce(ctx context.Context, topic, key string, payload []byte) error
+}
+
+// BatchProducer optionally batches callback produces.
+type BatchProducer interface {
+	ProduceMany(ctx context.Context, reqs ...kafkaclient.ProduceRequest) error
 }
 
 // Processor applies completion events to the batch ledger.
@@ -103,11 +109,38 @@ func (p *Processor) ProcessBatch(ctx context.Context, rawEvents [][]byte) (Outco
 		})
 	}
 
-	for _, cb := range out.Callbacks {
-		raw, _ := json.Marshal(cb)
-		if err := p.Producer.Produce(ctx, p.Cfg.CallbacksTopic, cb.BatchID, raw); err != nil {
-			return out, fmt.Errorf("callback produce: %w", err)
-		}
+	if err := p.produceCallbacks(ctx, out.Callbacks); err != nil {
+		return out, err
 	}
 	return out, nil
+}
+
+func (p *Processor) produceCallbacks(ctx context.Context, callbacks []protocol.CallbackMessage) error {
+	if len(callbacks) == 0 {
+		return nil
+	}
+	reqs := make([]kafkaclient.ProduceRequest, 0, len(callbacks))
+	for _, cb := range callbacks {
+		raw, err := json.Marshal(cb)
+		if err != nil {
+			return fmt.Errorf("callback marshal: %w", err)
+		}
+		reqs = append(reqs, kafkaclient.ProduceRequest{
+			Topic: p.Cfg.CallbacksTopic,
+			Key:   cb.BatchID,
+			Value: raw,
+		})
+	}
+	if bp, ok := p.Producer.(BatchProducer); ok {
+		if err := bp.ProduceMany(ctx, reqs...); err != nil {
+			return fmt.Errorf("callback produce: %w", err)
+		}
+		return nil
+	}
+	for _, req := range reqs {
+		if err := p.Producer.Produce(ctx, req.Topic, req.Key, req.Value); err != nil {
+			return fmt.Errorf("callback produce: %w", err)
+		}
+	}
+	return nil
 }

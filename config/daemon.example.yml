@@ -36,6 +36,13 @@ redis_url: redis://localhost:6379/0
 
 max_retries: 3
 
+# Phase 3 — control-plane throughput (single pod, multi-partition topics)
+# In-process Kafka group members split partition assignment across goroutines.
+# With 32 events partitions, set events_consumer_concurrency up to 32.
+# events_consumer_concurrency: 8
+# retry_consumer_concurrency: 4
+# producer_required_acks: all_isr   # all_isr (default) | leader
+
 # Phase 3b — delayed jobs (perform_in / perform_at)
 # schedule_poller_enabled: true
 # scheduled_topic: kafka_batch.scheduled

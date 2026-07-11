@@ -33,6 +33,14 @@ type Daemon struct {
 	SkipCancelledJobs  bool
 	NodeID             string
 	RetryTransactionalEnabled bool
+	// EventsConsumerConcurrency is the number of in-process Kafka group members
+	// for the events consumer (same group, partition assignment split by broker).
+	EventsConsumerConcurrency int
+	// RetryConsumerConcurrency is the number of in-process group members for the
+	// non-transactional retry consumer.
+	RetryConsumerConcurrency int
+	// ProducerRequiredAcks is "all_isr" (default, safest) or "leader".
+	ProducerRequiredAcks string
 	SchedulePollerEnabled bool
 	ScheduledTopic        string
 	SchedulePollInterval  time.Duration
@@ -133,7 +141,34 @@ func DefaultDaemon() Daemon {
 		ReconciliationInterval:      300 * time.Second,
 		ReconcilerLockTTL:           600 * time.Second,
 		MaxReconcilePerRun:          100,
+		EventsConsumerConcurrency:   8,
+		RetryConsumerConcurrency:    4,
+		ProducerRequiredAcks:        "all_isr",
 	}
+}
+
+// RequiredAcks returns the franz-go ack level for the shared producer client.
+func (c Daemon) RequiredAcks() string {
+	if c.ProducerRequiredAcks == "" {
+		return "all_isr"
+	}
+	return c.ProducerRequiredAcks
+}
+
+// EventsConsumerMembers returns a positive member count for the events group.
+func (c Daemon) EventsConsumerMembers() int {
+	if c.EventsConsumerConcurrency < 1 {
+		return 1
+	}
+	return c.EventsConsumerConcurrency
+}
+
+// RetryConsumerMembers returns a positive member count for the retry group.
+func (c Daemon) RetryConsumerMembers() int {
+	if c.RetryConsumerConcurrency < 1 {
+		return 1
+	}
+	return c.RetryConsumerConcurrency
 }
 
 func LoadDaemon(path string) (Daemon, error) {
@@ -161,6 +196,9 @@ func LoadDaemon(path string) (Daemon, error) {
 		MaxRetries         int            `yaml:"max_retries"`
 		CompleteAfter      int            `yaml:"complete_after_retries"`
 		RetryTransactionalEnabled bool     `yaml:"retry_transactional_enabled"`
+		EventsConsumerConcurrency int        `yaml:"events_consumer_concurrency"`
+		RetryConsumerConcurrency  int        `yaml:"retry_consumer_concurrency"`
+		ProducerRequiredAcks      string     `yaml:"producer_required_acks"`
 		SchedulePollerEnabled bool          `yaml:"schedule_poller_enabled"`
 		ScheduledTopic        string        `yaml:"scheduled_topic"`
 		ScheduleLeaseSeconds  int           `yaml:"schedule_lease_seconds"`
@@ -252,6 +290,15 @@ func LoadDaemon(path string) (Daemon, error) {
 	}
 	if doc.RetryTransactionalEnabled {
 		cfg.RetryTransactionalEnabled = true
+	}
+	if doc.EventsConsumerConcurrency > 0 {
+		cfg.EventsConsumerConcurrency = doc.EventsConsumerConcurrency
+	}
+	if doc.RetryConsumerConcurrency > 0 {
+		cfg.RetryConsumerConcurrency = doc.RetryConsumerConcurrency
+	}
+	if doc.ProducerRequiredAcks != "" {
+		cfg.ProducerRequiredAcks = doc.ProducerRequiredAcks
 	}
 	if doc.SchedulePollerEnabled {
 		cfg.SchedulePollerEnabled = true
@@ -440,7 +487,29 @@ func applyEnv(cfg *Daemon) {
 	if v := os.Getenv("KAFKA_BATCH_METRICS_STATSD_ADDR"); v != "" {
 		cfg.MetricsStatsDAddr = strings.TrimSpace(v)
 	}
+	if v := os.Getenv("KAFKA_BATCH_EVENTS_CONSUMER_CONCURRENCY"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			cfg.EventsConsumerConcurrency = n
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_RETRY_CONSUMER_CONCURRENCY"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			cfg.RetryConsumerConcurrency = n
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_PRODUCER_REQUIRED_ACKS"); v != "" {
+		cfg.ProducerRequiredAcks = strings.TrimSpace(v)
+	}
 	cfg.prefixTopics()
+}
+
+func parsePositiveInt(s string) (int, error) {
+	var n int
+	_, err := fmt.Sscanf(strings.TrimSpace(s), "%d", &n)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("invalid positive int %q", s)
+	}
+	return n, nil
 }
 
 func (c *Daemon) prefixTopics() {

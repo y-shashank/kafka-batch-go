@@ -11,6 +11,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/y-shashank/kafka-batch-go/pkg/config"
+	"github.com/y-shashank/kafka-batch-go/pkg/kafkaclient"
 	"github.com/y-shashank/kafka-batch-go/pkg/protocol"
 	"github.com/y-shashank/kafka-batch-go/pkg/store"
 )
@@ -29,6 +30,15 @@ func (m *memProducer) Produce(_ context.Context, topic, key string, payload []by
 		key   string
 		body  []byte
 	}{topic, key, payload})
+	return nil
+}
+
+func (m *memProducer) ProduceMany(_ context.Context, reqs ...kafkaclient.ProduceRequest) error {
+	for _, r := range reqs {
+		if err := m.Produce(context.Background(), r.Topic, r.Key, r.Value); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -80,6 +90,38 @@ func TestProcessBatchFinalizesAndProducesCallback(t *testing.T) {
 		t.Fatalf("produced %+v", prod.msgs)
 	}
 
+	batch, err := st.FindBatch(context.Background(), batchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch.Status != "success" {
+		t.Fatalf("status %q", batch.Status)
+	}
+}
+
+func TestProcessBatchMultipleEventsOnePoll(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := store.NewRedisStore(rdb, time.Hour)
+	prod := &memProducer{}
+
+	batchID := "batch-multi"
+	seedRunningBatch(t, mr, batchID, 2)
+
+	ev1, _ := json.Marshal(protocol.EventMessage{BatchID: batchID, JobID: "j1", Status: "success", BatchSeq: 1})
+	ev2, _ := json.Marshal(protocol.EventMessage{BatchID: batchID, JobID: "j2", Status: "success", BatchSeq: 2})
+
+	cfg := config.DefaultDaemon()
+	cfg.CallbacksTopic = "callbacks.multi"
+	p := &Processor{Cfg: cfg, Store: st, Producer: prod}
+
+	_, err := p.ProcessBatch(context.Background(), [][]byte{ev1, ev2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prod.msgs) != 1 {
+		t.Fatalf("expected 1 batched callback, got %d", len(prod.msgs))
+	}
 	batch, err := st.FindBatch(context.Background(), batchID)
 	if err != nil {
 		t.Fatal(err)

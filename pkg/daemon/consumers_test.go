@@ -40,6 +40,16 @@ func TestSafeHandlePassesThroughError(t *testing.T) {
 	}
 }
 
+func TestSafeBatchHandleRecoversPanic(t *testing.T) {
+	rec := &kgo.Record{Topic: "t", Partition: 0, Offset: 1}
+	err := safeBatchHandle(context.Background(), func(context.Context, []*kgo.Record) error {
+		panic("boom")
+	}, []*kgo.Record{rec})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
 func TestConsumerHealthHealthy(t *testing.T) {
 	h := NewConsumerHealthTracker(50*time.Millisecond, 20*time.Millisecond)
 	h.Register("g1")
