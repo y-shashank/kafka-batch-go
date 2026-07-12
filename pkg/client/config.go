@@ -37,7 +37,7 @@ type Config struct {
 	FairnessTimeIngest       string
 	FairnessThroughputIngest string
 	// Static tenant_id → ingest partition (Ruby fairness_tenant_partitions).
-	FairnessTenantPartitions map[string]int32
+	FairnessTenantPartitions        map[string]int32
 	FairnessDynamicTenantPartitions bool
 	FairnessTenantPartitionCacheTTL time.Duration
 
@@ -48,13 +48,13 @@ type Config struct {
 	// (Ruby-style plain enqueue without a manifest entry).
 	AllowUnknownWorkerClasses bool
 
-	TopicsReplicationFactor int
+	TopicsReplicationFactor   int
 	TopicsIncludeControlPlane bool
 	ValidateTopicsOnConnect   bool
 
-	EventsTopic     string
-	DeadLetterTopic string
-	TopicsExtra     []string
+	EventsTopic           string
+	DeadLetterTopic       string
+	TopicsExtra           []string
 	TopicsForcePartitions int32
 }
 
@@ -73,25 +73,25 @@ type WorkerClassConfig struct {
 // DefaultConfig returns sensible local defaults.
 func DefaultConfig() Config {
 	return Config{
-		Brokers:                   []string{"localhost:9092"},
-		RedisURL:                  "redis://localhost:6379/0",
-		JobsTopic:                 "kafka_batch.jobs",
-		ScheduledTopic:            "kafka_batch.scheduled",
-		CallbacksTopic:            "kafka_batch.callbacks",
-		EventsTopic:               "kafka_batch.events",
-		DeadLetterTopic:           "kafka_batch.dead_letter",
-		BatchTTL:                  7 * 24 * time.Hour,
-		MaxRetries:                25,
-		CompleteAfterRetries:      3,
-		UniqEnabled:               true,
-		UniqLockTTL:               7 * 24 * time.Hour,
-		UniqOnDuplicate:           "skip",
-		ScheduleIndexWriteRetries: 3,
-		ScheduleIndexWriteBackoff: time.Second,
-		MaxScheduleHorizon:        30 * 24 * time.Hour,
-		ProduceChunkSize:          500,
-		FairnessTimeIngest:        "kafka_batch.fair_time_ingest",
-		FairnessThroughputIngest:  "kafka_batch.fair_throughput_ingest",
+		Brokers:                         []string{"localhost:9092"},
+		RedisURL:                        "redis://localhost:6379/0",
+		JobsTopic:                       "kafka_batch.jobs",
+		ScheduledTopic:                  "kafka_batch.scheduled",
+		CallbacksTopic:                  "kafka_batch.callbacks",
+		EventsTopic:                     "kafka_batch.events",
+		DeadLetterTopic:                 "kafka_batch.dead_letter",
+		BatchTTL:                        7 * 24 * time.Hour,
+		MaxRetries:                      7,
+		CompleteAfterRetries:            7,
+		UniqEnabled:                     true,
+		UniqLockTTL:                     7 * 24 * time.Hour,
+		UniqOnDuplicate:                 "skip",
+		ScheduleIndexWriteRetries:       3,
+		ScheduleIndexWriteBackoff:       time.Second,
+		MaxScheduleHorizon:              30 * 24 * time.Hour,
+		ProduceChunkSize:                500,
+		FairnessTimeIngest:              "kafka_batch.fair_time_ingest",
+		FairnessThroughputIngest:        "kafka_batch.fair_throughput_ingest",
 		FairnessTenantPartitionCacheTTL: 30 * time.Second,
 	}
 }

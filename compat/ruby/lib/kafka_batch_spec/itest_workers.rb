@@ -66,3 +66,20 @@ class RubyAlwaysFailWorker
     raise "always fails"
   end
 end
+
+# Shared-name uniq worker. Both the Ruby client and the Go client enqueue
+# job_type "integration.uniq_shared" resolving to worker_class "RubyUniqWorker",
+# so the uniqueness fingerprint (worker_class name + canonical payload) is
+# computed over the SAME material on both runtimes. This is what lets a job
+# enqueued from one runtime dedupe against the same job enqueued from the other
+# via the shared Redis lock. See integration/matrix/matrix_uniq_test.go.
+class RubyUniqWorker
+  include KafkaBatch::Worker
+
+  job_type "integration.uniq_shared"
+  uniq true
+
+  def perform(_payload)
+    KafkaBatchSpec::ItestWorkers.write_marker!(job_id)
+  end
+end

@@ -274,6 +274,20 @@ Every PR runs Phase 1–4 plus the Go E2E suite (`-p 1` so packages do not race 
 | 4 | `TestMatrix_Phase4_RubyControl` |
 | Nightly | `TestMatrix_Full` |
 
+### Cross-runtime contract tests
+
+These guard shared-state contracts that single-runtime tests can't catch (run in PR CI and nightly):
+
+| Test | What it proves |
+|------|----------------|
+| `TestMatrix_UniqDedupCrossRuntime` | A uniq job enqueued from one runtime dedupes against the other via the shared Redis lock — fingerprints match byte-for-byte, including payloads with `<`, `>`, `&`, and non-ASCII. |
+| `TestMatrix_PartitionParity` | Go (franz-go) and Ruby (WaterDrop `murmur2_random`) assign the **same partition** to the same key on a multi-partition topic — the fairness co-partitioning contract. |
+| `TestMatrix_ScheduledJobRubyClientGoExec` | A Ruby client's delayed job is picked up by the Go daemon's schedule poller and run by a Go worker — schedule-index parity. |
+| `TestMatrix_CancellationCrossRuntime` | A batch cancelled by the Go client is skipped by a Ruby JobConsumer via the shared `kafka_batch:index:cancelled` set. |
+| `TestMatrix_DLTExhaustedRubyExec` | A Ruby job retried through the Go control plane and exhausted lands in the dead-letter topic — shared retry-tier + DLT envelope. |
+| `TestMatrix_CallbackMessageCrossRuntime` | A batch with a legacy class-string `on_complete` finalized under Go control emits a callback message (with `callback_args`) for the Ruby `CallbackConsumer`. |
+| `TestMatrix_ConsumptionPauseCrossRuntime` | A pause written to the shared `kafka_batch:consumption:topics` set is honored by the Go worker; resume drains — the cross-runtime killswitch. |
+
 Set `KAFKA_BATCH_GEM_PATH` or clone [kafka-batch](https://github.com/y-shashank/kafka-batch) as `kafka-batch/` in this repo (or sibling `../kafka-batch` locally).
 
 ## Go E2E integration tests

@@ -1,6 +1,7 @@
 package uniq
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -101,9 +102,27 @@ func fingerprint(workerClassName string, payload map[string]interface{}) []byte 
 	return buf
 }
 
+// canonicalPayload serializes the deep-key-sorted payload to the exact byte
+// sequence the Ruby gem produces with Oj.dump(mode: :compat). This must match
+// byte-for-byte across runtimes: the fingerprint is hashed from it, so any
+// divergence silently breaks cross-runtime uniqueness dedup (a Ruby-enqueued
+// and a Go-enqueued job with identical payloads would compute different
+// _uniq_fp values and both run).
+//
+// The critical detail is HTML escaping: encoding/json escapes '<', '>', '&'
+// (and U+2028/U+2029) by default, whereas Oj :compat emits them verbatim. We
+// disable escaping via json.Encoder so payloads containing those characters
+// (e.g. names, URLs with query strings, HTML fragments) fingerprint identically
+// to Ruby. json.Encoder appends a trailing newline that Marshal does not, so we
+// trim it.
 func canonicalPayload(payload map[string]interface{}) string {
-	b, _ := json.Marshal(deepSortKeys(payload))
-	return string(b)
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(deepSortKeys(payload)); err != nil {
+		return ""
+	}
+	return string(bytes.TrimRight(buf.Bytes(), "\n"))
 }
 
 func deepSortKeys(v interface{}) interface{} {

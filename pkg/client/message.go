@@ -61,7 +61,7 @@ func (c *Client) maxRetries(entry config.HandlerEntry) int {
 	if c.cfg.MaxRetries > 0 {
 		return c.cfg.MaxRetries
 	}
-	return 25
+	return 7
 }
 
 func (c *Client) completeAfter(entry config.HandlerEntry) int {
@@ -71,7 +71,7 @@ func (c *Client) completeAfter(entry config.HandlerEntry) int {
 	if c.cfg.CompleteAfterRetries > 0 {
 		return c.cfg.CompleteAfterRetries
 	}
-	return 3
+	return 7
 }
 
 func (c *Client) claimUniq(ctx context.Context, entry config.HandlerEntry, jobType string, payload map[string]interface{}, jobID, batchID string) (skipped bool, err error) {

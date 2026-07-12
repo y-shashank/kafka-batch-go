@@ -34,7 +34,7 @@ retry_topic: kafka_batch.jobs.retry
 
 redis_url: redis://localhost:6379/0
 
-max_retries: 3
+max_retries: 7
 
 # Phase 3 — control-plane throughput (single pod, multi-partition topics)
 # In-process Kafka group members split partition assignment across goroutines.

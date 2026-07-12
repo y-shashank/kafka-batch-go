@@ -21,8 +21,10 @@ options = { mode: "enqueue", job_type: "integration.go_daemon" }
 OptionParser.new do |opts|
   opts.on("--config PATH", "daemon YAML") { |v| options[:config] = v }
   opts.on("--manifest PATH", "handler manifest YAML") { |v| options[:manifest] = v }
-  opts.on("--mode MODE", "enqueue | batch-go | batch-ruby | batch-mixed | scheduled-go") { |v| options[:mode] = v }
+  opts.on("--mode MODE", "enqueue | batch-go | batch-ruby | batch-mixed | scheduled-go | enqueue-uniq | produce-raw") { |v| options[:mode] = v }
   opts.on("--job-type TYPE") { |v| options[:job_type] = v }
+  opts.on("--topic TOPIC") { |v| options[:topic] = v }
+  opts.on("--keys N", Integer) { |v| options[:keys] = v }
 end.parse!
 
 abort "--config required" unless options[:config]
@@ -44,7 +46,8 @@ KafkaBatch.configure do |c|
   c.scheduled_topic = cfg["scheduled_topic"] if cfg["scheduled_topic"]
   c.fair_time_ingest_topic = cfg["fairness_time_ingest"]
   c.fair_throughput_ingest_topic = cfg["fairness_throughput_ingest"]
-  c.uniq_enabled = cfg.fetch("uniq_enabled", false)
+  # enqueue-uniq exercises cross-runtime dedup, which requires uniqueness on.
+  c.uniq_enabled = (options[:mode] == "enqueue-uniq") || cfg.fetch("uniq_enabled", false)
 end
 KafkaBatch::HandlerManifest.load!(options[:manifest])
 KafkaBatch::Producer.reset!
@@ -105,6 +108,30 @@ when "scheduled-go"
   end
   result = { "batch_id" => batch.id, "job_ids" => { "go" => go_id } }
   File.write(marker, batch.id) if marker && !marker.empty?
+when "enqueue-uniq"
+  # Enqueue a uniq job whose worker_class ("RubyUniqWorker") matches the Go
+  # client's manifest worker_class, so the fingerprint — and therefore the
+  # Redis lock — is shared across runtimes. Returns the job_id, or a null id
+  # when the uniqueness lock was already held (skipped).
+  payload = JSON.parse(ENV.fetch("KBATCH_UNIQ_PAYLOAD", '{"n":1}'))
+  job_type = options[:job_type] == "integration.go_daemon" ? "integration.uniq_shared" : options[:job_type]
+  job_id = KafkaBatch::Batch.enqueue_job(job_type, payload)
+  result = { "job_ids" => { "primary" => job_id }, "skipped" => job_id.nil? }
+when "produce-raw"
+  # Produce N keyed records straight through WaterDrop (murmur2_random) so the
+  # Go side can compare partition assignment for identical keys — the fairness
+  # co-partitioning contract. Each record's value carries its key + source.
+  abort "--topic required for produce-raw" unless options[:topic]
+  count = options[:keys] || 20
+  count.times do |i|
+    key = "pk-#{i}"
+    KafkaBatch::Producer.produce_sync(
+      topic: options[:topic],
+      payload: JSON.generate({ "key" => key, "src" => "ruby", "i" => i }),
+      key: key
+    )
+  end
+  result = { "produced" => count }
 else
   abort "unknown mode #{options[:mode]}"
 end

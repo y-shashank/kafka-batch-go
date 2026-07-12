@@ -37,27 +37,27 @@ type Stack struct {
 	Redis   string
 	TmpDir  string
 
-	WorkerTopic   string
-	EventsTopic   string
+	WorkerTopic    string
+	EventsTopic    string
 	CallbacksTopic string
-	DLTTopic      string
+	DLTTopic       string
 	ScheduledTopic string
-	RetryBase     string
+	RetryBase      string
 
-	TimeIngest     string
-	TimeReadyGo    string
-	TimeReadyRuby  string
-	TpIngest       string
-	TpReadyGo      string
-	TpReadyRuby    string
+	TimeIngest    string
+	TimeReadyGo   string
+	TimeReadyRuby string
+	TpIngest      string
+	TpReadyGo     string
+	TpReadyRuby   string
 
 	P0Topic string
 	P1Topic string
 
-	ManifestPath string
-	ConfigPath   string
-	MarkerPath   string
-	P0MarkerPath string
+	ManifestPath   string
+	ConfigPath     string
+	MarkerPath     string
+	P0MarkerPath   string
 	RubyMarkerPath string
 
 	daemonPID       *exec.Cmd
@@ -136,31 +136,32 @@ type manifestDoc struct {
 }
 
 type daemonYAML struct {
-	Brokers              []string          `yaml:"brokers"`
-	ConsumerGroup        string            `yaml:"consumer_group"`
-	JobsTopics           []string          `yaml:"jobs_topics,omitempty"`
-	EventsTopic          string            `yaml:"events_topic"`
-	CallbacksTopic       string            `yaml:"callbacks_topic"`
-	DeadLetterTopic      string            `yaml:"dead_letter_topic"`
-	ScheduledTopic       string            `yaml:"scheduled_topic,omitempty"`
-	RetryTopic           string            `yaml:"retry_topic"`
-	RedisURL             string            `yaml:"redis_url"`
-	HandlerManifest      string            `yaml:"handler_manifest"`
-	MaxRetries           int               `yaml:"max_retries"`
-	CompleteAfterRetries int               `yaml:"complete_after_retries"`
-	RetryTiers           map[string]int    `yaml:"retry_tiers"`
-	SchedulePollerEnabled bool             `yaml:"schedule_poller_enabled,omitempty"`
-	FairnessEnabled      bool              `yaml:"fairness_enabled,omitempty"`
-	FairnessTimeIngest   string            `yaml:"fairness_time_ingest,omitempty"`
-	FairnessTimeReadyGo  string            `yaml:"fairness_time_ready_go,omitempty"`
-	FairnessTimeReadyRuby string           `yaml:"fairness_time_ready_ruby,omitempty"`
-	FairnessThroughputIngest string        `yaml:"fairness_throughput_ingest,omitempty"`
-	FairnessThroughputReadyGo string       `yaml:"fairness_throughput_ready_go,omitempty"`
-	FairnessThroughputReadyRuby string     `yaml:"fairness_throughput_ready_ruby,omitempty"`
-	PriorityConfigPaths  []string          `yaml:"priority_config_paths,omitempty"`
-	PriorityLagCheckInterval float64       `yaml:"priority_lag_check_interval,omitempty"`
-	LivenessEnabled      bool              `yaml:"liveness_enabled,omitempty"`
-	LivenessHTTPAddr     string            `yaml:"liveness_http_addr,omitempty"`
+	Brokers                     []string       `yaml:"brokers"`
+	ConsumerGroup               string         `yaml:"consumer_group"`
+	JobsTopics                  []string       `yaml:"jobs_topics,omitempty"`
+	EventsTopic                 string         `yaml:"events_topic"`
+	CallbacksTopic              string         `yaml:"callbacks_topic"`
+	DeadLetterTopic             string         `yaml:"dead_letter_topic"`
+	ScheduledTopic              string         `yaml:"scheduled_topic,omitempty"`
+	RetryTopic                  string         `yaml:"retry_topic"`
+	RedisURL                    string         `yaml:"redis_url"`
+	HandlerManifest             string         `yaml:"handler_manifest"`
+	MaxRetries                  int            `yaml:"max_retries"`
+	CompleteAfterRetries        int            `yaml:"complete_after_retries"`
+	RetryTiers                  map[string]int `yaml:"retry_tiers"`
+	SchedulePollerEnabled       bool           `yaml:"schedule_poller_enabled,omitempty"`
+	FairnessEnabled             bool           `yaml:"fairness_enabled,omitempty"`
+	FairnessTimeIngest          string         `yaml:"fairness_time_ingest,omitempty"`
+	FairnessTimeReadyGo         string         `yaml:"fairness_time_ready_go,omitempty"`
+	FairnessTimeReadyRuby       string         `yaml:"fairness_time_ready_ruby,omitempty"`
+	FairnessThroughputIngest    string         `yaml:"fairness_throughput_ingest,omitempty"`
+	FairnessThroughputReadyGo   string         `yaml:"fairness_throughput_ready_go,omitempty"`
+	FairnessThroughputReadyRuby string         `yaml:"fairness_throughput_ready_ruby,omitempty"`
+	PriorityConfigPaths         []string       `yaml:"priority_config_paths,omitempty"`
+	PriorityLagCheckInterval    float64        `yaml:"priority_lag_check_interval,omitempty"`
+	LivenessEnabled             bool           `yaml:"liveness_enabled,omitempty"`
+	LivenessHTTPAddr            string         `yaml:"liveness_http_addr,omitempty"`
+	ConsumptionRefreshInterval  float64        `yaml:"consumption_control_refresh_interval,omitempty"`
 }
 
 func (s *Stack) writeManifest(handlers map[string]handlerYAML) {
@@ -648,6 +649,14 @@ func baseHandlers(workerTopic string) map[string]handlerYAML {
 		},
 		"integration.go_uniq": {
 			Runtime: "go", Topic: workerTopic, MaxRetries: 1, Uniq: true,
+		},
+		// Shared-name uniq handler for cross-runtime dedup. worker_class is a
+		// Ruby class name so both the Go client (via manifest worker_class) and
+		// the Ruby client (via the resolved Worker class) fingerprint over the
+		// identical worker_class string. See matrix_uniq_test.go.
+		"integration.uniq_shared": {
+			Runtime: "ruby", Topic: workerTopic + ".ruby", WorkerClass: "RubyUniqWorker",
+			ApplyTopicPrefix: false, MaxRetries: 1, Uniq: true,
 		},
 		"integration.go_p0": {
 			Runtime: "go", Topic: "", MaxRetries: 1,
