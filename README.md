@@ -243,6 +243,107 @@ handlers:
 
 One execution topic = one runtime. Fair jobs use shared **ingest** topics; control forwards to `.go` / `.ruby` **ready** topics. See [Mixed-runtime deployment](#mixed-runtime-deployment) for how to run both execution tiers together.
 
+## Priority queues
+
+Run several job topics as one **ordered group** so a worker always drains the higher-priority topics before touching lower ones. Ordering is by topic rank, defined in a small YAML file per group (Sidekiq-`config/sidekiq.yml`-style). Priority is a **tier-3 (worker) feature** — the `kbatch worker` loads the priority YAML(s) and runs one lag-gated consumer group per file; the daemon is not involved. It's wire-compatible with the Ruby gem's priority YAML.
+
+**Priority is selection, not preemption.** In-flight jobs are never killed when higher-priority work arrives; the gate only decides which topic the worker *starts* the next job from.
+
+### 1. Route handlers onto priority topics (manifest)
+
+A job reaches a priority topic the normal way — its handler's `topic` in the manifest points there:
+
+```yaml
+# config/kafka_batch_handlers.yml
+handlers:
+  orders.settle:        # critical — highest rank
+    runtime: go
+    topic: kafka_batch.jobs.p0
+  orders.email:         # normal
+    runtime: go
+    topic: kafka_batch.jobs.p1
+  orders.cleanup:       # background
+    runtime: go
+    topic: kafka_batch.jobs.p2
+```
+
+### 2. Define the priority group (YAML)
+
+One file per consumer group. Topics are listed **highest priority first**:
+
+```yaml
+# config/priority/jobs-fast.yml
+consumer_group_suffix: jobs-fast     # → Kafka group "<consumer_group>-jobs-fast"
+mode: weighted                       # weighted (default) | strict
+weighted_interleave: 4               # weighted only: run 1-in-N lower-rank jobs while a higher topic has lag
+topics:                              # rank 0, 1, 2 … (highest first)
+  - kafka_batch.jobs.p0
+  - kafka_batch.jobs.p1
+  - kafka_batch.jobs.p2
+```
+
+Strict group (no interleave — lower ranks wait entirely):
+
+```yaml
+# config/priority/jobs-slow.yml
+consumer_group_suffix: jobs-slow
+mode: strict
+topics:
+  - kafka_batch.jobs.slow_p0
+  - kafka_batch.jobs.slow_p1
+```
+
+### 3. Wire the YAML into the worker
+
+Via daemon/worker config:
+
+```yaml
+# config/daemon.yml
+priority_config_paths:
+  - config/priority/jobs-fast.yml
+  - config/priority/jobs-slow.yml
+priority_lag_check_interval: 2      # seconds between Kafka lag checks (default 2)
+priority_weighted_interleave: 4     # default interleave when a group omits weighted_interleave
+```
+
+or via environment (comma-separated for multiple):
+
+```bash
+export KAFKA_BATCH_PRIORITY_CONFIGS="config/priority/jobs-fast.yml,config/priority/jobs-slow.yml"
+# single file:
+export KAFKA_BATCH_PRIORITY_CONFIG="config/priority/jobs-fast.yml"
+```
+
+### Modes
+
+| Mode | Behavior while a higher-rank topic still has lag |
+|------|--------------------------------------------------|
+| **`strict`** | Lower-rank topics start **no** new jobs until every higher topic is fully drained. |
+| **`weighted`** | Lower-rank topics interleave — `1` in every `weighted_interleave` polls proceeds (default 4), so low-priority work still trickles through instead of starving. |
+
+- Lag is read via the Kafka Admin API, rate-limited to one check per `priority_lag_check_interval`. If the cluster is unreachable the gate **fails open** (processes anyway) rather than stalling.
+- A higher topic that is **paused** via consumption control (the shared `kafka_batch:consumption:topics` Redis set) is treated as inactive for gating, so lower ranks keep flowing.
+- `topic_prefix` / `KAFKA_PREFIX` is applied to priority topic names automatically (list base names).
+
+### Boot rules
+
+- Each topic belongs to **exactly one** priority group (duplicates across files are rejected at load).
+- The default flat jobs topic (`kafka_batch.jobs`, or your `jobs_topics`) **cannot** appear in a priority group — that would double-process.
+- `mode` must be `strict` or `weighted`; omitted → `weighted`.
+
+### Deployment
+
+Priority runs inside the normal Go worker — the same `kbatch worker` that consumes plain and fair-ready topics also runs every priority group. Just point it at the priority YAML(s):
+
+```bash
+kbatch worker --config config/daemon.yml --manifest config/kafka_batch_handlers.yml
+# daemon.yml lists priority_config_paths (or set KAFKA_BATCH_PRIORITY_CONFIGS)
+```
+
+To isolate a hot priority group on its own pods, run a second worker deployment whose config lists **only** that group's YAML (and drop those topics from the other deployment's config). Scale in-process members per group with `priority_consumer_concurrency` / `KAFKA_BATCH_PRIORITY_CONSUMER_CONCURRENCY` (default 4). Because each group is its own Kafka consumer group (`<consumer_group>-<suffix>`), you can also scale it horizontally by running more replicas of that deployment.
+
+Mixed runtime: a priority topic, like any execution topic, is **one runtime only**. Ruby `PriorityJobConsumer` and the Go worker must not share a priority topic — split by `runtime` in the manifest.
+
 ## Cross-runtime matrix tests
 
 Integration tests exercise the [mixed-runtime combinations](#mixed-runtime-deployment) above against live Kafka + Redis. See also `compat/ruby/README.md`.
