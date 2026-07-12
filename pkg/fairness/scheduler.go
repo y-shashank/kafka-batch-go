@@ -11,6 +11,11 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// reclaimClaimTTL bounds how long a reclaim-in-progress marker lives. It only needs to
+// outlast one produce+confirm round trip; sized generously since a false "already
+// claimed" skip just means this tick's reclaim retries on the next tick.
+const reclaimClaimTTL = 30 * time.Second
+
 // CheckoutResult is returned by Scheduler.Checkout.
 type CheckoutResult struct {
 	TenantID string
@@ -208,6 +213,26 @@ func (s *Scheduler) rearmLease(ctx context.Context, tenantID, slotID string) err
 	return err
 }
 
+// SlotLeaseActive reports whether the slot still holds a live lease — i.e. its
+// holder is presumed alive and renewing. Returns the lease expiry (unix seconds)
+// when present. Used to distinguish an orphaned slot (holder died, lease gone or
+// expired → safe to re-run) from a slot whose holder is still working (defer and
+// re-check after expiry rather than double-run).
+func (s *Scheduler) SlotLeaseActive(ctx context.Context, slotID string) (active bool, expiry float64, err error) {
+	if slotID == "" {
+		return false, 0, nil
+	}
+	score, err := s.Client.ZScore(ctx, leasesKey(s.Lane), slotID).Result()
+	if err == redis.Nil {
+		return false, 0, nil
+	}
+	if err != nil {
+		return false, 0, err
+	}
+	now := float64(time.Now().UnixNano()) / 1e9
+	return score > now, score, nil
+}
+
 func (s *Scheduler) ClaimSlotExecution(ctx context.Context, slotID string) (bool, error) {
 	if slotID == "" {
 		return true, nil
@@ -229,18 +254,27 @@ func (s *Scheduler) ListStaleForwards(ctx context.Context) ([]StaleForward, erro
 	out := make([]StaleForward, 0)
 	for slotID, payload := range entries {
 		exp, err := s.Client.ZScore(ctx, leasesKey(s.Lane), slotID).Result()
-		if err == redis.Nil {
-			continue
-		}
-		if err != nil {
+		if err != nil && err != redis.Nil {
 			return out, err
 		}
-		if exp > now {
-			continue
+		if err == nil {
+			// Lease record still present: only reclaim once it's actually expired *and*
+			// past the grace window (gives an in-flight renewal a chance to land before
+			// we steal the slot).
+			if exp > now || (now-exp) < grace {
+				continue
+			}
 		}
-		if (now - exp) < grace {
-			continue
-		}
+		// err == redis.Nil here means the lease record is gone entirely. Checkout creates
+		// the forwarding-buffer entry and its lease atomically in one EVAL, and every
+		// legitimate teardown path (ConfirmForward, AbortForward, Complete) clears the
+		// forwarding-buffer entry no later than it clears the lease. So a forwarding entry
+		// that still exists with NO lease at all can only mean the producing process
+		// crashed between checkout and confirm/abort, and ReclaimExpiredLeases has since
+		// swept the (unconditional, no-grace) lease record. That is *more* stale than an
+		// expired-but-present lease, not less: skipping it (the previous behavior) silently
+		// orphaned the payload forever, since ReclaimExpiredLeases runs on the same cadence
+		// and always purges the lease before this grace window would have elapsed.
 		tenant, _ := s.Client.HGet(ctx, forwardingMetaKey(s.Lane), slotID).Result()
 		if tenant == "" {
 			tenant = tenantFromPayload([]byte(payload))
@@ -254,6 +288,17 @@ func (s *Scheduler) ListStaleForwards(ctx context.Context) ([]StaleForward, erro
 }
 
 func (s *Scheduler) ReclaimStaleForward(ctx context.Context, entry StaleForward, produce func(payload []byte, key string) error) error {
+	// Claim the reclaim atomically before producing. Without this, two forwarder replicas
+	// (a normal horizontally-scaled deployment) can both list the same stale entry and
+	// both call produce() before either wins the ConfirmForward race, duplicating the job
+	// onto the ready topic.
+	won, err := s.Client.SetNX(ctx, reclaimClaimKey(s.Lane, entry.SlotID), "1", reclaimClaimTTL).Result()
+	if err != nil {
+		return err
+	}
+	if !won {
+		return nil
+	}
 	marked, key, err := markSlot(entry.Payload, entry.TenantID, entry.SlotID, s.Lane)
 	if err != nil {
 		return err

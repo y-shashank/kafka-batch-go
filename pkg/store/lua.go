@@ -6,12 +6,12 @@ const batchDoneJobLua = `
 local seq = tonumber(ARGV[1])
 if not seq or seq < 1 then return {0, 'invalid'} end
 
+if redis.call('EXISTS', KEYS[1]) == 0 then return {0, 'not_found'} end
+
 local bit = seq - 1
 if redis.call('GETBIT', KEYS[2], bit) == 1 then return {0, 'duplicate'} end
 redis.call('SETBIT', KEYS[2], bit, 1)
 redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
-
-if redis.call('EXISTS', KEYS[1]) == 0 then return {0, 'not_found'} end
 
 local status = redis.call('HGET', KEYS[1], 'status')
 if status == 'success' or status == 'complete' or status == 'cancelled' then

@@ -85,7 +85,11 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	}
 
 	st := store.NewRedisStore(rdb, cfg.BatchTTL)
-	prod, err := kafkaclient.New(cfg.Brokers)
+	acks, err := kafkaclient.RequiredAcksFromConfig(cfg.RequiredAcks())
+	if err != nil {
+		return fmt.Errorf("producer acks: %w", err)
+	}
+	prod, err := kafkaclient.New(cfg.Brokers, kafkaclient.WithRequiredAcks(acks))
 	if err != nil {
 		return err
 	}
@@ -112,22 +116,44 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	defer lagClient.Close()
 	ingestLag := priority.NewLagReader(lagClient)
 
-	RunConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-events", []string{cfg.EventsTopic}, func(rec *kgo.Record) error {
-		reconciler.MaybeRun(ctx, cfg, st, prod)
-		_, err := eventProc.ProcessBatch(ctx, [][]byte{rec.Value})
-		return err
-	}, consumerHealth, nil, nil)
+	eventsGroup := cfg.ConsumerGroup + "-events"
+	RunBatchedConsumerGroupMembers(ctx, cfg.EventsConsumerMembers(), cfg.Brokers, eventsGroup,
+		[]string{cfg.EventsTopic}, func(ctx context.Context, recs []*kgo.Record) error {
+			reconciler.MaybeRun(ctx, cfg, st, prod)
+			if len(recs) == 0 {
+				return nil
+			}
+			raw := make([][]byte, len(recs))
+			for i, rec := range recs {
+				raw[i] = rec.Value
+			}
+			_, err := eventProc.ProcessBatch(ctx, raw)
+			return err
+		}, consumerHealth, nil, nil)
+	log.Printf("kbatch events consumer group=%s members=%d topic=%s acks=%s",
+		eventsGroup, cfg.EventsConsumerMembers(), cfg.EventsTopic, cfg.RequiredAcks())
 
 	retryTopics := cfg.RetryTopics()
 	if len(retryTopics) > 0 {
-		RunConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-retry", retryTopics, func(rec *kgo.Record) error {
-			src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
-			out, err := retryProc.Process(ctx, rec.Value, src)
-			if err != nil {
-				return err
-			}
-			return applyRetryOutcome(ctx, cfg, prod, out, src)
-		}, consumerHealth, pauseCtl, live)
+		if cfg.RetryTransactionalEnabled {
+			// Exactly-once retry pipeline (produce + offset commit atomic via Kafka
+			// transactions). Opt-in: requires broker/topic transaction support, so it is
+			// off by default and the non-transactional path below remains the fallback.
+			RunRetryConsumerTransactional(ctx, cfg, retryTopics, retryProc, consumerHealth)
+		} else {
+			retryGroup := cfg.ConsumerGroup + "-retry"
+			RunConsumerGroupMembers(ctx, cfg.RetryConsumerMembers(), cfg.Brokers, retryGroup, retryTopics,
+				func(rec *kgo.Record) error {
+					src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
+					out, err := retryProc.Process(ctx, rec.Value, src)
+					if err != nil {
+						return err
+					}
+					return applyRetryOutcome(ctx, cfg, prod, out, src)
+				}, consumerHealth, pauseCtl, live)
+			log.Printf("kbatch retry consumer group=%s members=%d topics=%v",
+				retryGroup, cfg.RetryConsumerMembers(), retryTopics)
+		}
 	}
 
 	if cfg.SchedulePollerEnabled {

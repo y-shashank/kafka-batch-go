@@ -135,7 +135,7 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 
 	if err := p.withFairSlot(ctx, raw, run); err != nil {
 		if errors.Is(err, errFairSkipped) {
-			return out, nil
+			return p.handleFairSkip(ctx, job, raw, src, run)
 		}
 		return p.handleFailure(ctx, job, raw, src, err)
 	}
@@ -150,6 +150,88 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 	p.releaseUniq(ctx, job)
 	emitJobProcessed(job, instrumentSince(started, p.now()))
 	return out, nil
+}
+
+// fairSkipDeferGrace is added past a live slot lease's expiry before a deferred
+// fair-skip redelivery is reconsidered, so the lease is unambiguously expired
+// (and the holder confirmed dead) by the time it returns.
+const fairSkipDeferGrace = 5 * time.Second
+
+// handleFairSkip decides what to do when a fair slot's dedup key is already held
+// (errFairSkipped). Three cases:
+//
+//  1. Completion already recorded → genuine duplicate delivery; drop it.
+//  2. Not recorded, slot lease still live → the holder is alive and working.
+//     Do NOT run (that would double-execute); defer the redelivery past the
+//     lease expiry via the delayed retry topic and re-check then.
+//  3. Not recorded, slot lease gone/expired → the holder died mid-perform before
+//     counting. Re-run so the batch can finalize (jobs are at-least-once and
+//     handlers must be idempotent, README pitfall #1) and emit the completion.
+//
+// The completion bitmap dedups counting, so even if a deferred copy and a slow
+// holder both eventually emit, the batch is counted exactly once.
+func (p *Processor) handleFairSkip(ctx context.Context, job protocol.JobMessage, raw []byte, src protocol.SourceCoords, run func() error) (Outcome, error) {
+	out := Outcome{CommitOffset: true}
+	if p.Store == nil || job.BatchID == nil || job.BatchSeq == nil || job.BatchCounted {
+		return out, nil
+	}
+	recorded, err := p.Store.CompletionRecorded(ctx, *job.BatchID, *job.BatchSeq)
+	if err != nil {
+		return out, err
+	}
+	if recorded {
+		return out, nil // (1) genuine duplicate — already counted
+	}
+
+	// (2) Holder still alive? Defer past the lease expiry instead of double-running.
+	sched := p.fairScheduler(raw)
+	fm := parseFairMeta(raw)
+	if sched != nil && fm.slotID != "" {
+		active, expiry, lerr := sched.SlotLeaseActive(ctx, fm.slotID)
+		if lerr != nil {
+			return out, lerr
+		}
+		if active {
+			retryAt := time.Unix(int64(expiry), 0).Add(fairSkipDeferGrace)
+			if !retryAt.After(p.now()) {
+				retryAt = p.now().Add(fairSkipDeferGrace)
+			}
+			payload, berr := buildFairDeferPayload(raw, retryAt, src.Topic)
+			if berr != nil {
+				return out, berr
+			}
+			out.RetryTopic = p.Cfg.RetryTopic(p.Cfg.RetryTierFor(job.Attempt+1, job.RetryTier))
+			out.RetryKey = job.JobID
+			out.RetryPayload = payload
+			return out, nil
+		}
+	}
+
+	// (3) Orphaned slot — holder is dead. Run to completion so the batch advances.
+	if err := run(); err != nil {
+		return p.handleFailure(ctx, job, raw, src, err)
+	}
+	ev := p.buildEvent(job, "success", src)
+	out.Event = &ev
+	if job.Attempt > 0 {
+		_ = p.Store.ClearFailure(ctx, *job.BatchID, job.JobID)
+	}
+	p.releaseUniq(ctx, job)
+	return out, nil
+}
+
+// buildFairDeferPayload re-frames a fair job for delayed redelivery via the retry
+// topic. Unlike buildRetryPayload it PRESERVES the _fair_slot* metadata (so the
+// returning copy re-checks the same slot and its lease) and does NOT bump attempt
+// — a defer is not a retry and must not consume the job's retry budget.
+func buildFairDeferPayload(raw []byte, retryAt time.Time, retryTo string) ([]byte, error) {
+	var m map[string]interface{}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, err
+	}
+	m["retry_after"] = retryAt.UTC().Format(time.RFC3339)
+	m["retry_to"] = retryTo
+	return json.Marshal(m)
 }
 
 func (p *Processor) handleFailure(ctx context.Context, job protocol.JobMessage, raw []byte, src protocol.SourceCoords, execErr error) (Outcome, error) {

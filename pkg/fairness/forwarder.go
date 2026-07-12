@@ -65,13 +65,20 @@ func (f *Forwarder) handleExpired(ctx context.Context, job *CheckoutResult) bool
 	if !jobexpiry.Expired(validTill, f.now()) {
 		return false
 	}
-	_ = f.Scheduler.Complete(ctx, job.TenantID, job.SlotID, 0)
-	_, _ = f.Scheduler.ConfirmForward(ctx, job.SlotID)
+	// The payload was already LPOP'd from the ready list during Checkout, so the
+	// forwarding entry (+ its lease) is now the ONLY durable record of this job.
+	// Emit the completion/DLT drop first; only release the slot and confirm the
+	// forward once it succeeds. If the drop fails we leave the forwarding entry
+	// and lease intact so stale-forward recovery re-produces the job instead of
+	// losing it (and stranding its batch). Mirrors forwardJob's produce→confirm.
 	if f.OnExpired != nil {
 		if err := f.OnExpired(ctx, job, job.Payload); err != nil {
-			log.Printf("[kbatch-fair-forwarder] expired drop lane=%s: %v", f.Lane, err)
+			log.Printf("[kbatch-fair-forwarder] expired drop lane=%s: %v (retained for stale-forward recovery)", f.Lane, err)
+			return true
 		}
 	}
+	_ = f.Scheduler.Complete(ctx, job.TenantID, job.SlotID, 0)
+	_, _ = f.Scheduler.ConfirmForward(ctx, job.SlotID)
 	return true
 }
 

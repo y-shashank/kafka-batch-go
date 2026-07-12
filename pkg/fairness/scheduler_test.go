@@ -3,6 +3,7 @@ package fairness
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
@@ -183,6 +184,72 @@ type producerFunc func(ctx context.Context, topic, key string, payload []byte) e
 
 func (f producerFunc) Produce(ctx context.Context, topic, key string, payload []byte) error {
 	return f(ctx, topic, key, payload)
+}
+
+// TestListStaleForwardsRecoversOrphanWithNoLeaseRecord is a regression test for the
+// job-loss bug: a forwarding-buffer entry whose lease record has already been swept by
+// ReclaimExpiredLeases (or was otherwise never/no-longer present) must still be reported
+// as reclaimable. Checkout creates the forwarding entry and its lease atomically, and
+// every legitimate teardown path clears the forwarding entry no later than the lease, so
+// "forwarding entry present, lease entirely absent" can only mean a crashed producer that
+// needs recovery — it must never be silently skipped.
+func TestListStaleForwardsRecoversOrphanWithNoLeaseRecord(t *testing.T) {
+	s, mr := testScheduler(t)
+	ctx := context.Background()
+
+	slotID := "slot-orphan-1"
+	payload := mustJSON(t, map[string]interface{}{"job_id": "j1", "tenant_id": "acme"})
+	mr.HSet(forwardingKey(s.Lane), slotID, string(payload))
+	mr.HSet(forwardingMetaKey(s.Lane), slotID, "acme")
+	// Deliberately no lease record for slotID in leasesKey — simulates
+	// ReclaimExpiredLeases having already purged it.
+
+	stale, err := s.ListStaleForwards(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stale) != 1 || stale[0].SlotID != slotID || stale[0].TenantID != "acme" {
+		t.Fatalf("expected orphaned entry to be listed as stale, got %+v", stale)
+	}
+}
+
+// TestReclaimStaleForwardConcurrentDoesNotDuplicateProduce is a regression test for the
+// duplicate-delivery race: two forwarder replicas racing to reclaim the same stale slot
+// must produce the job at most once.
+func TestReclaimStaleForwardConcurrentDoesNotDuplicateProduce(t *testing.T) {
+	s, mr := testScheduler(t)
+	ctx := context.Background()
+
+	slotID := "slot-orphan-2"
+	payload := mustJSON(t, map[string]interface{}{"job_id": "j1", "tenant_id": "acme"})
+	mr.HSet(forwardingKey(s.Lane), slotID, string(payload))
+	mr.HSet(forwardingMetaKey(s.Lane), slotID, "acme")
+
+	entry := StaleForward{SlotID: slotID, TenantID: "acme", Payload: payload}
+
+	var mu sync.Mutex
+	var produceCount int
+	produce := func(_ []byte, _ string) error {
+		mu.Lock()
+		produceCount++
+		mu.Unlock()
+		return nil
+	}
+
+	const n = 10
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			_ = s.ReclaimStaleForward(ctx, entry, produce)
+		}()
+	}
+	wg.Wait()
+
+	if produceCount != 1 {
+		t.Fatalf("expected exactly 1 produce across %d concurrent reclaims, got %d", n, produceCount)
+	}
 }
 
 func mustJSON(t *testing.T, v map[string]interface{}) []byte {

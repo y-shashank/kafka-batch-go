@@ -32,6 +32,24 @@ type Daemon struct {
 	HandlerManifest    string
 	SkipCancelledJobs  bool
 	NodeID             string
+	RetryTransactionalEnabled bool
+	// EventsConsumerConcurrency is the number of in-process Kafka group members
+	// for the events consumer (same group, partition assignment split by broker).
+	EventsConsumerConcurrency int
+	// RetryConsumerConcurrency is the number of in-process group members for the
+	// non-transactional retry consumer.
+	RetryConsumerConcurrency int
+	// ProducerRequiredAcks is "all_isr" (default, safest) or "leader".
+	ProducerRequiredAcks string
+	// JobsConsumerConcurrency is in-process group members for plain go job topics.
+	JobsConsumerConcurrency int
+	// FairReadyConsumerConcurrency is in-process group members per fair-ready lane.
+	FairReadyConsumerConcurrency int
+	// PriorityConsumerConcurrency is in-process group members per priority group.
+	PriorityConsumerConcurrency int
+	// JobProcessConcurrency is parallel job executions per poll per consumer member
+	// (Karafka concurrency equivalent). 1 = serial within each poll loop.
+	JobProcessConcurrency int
 	SchedulePollerEnabled bool
 	ScheduledTopic        string
 	SchedulePollInterval  time.Duration
@@ -132,7 +150,70 @@ func DefaultDaemon() Daemon {
 		ReconciliationInterval:      300 * time.Second,
 		ReconcilerLockTTL:           600 * time.Second,
 		MaxReconcilePerRun:          100,
+		EventsConsumerConcurrency:   8,
+		RetryConsumerConcurrency:    4,
+		ProducerRequiredAcks:        "all_isr",
+		JobsConsumerConcurrency:     8,
+		FairReadyConsumerConcurrency: 8,
+		PriorityConsumerConcurrency: 4,
+		JobProcessConcurrency:       1,
 	}
+}
+
+// RequiredAcks returns the franz-go ack level for the shared producer client.
+func (c Daemon) RequiredAcks() string {
+	if c.ProducerRequiredAcks == "" {
+		return "all_isr"
+	}
+	return c.ProducerRequiredAcks
+}
+
+// EventsConsumerMembers returns a positive member count for the events group.
+func (c Daemon) EventsConsumerMembers() int {
+	if c.EventsConsumerConcurrency < 1 {
+		return 1
+	}
+	return c.EventsConsumerConcurrency
+}
+
+// RetryConsumerMembers returns a positive member count for the retry group.
+func (c Daemon) RetryConsumerMembers() int {
+	if c.RetryConsumerConcurrency < 1 {
+		return 1
+	}
+	return c.RetryConsumerConcurrency
+}
+
+// JobsConsumerMembers returns in-process group members for plain go job topics.
+func (c Daemon) JobsConsumerMembers() int {
+	if c.JobsConsumerConcurrency < 1 {
+		return 1
+	}
+	return c.JobsConsumerConcurrency
+}
+
+// FairReadyConsumerMembers returns in-process group members per fair-ready lane.
+func (c Daemon) FairReadyConsumerMembers() int {
+	if c.FairReadyConsumerConcurrency < 1 {
+		return 1
+	}
+	return c.FairReadyConsumerConcurrency
+}
+
+// PriorityConsumerMembers returns in-process group members per priority group.
+func (c Daemon) PriorityConsumerMembers() int {
+	if c.PriorityConsumerConcurrency < 1 {
+		return 1
+	}
+	return c.PriorityConsumerConcurrency
+}
+
+// JobProcessWorkers returns parallel job executions per poll (min 1).
+func (c Daemon) JobProcessWorkers() int {
+	if c.JobProcessConcurrency < 1 {
+		return 1
+	}
+	return c.JobProcessConcurrency
 }
 
 func LoadDaemon(path string) (Daemon, error) {
@@ -159,6 +240,14 @@ func LoadDaemon(path string) (Daemon, error) {
 		HandlerManifest string            `yaml:"handler_manifest"`
 		MaxRetries         int            `yaml:"max_retries"`
 		CompleteAfter      int            `yaml:"complete_after_retries"`
+		RetryTransactionalEnabled bool     `yaml:"retry_transactional_enabled"`
+		EventsConsumerConcurrency int        `yaml:"events_consumer_concurrency"`
+		RetryConsumerConcurrency  int        `yaml:"retry_consumer_concurrency"`
+		ProducerRequiredAcks      string     `yaml:"producer_required_acks"`
+		JobsConsumerConcurrency   int        `yaml:"jobs_consumer_concurrency"`
+		FairReadyConsumerConcurrency int     `yaml:"fair_ready_consumer_concurrency"`
+		PriorityConsumerConcurrency int      `yaml:"priority_consumer_concurrency"`
+		JobProcessConcurrency     int        `yaml:"job_process_concurrency"`
 		SchedulePollerEnabled bool          `yaml:"schedule_poller_enabled"`
 		ScheduledTopic        string        `yaml:"scheduled_topic"`
 		ScheduleLeaseSeconds  int           `yaml:"schedule_lease_seconds"`
@@ -247,6 +336,30 @@ func LoadDaemon(path string) (Daemon, error) {
 	}
 	if doc.CompleteAfter > 0 {
 		cfg.CompleteAfter = doc.CompleteAfter
+	}
+	if doc.RetryTransactionalEnabled {
+		cfg.RetryTransactionalEnabled = true
+	}
+	if doc.EventsConsumerConcurrency > 0 {
+		cfg.EventsConsumerConcurrency = doc.EventsConsumerConcurrency
+	}
+	if doc.RetryConsumerConcurrency > 0 {
+		cfg.RetryConsumerConcurrency = doc.RetryConsumerConcurrency
+	}
+	if doc.ProducerRequiredAcks != "" {
+		cfg.ProducerRequiredAcks = doc.ProducerRequiredAcks
+	}
+	if doc.JobsConsumerConcurrency > 0 {
+		cfg.JobsConsumerConcurrency = doc.JobsConsumerConcurrency
+	}
+	if doc.FairReadyConsumerConcurrency > 0 {
+		cfg.FairReadyConsumerConcurrency = doc.FairReadyConsumerConcurrency
+	}
+	if doc.PriorityConsumerConcurrency > 0 {
+		cfg.PriorityConsumerConcurrency = doc.PriorityConsumerConcurrency
+	}
+	if doc.JobProcessConcurrency > 0 {
+		cfg.JobProcessConcurrency = doc.JobProcessConcurrency
 	}
 	if doc.SchedulePollerEnabled {
 		cfg.SchedulePollerEnabled = true
@@ -435,7 +548,49 @@ func applyEnv(cfg *Daemon) {
 	if v := os.Getenv("KAFKA_BATCH_METRICS_STATSD_ADDR"); v != "" {
 		cfg.MetricsStatsDAddr = strings.TrimSpace(v)
 	}
+	if v := os.Getenv("KAFKA_BATCH_EVENTS_CONSUMER_CONCURRENCY"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			cfg.EventsConsumerConcurrency = n
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_RETRY_CONSUMER_CONCURRENCY"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			cfg.RetryConsumerConcurrency = n
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_PRODUCER_REQUIRED_ACKS"); v != "" {
+		cfg.ProducerRequiredAcks = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("KAFKA_BATCH_JOBS_CONSUMER_CONCURRENCY"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			cfg.JobsConsumerConcurrency = n
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_FAIR_READY_CONSUMER_CONCURRENCY"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			cfg.FairReadyConsumerConcurrency = n
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_PRIORITY_CONSUMER_CONCURRENCY"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			cfg.PriorityConsumerConcurrency = n
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_JOB_PROCESS_CONCURRENCY"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			cfg.JobProcessConcurrency = n
+		}
+	}
 	cfg.prefixTopics()
+}
+
+func parsePositiveInt(s string) (int, error) {
+	var n int
+	_, err := fmt.Sscanf(strings.TrimSpace(s), "%d", &n)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("invalid positive int %q", s)
+	}
+	return n, nil
 }
 
 func (c *Daemon) prefixTopics() {

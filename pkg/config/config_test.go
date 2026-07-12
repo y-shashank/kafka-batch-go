@@ -172,6 +172,34 @@ func TestJobTopicsGoExcludesFairAndRuby(t *testing.T) {
 	}
 }
 
+func TestDefaultDaemonConsumerConcurrency(t *testing.T) {
+	cfg := DefaultDaemon()
+	if cfg.EventsConsumerConcurrency != 8 {
+		t.Fatalf("events members=%d", cfg.EventsConsumerConcurrency)
+	}
+	if cfg.RetryConsumerConcurrency != 4 {
+		t.Fatalf("retry members=%d", cfg.RetryConsumerConcurrency)
+	}
+	if cfg.RequiredAcks() != "all_isr" {
+		t.Fatalf("acks=%q", cfg.RequiredAcks())
+	}
+	if cfg.EventsConsumerMembers() != 8 {
+		t.Fatalf("events members helper=%d", cfg.EventsConsumerMembers())
+	}
+	if cfg.JobsConsumerMembers() != 8 {
+		t.Fatalf("jobs members=%d", cfg.JobsConsumerMembers())
+	}
+	if cfg.FairReadyConsumerMembers() != 8 {
+		t.Fatalf("fair ready members=%d", cfg.FairReadyConsumerMembers())
+	}
+	if cfg.PriorityConsumerMembers() != 4 {
+		t.Fatalf("priority members=%d", cfg.PriorityConsumerMembers())
+	}
+	if cfg.JobProcessWorkers() != 1 {
+		t.Fatalf("job process workers=%d", cfg.JobProcessWorkers())
+	}
+}
+
 func TestWriteAndLoadRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "mini.yaml")
