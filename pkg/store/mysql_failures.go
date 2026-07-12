@@ -7,6 +7,8 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+
+	"github.com/y-shashank/kafka-batch-go/pkg/dsn"
 )
 
 // MySQLFailures records job failures to kafka_batch_failures (Ruby MysqlStore parity).
@@ -14,8 +16,12 @@ type MySQLFailures struct {
 	db *sql.DB
 }
 
-func NewMySQLFailures(dsn string) (*MySQLFailures, error) {
-	db, err := sql.Open("mysql", dsn)
+func NewMySQLFailures(conn string) (*MySQLFailures, error) {
+	dataSource, err := dsn.Normalize(conn)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("mysql", dataSource)
 	if err != nil {
 		return nil, err
 	}

@@ -454,6 +454,89 @@ CLI: `config.LoadDaemon` applies env after YAML parse.
 
 See `config/daemon.example.yml` for the full YAML surface (fairness, schedule, retry tiers, etc.).
 
+#### MySQL connection strings
+
+`KAFKA_BATCH_SCHEDULE_MYSQL_DSN` and `KAFKA_BATCH_STORE_MYSQL_DSN` (and their YAML
+keys `schedule_mysql_dsn` / `store_mysql_dsn`) accept **either** form:
+
+```bash
+# 1. Native go-sql-driver DSN
+export KAFKA_BATCH_STORE_MYSQL_DSN='dbuser:secret@tcp(mysql:3306)/kafka_batch?parseTime=true&loc=UTC'
+
+# 2. Rails-style URL (as in DATABASE_URL / database.yml)
+export KAFKA_BATCH_STORE_MYSQL_DSN='mysql2://dbuser:secret@mysql:3306/kafka_batch?parseTime=true&loc=UTC'
+```
+
+The `mysql2://` and `mysql://` URL forms are converted to the driver DSN at connect
+time (port defaults to `3306`; query params such as `parseTime`, `loc`, `tls`, and
+`charset` are preserved). Use `parseTime=true&loc=UTC` so MySQL timestamps scan into
+Go `time.Time` in UTC — the schedule index depends on it.
+
+**Reference an env var from the config (one value, all three roles).** Any value in
+`daemon.yml` may contain `${VAR}` or `${VAR:-default}` — expanded from the environment
+at load time. Set the connection string once and point every DSN key at it:
+
+```yaml
+# daemon.yml
+schedule_mysql_dsn: ${KB_MYSQL_URL}
+store_mysql_dsn:    ${KB_MYSQL_URL}
+```
+
+```bash
+export KB_MYSQL_URL='mysql2://dbuser:secret@mysql:3306/kafka_batch?parseTime=true&loc=UTC'
+```
+
+The daemon (control) and worker (execution) pick this up when they load `daemon.yml`.
+The client — which builds its `Config` in code rather than reading the YAML — expands the
+same `${VAR}` refs in `ScheduleMySQLDSN` via `client.ApplyEnv` (called by `client.New`),
+so setting `cfg.ScheduleMySQLDSN = "${KB_MYSQL_URL}"` works there too. A bare `$VAR`
+(no braces) is intentionally left untouched so a literal `$` in a password survives.
+
+Interpolation is not limited to DSNs — **any** value in `daemon.yml` accepts it. A typical
+`redis_url` with a local fallback:
+
+```yaml
+# daemon.yml — use REDIS_URL when set, else localhost
+redis_url: ${REDIS_URL:-redis://localhost:6379/0}
+```
+
+### Schedule poller (delayed jobs — `perform_in` / `perform_at`)
+
+Runs on the **control** tier only (gated by `schedule_poller_enabled`). Each tick claims up
+to `schedule_batch_size` due jobs in one query and dispatches them; when a tick finds nothing
+due it sleeps and backs off exponentially (with jitter) up to `schedule_poll_max_interval`,
+resetting to `schedule_poll_interval` the moment work reappears. **Same keys and defaults as
+the Ruby gem**, so the two runtimes are interchangeable.
+
+| YAML key | Env-equivalent* | Default | What it does |
+|----------|-----------------|---------|--------------|
+| `schedule_poller_enabled` | — | `false` | Enable the delayed-job poller (control tier). |
+| `scheduled_topic` | — | `kafka_batch.scheduled` | Durable payload topic for `perform_in`/`perform_at`. |
+| `schedule_store` | — | `redis` | Schedule-index backend: `redis` or `mysql`. |
+| `schedule_mysql_dsn` | `KAFKA_BATCH_SCHEDULE_MYSQL_DSN` | — | Required when `schedule_store: mysql` (DSN or `mysql2://` URL). |
+| `schedule_poll_interval` | — | `5` (sec) | **How often it checks** for due jobs while work is flowing. |
+| `schedule_poll_max_interval` | — | `60` (sec) | Cap for exponential backoff while idle. |
+| `schedule_poll_jitter` | — | `0.1` | ± fraction on the sleep so pods de-sync (`0` disables). |
+| `schedule_batch_size` | — | `100` | **How many jobs fetched per query** (the claim `LIMIT`). |
+| `schedule_lease_seconds` | — | `60` (sec) | Lease TTL on a claimed job pointer. |
+| `schedule_reclaim_interval` | — | `30` (sec) | How often to reclaim expired leases. |
+
+<sub>*Only the MySQL DSN has a dedicated env override; the rest are set via YAML (use `${VAR}` interpolation if you need them env-driven).</sub>
+
+```yaml
+# daemon.yml — control tier
+schedule_poller_enabled: true
+schedule_store: mysql
+schedule_mysql_dsn: ${KB_MYSQL_URL}
+schedule_poll_interval: 5      # poll cadence when jobs are flowing
+schedule_poll_max_interval: 60 # idle backoff cap
+schedule_batch_size: 100       # due jobs claimed per poll
+```
+
+> **Runtime parity note:** the Go `DefaultDaemon()` leaves `schedule_poll_jitter` at `0` unless
+> set, whereas the Ruby gem defaults it to `0.1`. Set `schedule_poll_jitter: 0.1` explicitly in
+> the Go config if you want matching pod de-sync behavior across runtimes.
+
 ### Throughput tuning — single Go pod
 
 Go daemon and worker scale **inside one pod** with two mechanisms:

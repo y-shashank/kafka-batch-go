@@ -235,6 +235,9 @@ func LoadDaemon(path string) (Daemon, error) {
 	if err != nil {
 		return cfg, err
 	}
+	// Interpolate ${VAR} / ${VAR:-default} references so config can point at
+	// deployment env vars (e.g. store_mysql_dsn: ${KB_MYSQL_URL}).
+	raw = []byte(ExpandEnv(string(raw)))
 	var doc struct {
 		Brokers                              []string         `yaml:"brokers"`
 		TopicPrefix                          string           `yaml:"topic_prefix"`

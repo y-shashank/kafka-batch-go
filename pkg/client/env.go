@@ -3,6 +3,8 @@ package client
 import (
 	"os"
 	"strings"
+
+	"github.com/y-shashank/kafka-batch-go/pkg/config"
 )
 
 // ApplyEnv overlays deployment environment variables onto cfg (same names as daemon/worker).
@@ -23,4 +25,7 @@ func ApplyEnv(cfg *Config) {
 	if v := os.Getenv("KAFKA_BATCH_SCHEDULE_MYSQL_DSN"); v != "" {
 		cfg.ScheduleMySQLDSN = v
 	}
+	// Expand ${VAR} / ${VAR:-default} refs so the client can share the same
+	// env-referenced DSN/URL as the control and execution roles.
+	cfg.ScheduleMySQLDSN = config.ExpandEnv(cfg.ScheduleMySQLDSN)
 }

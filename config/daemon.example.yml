@@ -9,8 +9,19 @@
 #   KAFKA_BATCH_SCHEDULE_MYSQL_DSN  when schedule_store is mysql
 #   KAFKA_BATCH_PRIORITY_CONFIG(S)  priority YAML path(s) — daemon/worker only
 #   KAFKA_BATCH_STORE_MYSQL_DSN     batch failures / pause MySQL — daemon/worker only
+#     Both MYSQL_DSN vars accept a go-sql-driver DSN
+#       user:pass@tcp(host:3306)/db?parseTime=true&loc=UTC
+#     or a Rails-style URL
+#       mysql2://user:pass@host:3306/db?parseTime=true&loc=UTC
 #   KAFKA_BATCH_METRICS_*           metrics — daemon/worker only
 #   KAFKA_BATCH_LIVENESS_*          health HTTP — daemon/worker only
+#
+# Env interpolation: any value may reference an env var with ${VAR} or
+# ${VAR:-default}. One variable can then feed the client, control, and
+# execution roles — e.g. set KB_MYSQL_URL once and point both DSN keys at it:
+#   schedule_mysql_dsn: ${KB_MYSQL_URL}
+#   store_mysql_dsn:    ${KB_MYSQL_URL}
+# (A bare $VAR is left untouched so a literal '$' in a password survives.)
 
 brokers:
   - localhost:9092
@@ -32,7 +43,8 @@ callbacks_topic: kafka_batch.callbacks
 dead_letter_topic: kafka_batch.dead_letter
 retry_topic: kafka_batch.jobs.retry
 
-redis_url: redis://localhost:6379/0
+# Env interpolation in action: use REDIS_URL if set, else fall back to localhost.
+redis_url: ${REDIS_URL:-redis://localhost:6379/0}
 
 max_retries: 7
 
@@ -54,15 +66,18 @@ max_retries: 7
 # consumer_fetch_max_partition_bytes: 131072 # 128 KiB per partition (default)
 # consumer_fetch_max_wait_ms: 200            # max broker wait before partial fetch (default)
 
-# Phase 3b — delayed jobs (perform_in / perform_at)
-# schedule_poller_enabled: true
-# scheduled_topic: kafka_batch.scheduled
-# schedule_lease_seconds: 60
-# schedule_batch_size: 100
-# schedule_poll_interval: 5
-# schedule_reclaim_interval: 30
-# schedule_poll_max_interval: 60
-# schedule_poll_jitter: 0.1
+# Phase 3b — delayed jobs (perform_in / perform_at). Runs on control only.
+# Values shown are the defaults; uncomment to override. Same keys/defaults in the Ruby gem.
+# schedule_poller_enabled: true          # bool  — enable the delayed-job poller (control tier)
+# scheduled_topic: kafka_batch.scheduled # durable payload topic for perform_in/perform_at
+# schedule_store: redis                  # redis (default) | mysql — backend for the schedule index
+# schedule_mysql_dsn: ${KB_MYSQL_URL}    # required when schedule_store: mysql (DSN or mysql2:// URL)
+# schedule_poll_interval: 5              # sec   — base poll cadence while jobs are flowing
+# schedule_poll_max_interval: 60         # sec   — cap for exponential backoff while idle
+# schedule_poll_jitter: 0.1              # ±frac — jitter on the sleep so pods de-sync (0 disables)
+# schedule_batch_size: 100               # int   — max due jobs claimed (query LIMIT) per poll
+# schedule_lease_seconds: 60             # sec   — lease TTL on a claimed job pointer
+# schedule_reclaim_interval: 30          # sec   — how often to reclaim expired leases
 
 # Priority YAML groups (one file per consumer group suffix)
 # priority_config_paths:

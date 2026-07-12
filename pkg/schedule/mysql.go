@@ -7,6 +7,8 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+
+	"github.com/y-shashank/kafka-batch-go/pkg/dsn"
 )
 
 // MysqlStore implements the delayed-job index on kafka_batch_scheduled_jobs.
@@ -15,8 +17,12 @@ type MysqlStore struct {
 	limit int
 }
 
-func NewMysqlStore(dsn string, readMissLimit int) (*MysqlStore, error) {
-	db, err := sql.Open("mysql", dsn)
+func NewMysqlStore(conn string, readMissLimit int) (*MysqlStore, error) {
+	dataSource, err := dsn.Normalize(conn)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("mysql", dataSource)
 	if err != nil {
 		return nil, err
 	}
