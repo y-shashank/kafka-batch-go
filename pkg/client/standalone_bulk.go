@@ -19,26 +19,28 @@ func (c *Client) planStandalonePushes(ctx context.Context, jobType string, paylo
 		return entry, nil, nil, err
 	}
 	jobIDs := make([]string, len(payloads))
+	for i := range payloads {
+		jobIDs[i] = uuid.NewString()
+	}
+	workerName := workerClassName(entry, jobType)
+	claimed, err := c.bulkUniqClaims(ctx, entry, workerName, payloads, jobIDs, "")
+	if err != nil {
+		return entry, nil, nil, err
+	}
 	plans := make([]pushPlan, 0, len(payloads))
 	for i, payload := range payloads {
 		if payload == nil {
 			payload = map[string]interface{}{}
 		}
-		jobID := uuid.NewString()
-		skipped, err := c.claimUniq(ctx, entry, jobType, payload, jobID, "")
-		if err != nil {
-			return entry, nil, nil, err
-		}
-		if skipped {
+		if !claimed[i] {
 			jobIDs[i] = ""
 			continue
 		}
 		fp := ""
 		if entry.Uniq && c.cfg.UniqEnabled {
-			fp = uniq.DigestHex(workerClassName(entry, jobType), payload)
+			fp = uniq.DigestHex(workerName, payload)
 		}
-		plans = append(plans, pushPlan{jobID: jobID, payload: payload, fp: fp})
-		jobIDs[i] = jobID
+		plans = append(plans, pushPlan{jobID: jobIDs[i], payload: payload, fp: fp})
 	}
 	return entry, plans, jobIDs, nil
 }

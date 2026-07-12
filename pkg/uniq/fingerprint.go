@@ -53,6 +53,52 @@ func (l *Locker) Claim(ctx context.Context, workerClassName string, payload map[
 	return ok, nil
 }
 
+// ClaimInput is one row for ClaimMany (bulk push_many / enqueue_many).
+type ClaimInput struct {
+	WorkerClassName string
+	Payload         map[string]interface{}
+	JobID           string
+}
+
+// ClaimMany acquires many uniq locks in pipelined Redis round-trips. Returns a
+// parallel []bool (true = acquired). Order is preserved so within-batch duplicate
+// payloads dedupe like sequential Claim calls (first wins). Fails open when Redis
+// is unavailable, matching Claim.
+func (l *Locker) ClaimMany(ctx context.Context, inputs []ClaimInput) []bool {
+	out := make([]bool, len(inputs))
+	if len(inputs) == 0 {
+		return out
+	}
+	if l == nil || l.client == nil {
+		for i := range out {
+			out[i] = true
+		}
+		return out
+	}
+
+	pipe := l.client.Pipeline()
+	cmds := make([]*redis.BoolCmd, len(inputs))
+	for i, in := range inputs {
+		key := redisKey(in.WorkerClassName, in.Payload)
+		cmds[i] = pipe.SetNX(ctx, key, in.JobID, l.ttl)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		for i := range out {
+			out[i] = true
+		}
+		return out
+	}
+	for i, cmd := range cmds {
+		ok, err := cmd.Result()
+		if err != nil {
+			out[i] = true
+		} else {
+			out[i] = ok
+		}
+	}
+	return out
+}
+
 // Release drops a lock by fingerprint hex from the wire message.
 func (l *Locker) Release(ctx context.Context, fpHex, jobID string) error {
 	if l == nil || l.client == nil {

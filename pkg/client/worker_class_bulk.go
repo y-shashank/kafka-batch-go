@@ -25,17 +25,19 @@ func (c *Client) planWorkerPushes(ctx context.Context, workerClass string, paylo
 		return "", entry, nil, nil, err
 	}
 	jobIDs := make([]string, len(payloads))
+	for i := range payloads {
+		jobIDs[i] = uuid.NewString()
+	}
+	claimed, err := c.bulkUniqClaims(ctx, entry, workerClass, payloads, jobIDs, batchID)
+	if err != nil {
+		return "", entry, nil, nil, err
+	}
 	plans := make([]workerPushPlan, 0, len(payloads))
 	for i, payload := range payloads {
 		if payload == nil {
 			payload = map[string]interface{}{}
 		}
-		jobID := uuid.NewString()
-		skipped, err := c.claimUniqWorker(ctx, entry, workerClass, payload, jobID, batchID)
-		if err != nil {
-			return "", entry, nil, nil, err
-		}
-		if skipped {
+		if !claimed[i] {
 			jobIDs[i] = ""
 			continue
 		}
@@ -43,8 +45,7 @@ func (c *Client) planWorkerPushes(ctx context.Context, workerClass string, paylo
 		if entry.Uniq && c.cfg.UniqEnabled {
 			fp = uniq.DigestHex(workerClass, payload)
 		}
-		plans = append(plans, workerPushPlan{jobID: jobID, payload: payload, fp: fp})
-		jobIDs[i] = jobID
+		plans = append(plans, workerPushPlan{jobID: jobIDs[i], payload: payload, fp: fp})
 	}
 	return jobType, entry, plans, jobIDs, nil
 }

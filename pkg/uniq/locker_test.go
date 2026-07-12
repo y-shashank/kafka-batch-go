@@ -9,6 +9,39 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+func TestLockerClaimMany(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	locker := NewLocker(rdb, time.Hour)
+	ctx := context.Background()
+
+	inputs := []ClaimInput{
+		{WorkerClassName: "W", Payload: map[string]interface{}{"id": 1}, JobID: "j1"},
+		{WorkerClassName: "W", Payload: map[string]interface{}{"id": 1}, JobID: "j2"},
+		{WorkerClassName: "W", Payload: map[string]interface{}{"id": 2}, JobID: "j3"},
+	}
+	got := locker.ClaimMany(ctx, inputs)
+	want := []bool{true, false, true}
+	if len(got) != len(want) {
+		t.Fatalf("len=%d want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got[%d]=%v want %v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestLockerClaimManyNilFailsOpen(t *testing.T) {
+	var locker *Locker
+	got := locker.ClaimMany(context.Background(), []ClaimInput{
+		{WorkerClassName: "W", Payload: map[string]interface{}{"id": 1}, JobID: "j1"},
+	})
+	if len(got) != 1 || !got[0] {
+		t.Fatalf("fail-open got=%v", got)
+	}
+}
+
 func TestLockerClaimAndRelease(t *testing.T) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
