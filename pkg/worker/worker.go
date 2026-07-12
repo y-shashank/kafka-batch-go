@@ -96,7 +96,11 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	}
 
 	st := store.NewRedisStore(rdb, cfg.BatchTTL)
-	prod, err := kafkaclient.New(cfg.Brokers)
+	acks, err := kafkaclient.RequiredAcksFromConfig(cfg.RequiredAcks())
+	if err != nil {
+		return fmt.Errorf("producer acks: %w", err)
+	}
+	prod, err := kafkaclient.New(cfg.Brokers, kafkaclient.WithRequiredAcks(acks))
 	if err != nil {
 		return err
 	}
@@ -128,9 +132,14 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	defer stop()
 
 	group := cfg.ConsumerGroup + "-go-worker"
+	processWorkers := cfg.JobProcessWorkers()
 
 	if len(jobTopics) > 0 {
-		daemon.RunConsumer(ctx, cfg.Brokers, group+"-jobs", jobTopics, handleJob, consumerHealth, pauseCtl, live)
+		jobsGroup := group + "-jobs"
+		daemon.RunConcurrentConsumerGroupMembers(ctx, cfg.JobsConsumerMembers(), processWorkers,
+			cfg.Brokers, jobsGroup, jobTopics, handleJob, consumerHealth, pauseCtl, live)
+		log.Printf("kbatch go-worker jobs group=%s members=%d process_workers=%d topics=%v",
+			jobsGroup, cfg.JobsConsumerMembers(), processWorkers, jobTopics)
 	}
 
 	lagClient, err := kgo.NewClient(kgo.SeedBrokers(cfg.Brokers...))
@@ -142,16 +151,21 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	for _, pc := range goPrio {
 		gate := priority.NewGate(priorityLag, cfg.PriorityLagCheckInterval)
 		gate.Consumption = pauseCtl
-		daemon.RunPriorityGroup(ctx, cfg, pc, gate, handleJob, consumerHealth, pauseCtl, live)
+		daemon.RunPriorityGroupMembers(ctx, cfg.PriorityConsumerMembers(), processWorkers,
+			cfg, pc, gate, handleJob, consumerHealth, pauseCtl, live)
 	}
 
 	for _, spec := range fairReadyTopics {
-		daemon.RunConsumer(ctx, cfg.Brokers, cfg.GoWorkerFairReadyGroup(spec.lane),
-			[]string{spec.topic}, handleJob, consumerHealth, pauseCtl, live)
+		readyGroup := cfg.GoWorkerFairReadyGroup(spec.lane)
+		daemon.RunConcurrentConsumerGroupMembers(ctx, cfg.FairReadyConsumerMembers(), processWorkers,
+			cfg.Brokers, readyGroup, []string{spec.topic}, handleJob, consumerHealth, pauseCtl, live)
+		log.Printf("kbatch go-worker fair-ready group=%s members=%d process_workers=%d topic=%s",
+			readyGroup, cfg.FairReadyConsumerMembers(), processWorkers, spec.topic)
 	}
 
-	log.Printf("kbatch go-worker running group=%s plain=%v priority_groups=%d fair_ready=%v",
-		group, jobTopics, len(goPrio), fairReadyTopicNames(fairReadyTopics))
+	log.Printf("kbatch go-worker running group=%s plain=%v priority_groups=%d fair_ready=%v members(jobs=%d fair=%d prio=%d) process_workers=%d",
+		group, jobTopics, len(goPrio), fairReadyTopicNames(fairReadyTopics),
+		cfg.JobsConsumerMembers(), cfg.FairReadyConsumerMembers(), cfg.PriorityConsumerMembers(), processWorkers)
 	if ready := os.Getenv("KBATCH_WORKER_READY_FILE"); ready != "" {
 		_ = os.WriteFile(ready, []byte("ok\n"), 0o644)
 	}

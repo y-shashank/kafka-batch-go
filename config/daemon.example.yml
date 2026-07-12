@@ -43,6 +43,12 @@ max_retries: 3
 # retry_consumer_concurrency: 4
 # producer_required_acks: all_isr   # all_isr (default) | leader
 
+# kbatch worker throughput (single pod, multi-partition job topics)
+# jobs_consumer_concurrency: 32        # plain go job topics — match partition count
+# fair_ready_consumer_concurrency: 32  # per fair-ready lane (time / throughput)
+# priority_consumer_concurrency: 8     # per priority YAML group
+# job_process_concurrency: 1           # parallel jobs per poll per member (Karafka concurrency); try 4–8 for CPU-bound handlers
+
 # Phase 3b — delayed jobs (perform_in / perform_at)
 # schedule_poller_enabled: true
 # scheduled_topic: kafka_batch.scheduled

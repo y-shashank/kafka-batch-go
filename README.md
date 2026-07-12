@@ -318,25 +318,110 @@ kbatch worker --config config/daemon.example.yml --manifest config/kafka_batch_h
 
 ## Config
 
-Daemon and worker load `config/daemon.example.yml` (or your app copy), then **environment variables override YAML** when set:
+Daemon and worker load `config/daemon.example.yml` (or your app copy), then **environment variables override YAML** when set.
 
-| Variable | Used by | Purpose |
-|----------|---------|---------|
-| `KAFKA_BROKERS` | client, daemon, worker | Comma-separated broker list |
-| `REDIS_URL` | client, daemon, worker | Redis URL |
-| `KAFKA_PREFIX` | all | Topic + consumer_group prefix |
-| `KAFKA_BATCH_HANDLER_MANIFEST` | all | Path to `kafka_batch_handlers.yml` |
-| `KAFKA_BATCH_SCHEDULE_MYSQL_DSN` | client, daemon | MySQL schedule index |
-| `KAFKA_BATCH_PRIORITY_CONFIG(S)` | daemon, worker | Priority YAML path(s) |
-| `KAFKA_BATCH_STORE_MYSQL_DSN` | daemon, worker | MySQL failures / pause store |
-| `KAFKA_BATCH_METRICS_*` | daemon, worker | StatsD metrics |
-| `KAFKA_BATCH_LIVENESS_*` | daemon, worker | HTTP health probes |
+### Shared (client, daemon, worker)
 
-Client library: pass `client.DefaultConfig()` and call `client.New(cfg)` — `ApplyEnv` runs automatically inside `New`.
+| Variable | Purpose |
+|----------|---------|
+| `KAFKA_BROKERS` | Comma-separated broker list |
+| `REDIS_URL` | Redis URL (batch ledger, uniq, fair scheduler) |
+| `KAFKA_PREFIX` | Topic + `consumer_group` prefix |
+| `KAFKA_BATCH_HANDLER_MANIFEST` | Path to `kafka_batch_handlers.yml` |
+| `KAFKA_BATCH_SCHEDULE_MYSQL_DSN` | MySQL schedule index (client + daemon) |
+| `KAFKA_BATCH_PRIORITY_CONFIG` / `KAFKA_BATCH_PRIORITY_CONFIGS` | Priority YAML path(s) (daemon + worker) |
+| `KAFKA_BATCH_STORE_MYSQL_DSN` | MySQL failures / pause store (daemon + worker) |
+| `KAFKA_BATCH_METRICS_ENABLED` / `KAFKA_BATCH_METRICS_PREFIX` / `KAFKA_BATCH_METRICS_STATSD_ADDR` | StatsD metrics export |
+| `KAFKA_BATCH_LIVENESS_ENABLED` / `KAFKA_BATCH_LIVENESS_HTTP_ADDR` | HTTP `/health` probes |
 
-Daemon/worker CLI: `kbatch daemon --config path/to/daemon.yml` — `config.LoadDaemon` applies the same env overrides after YAML parse.
+Client: `client.DefaultConfig()` + `client.New(cfg)` applies env automatically.  
+CLI: `config.LoadDaemon` applies env after YAML parse.
 
-See `config/daemon.example.yml` for the full YAML surface.
+See `config/daemon.example.yml` for the full YAML surface (fairness, schedule, retry tiers, etc.).
+
+### Throughput tuning — single Go pod
+
+Go daemon and worker scale **inside one pod** with two mechanisms:
+
+1. **In-process consumer members** — N franz-go clients join the same Kafka consumer group; the broker assigns partitions across them (same as N pods, one OS process).
+2. **Per-poll parallelism (worker only)** — `job_process_concurrency` runs up to N jobs in parallel per poll per member (Karafka `config.concurrency` equivalent).
+
+**Max concurrent job executions** (worker):
+
+```text
+jobs_consumer_members × job_process_concurrency
+  (+ same formula per fair-ready lane and priority group)
+```
+
+Set **member count ≈ topic partition count** for partition-bound throughput. Raise **`job_process_concurrency`** when handlers are slow but partitions are scarce.
+
+#### Control plane (`kbatch daemon`)
+
+| Env variable | YAML key | Default | Used by | What it does |
+|--------------|----------|---------|---------|--------------|
+| `KAFKA_BATCH_EVENTS_CONSUMER_CONCURRENCY` | `events_consumer_concurrency` | `8` | daemon | In-process members for `{group}-events`. Each poll is batched through `ProcessBatch` (one pipelined Redis round trip per poll). Set to **events topic partition count** (e.g. `32`) when event lag grows. |
+| `KAFKA_BATCH_RETRY_CONSUMER_CONCURRENCY` | `retry_consumer_concurrency` | `4` | daemon | In-process members for `{group}-retry` (non-transactional path). Set up to **retry topic partition count** if retry-tier lag is high. |
+| `KAFKA_BATCH_PRODUCER_REQUIRED_ACKS` | `producer_required_acks` | `all_isr` | daemon, worker | `all_isr` (safest, default) or `leader` (lower produce latency; small loss risk on unclean leader failover). Affects callbacks, events, retry reroutes, schedule dispatch. |
+
+Events consumer batching and batched callback produce are always on — no extra knob.
+
+#### Execution plane (`kbatch worker`)
+
+| Env variable | YAML key | Default | What it does |
+|--------------|----------|---------|--------------|
+| `KAFKA_BATCH_JOBS_CONSUMER_CONCURRENCY` | `jobs_consumer_concurrency` | `8` | In-process members for `{group}-go-worker-jobs` (plain go topics). |
+| `KAFKA_BATCH_FAIR_READY_CONSUMER_CONCURRENCY` | `fair_ready_consumer_concurrency` | `8` | In-process members **per** fair-ready lane (`time`, `throughput`). |
+| `KAFKA_BATCH_PRIORITY_CONSUMER_CONCURRENCY` | `priority_consumer_concurrency` | `4` | In-process members **per** priority YAML group. |
+| `KAFKA_BATCH_JOB_PROCESS_CONCURRENCY` | `job_process_concurrency` | `1` | Parallel handler executions per poll **per member**. `1` = serial (safest). `4`–`8` for CPU-bound handlers. |
+| `KAFKA_BATCH_PRODUCER_REQUIRED_ACKS` | `producer_required_acks` | `all_isr` | Same as daemon — event emission after job completion. |
+
+Fairness admission is capped by control-plane `fairness_global_concurrency` (YAML). Raising worker concurrency above what control admits will backlog **ready** topics, not speed up end-to-end.
+
+#### Tuning profiles
+
+**32 partitions per topic** (typical production):
+
+```yaml
+# Control — match partition count
+events_consumer_concurrency: 32
+retry_consumer_concurrency: 8
+producer_required_acks: all_isr
+
+# Worker — see job type below
+jobs_consumer_concurrency: 32
+fair_ready_consumer_concurrency: 32
+priority_consumer_concurrency: 8
+producer_required_acks: all_isr
+```
+
+**I/O-heavy jobs** (HTTP calls, DB queries, object storage — handler waits on external systems):
+
+- Bottleneck is **waiting**, not CPU. Prefer **more partition members**, keep **`job_process_concurrency: 1`** per member.
+- Example: `jobs_consumer_concurrency: 32`, `job_process_concurrency: 1` → **32 concurrent jobs** on a 32-partition topic.
+- Size the pod for goroutine/memory overhead (many blocked I/O waits are cheap in Go).
+- If lag persists with members = partitions, add partitions (Kafka only allows increasing count).
+
+**CPU-heavy jobs** (encoding, aggregation, image/PDF work — handler saturates CPU):
+
+- Prefer **`job_process_concurrency`** up to **logical CPU count per member**, with fewer members if partition count is low.
+- Example on 8-core pod, 32 partitions: `jobs_consumer_concurrency: 8`, `job_process_concurrency: 4` → **32 concurrent jobs**.
+- Example on 16-core pod, 32 partitions: `jobs_consumer_concurrency: 16`, `job_process_concurrency: 2` → **32 concurrent jobs**.
+- Watch CPU throttling and Redis/Kafka produce latency; back off if event emission or fair slot release lags.
+
+**Mixed I/O + CPU fleet** — use separate handler topics (or fair lanes) with different worker deployments and tuning per fleet rather than one global `job_process_concurrency`.
+
+#### Quick reference
+
+| Symptom | Likely fix |
+|---------|------------|
+| Events topic lag (control) | Raise `KAFKA_BATCH_EVENTS_CONSUMER_CONCURRENCY` toward partition count |
+| Retry topic lag (control) | Raise `KAFKA_BATCH_RETRY_CONSUMER_CONCURRENCY` |
+| Job topic lag, I/O-bound handlers | Raise `KAFKA_BATCH_JOBS_CONSUMER_CONCURRENCY` toward partition count |
+| Job topic lag, CPU-bound handlers | Raise `KAFKA_BATCH_JOB_PROCESS_CONCURRENCY` (and/or members) |
+| Fair ready lag, admission OK | Raise `KAFKA_BATCH_FAIR_READY_CONSUMER_CONCURRENCY` |
+| Priority tier lag | Raise `KAFKA_BATCH_PRIORITY_CONSUMER_CONCURRENCY` |
+| Produce latency dominates | Try `KAFKA_BATCH_PRODUCER_REQUIRED_ACKS=leader` (trade durability) |
+| Ready topic backlog, ingest fine | Lower worker concurrency or raise `fairness_global_concurrency` on control |
 
 ## Operations (daemon / worker)
 
