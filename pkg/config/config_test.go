@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 )
 
 func testdata(t *testing.T, name string) string {
@@ -197,6 +198,41 @@ func TestDefaultDaemonConsumerConcurrency(t *testing.T) {
 	}
 	if cfg.JobProcessWorkers() != 1 {
 		t.Fatalf("job process workers=%d", cfg.JobProcessWorkers())
+	}
+}
+
+func TestDefaultDaemonConsumerFetchSettings(t *testing.T) {
+	cfg := DefaultDaemon()
+	s := cfg.ConsumerFetchSettings()
+	if s.MaxBytes != DefaultConsumerFetchMaxBytes {
+		t.Fatalf("max_bytes=%d", s.MaxBytes)
+	}
+	if s.MaxPartitionBytes != DefaultConsumerFetchMaxPartitionBytes {
+		t.Fatalf("max_partition_bytes=%d", s.MaxPartitionBytes)
+	}
+	if s.MaxWait != DefaultConsumerFetchMaxWait {
+		t.Fatalf("max_wait=%s", s.MaxWait)
+	}
+}
+
+func TestConsumerFetchEnvOverrides(t *testing.T) {
+	t.Setenv("KAFKA_BATCH_CONSUMER_FETCH_MAX_BYTES", "2097152")
+	t.Setenv("KAFKA_BATCH_CONSUMER_FETCH_MAX_PARTITION_BYTES", "262144")
+	t.Setenv("KAFKA_BATCH_CONSUMER_FETCH_MAX_WAIT_MS", "500")
+
+	cfg, err := LoadDaemon("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := cfg.ConsumerFetchSettings()
+	if s.MaxBytes != 2<<20 {
+		t.Fatalf("max_bytes=%d", s.MaxBytes)
+	}
+	if s.MaxPartitionBytes != 256<<10 {
+		t.Fatalf("max_partition_bytes=%d", s.MaxPartitionBytes)
+	}
+	if s.MaxWait != 500*time.Millisecond {
+		t.Fatalf("max_wait=%s", s.MaxWait)
 	}
 }
 

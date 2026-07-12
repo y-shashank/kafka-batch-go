@@ -50,6 +50,12 @@ type Daemon struct {
 	// JobProcessConcurrency is parallel job executions per poll per consumer member
 	// (Karafka concurrency equivalent). 1 = serial within each poll loop.
 	JobProcessConcurrency int
+	// ConsumerFetchMaxBytes caps total bytes per broker fetch (default 1 MiB).
+	ConsumerFetchMaxBytes int32
+	// ConsumerFetchMaxPartitionBytes caps bytes per partition in a fetch (default 128 KiB).
+	ConsumerFetchMaxPartitionBytes int32
+	// ConsumerFetchMaxWait is max broker wait before returning a partial fetch.
+	ConsumerFetchMaxWait time.Duration
 	SchedulePollerEnabled bool
 	ScheduledTopic        string
 	SchedulePollInterval  time.Duration
@@ -157,6 +163,9 @@ func DefaultDaemon() Daemon {
 		FairReadyConsumerConcurrency: 8,
 		PriorityConsumerConcurrency: 4,
 		JobProcessConcurrency:       1,
+		ConsumerFetchMaxBytes:          DefaultConsumerFetchMaxBytes,
+		ConsumerFetchMaxPartitionBytes: DefaultConsumerFetchMaxPartitionBytes,
+		ConsumerFetchMaxWait:           DefaultConsumerFetchMaxWait,
 	}
 }
 
@@ -248,6 +257,9 @@ func LoadDaemon(path string) (Daemon, error) {
 		FairReadyConsumerConcurrency int     `yaml:"fair_ready_consumer_concurrency"`
 		PriorityConsumerConcurrency int      `yaml:"priority_consumer_concurrency"`
 		JobProcessConcurrency     int        `yaml:"job_process_concurrency"`
+		ConsumerFetchMaxBytes          int32   `yaml:"consumer_fetch_max_bytes"`
+		ConsumerFetchMaxPartitionBytes int32   `yaml:"consumer_fetch_max_partition_bytes"`
+		ConsumerFetchMaxWaitMs         float64 `yaml:"consumer_fetch_max_wait_ms"`
 		SchedulePollerEnabled bool          `yaml:"schedule_poller_enabled"`
 		ScheduledTopic        string        `yaml:"scheduled_topic"`
 		ScheduleLeaseSeconds  int           `yaml:"schedule_lease_seconds"`
@@ -360,6 +372,15 @@ func LoadDaemon(path string) (Daemon, error) {
 	}
 	if doc.JobProcessConcurrency > 0 {
 		cfg.JobProcessConcurrency = doc.JobProcessConcurrency
+	}
+	if doc.ConsumerFetchMaxBytes > 0 {
+		cfg.ConsumerFetchMaxBytes = doc.ConsumerFetchMaxBytes
+	}
+	if doc.ConsumerFetchMaxPartitionBytes > 0 {
+		cfg.ConsumerFetchMaxPartitionBytes = doc.ConsumerFetchMaxPartitionBytes
+	}
+	if doc.ConsumerFetchMaxWaitMs > 0 {
+		cfg.ConsumerFetchMaxWait = time.Duration(doc.ConsumerFetchMaxWaitMs * float64(time.Millisecond))
 	}
 	if doc.SchedulePollerEnabled {
 		cfg.SchedulePollerEnabled = true
@@ -579,6 +600,21 @@ func applyEnv(cfg *Daemon) {
 	if v := os.Getenv("KAFKA_BATCH_JOB_PROCESS_CONCURRENCY"); v != "" {
 		if n, err := parsePositiveInt(v); err == nil {
 			cfg.JobProcessConcurrency = n
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_CONSUMER_FETCH_MAX_BYTES"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			cfg.ConsumerFetchMaxBytes = int32(n)
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_CONSUMER_FETCH_MAX_PARTITION_BYTES"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			cfg.ConsumerFetchMaxPartitionBytes = int32(n)
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_CONSUMER_FETCH_MAX_WAIT_MS"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			cfg.ConsumerFetchMaxWait = time.Duration(n) * time.Millisecond
 		}
 	}
 	cfg.prefixTopics()

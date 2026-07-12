@@ -49,6 +49,11 @@ max_retries: 3
 # priority_consumer_concurrency: 8     # per priority YAML group
 # job_process_concurrency: 1           # parallel jobs per poll per member (Karafka concurrency); try 4–8 for CPU-bound handlers
 
+# Consumer fetch fairness (daemon + worker consumers; tighter than franz-go defaults)
+# consumer_fetch_max_bytes: 1048576          # 1 MiB total per broker fetch (default)
+# consumer_fetch_max_partition_bytes: 131072 # 128 KiB per partition (default)
+# consumer_fetch_max_wait_ms: 200            # max broker wait before partial fetch (default)
+
 # Phase 3b — delayed jobs (perform_in / perform_at)
 # schedule_poller_enabled: true
 # scheduled_topic: kafka_batch.scheduled

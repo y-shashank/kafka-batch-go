@@ -345,6 +345,7 @@ Go daemon and worker scale **inside one pod** with two mechanisms:
 
 1. **In-process consumer members** — N franz-go clients join the same Kafka consumer group; the broker assigns partitions across them (same as N pods, one OS process).
 2. **Per-poll parallelism (worker only)** — `job_process_concurrency` runs up to N jobs in parallel per poll per member (Karafka `config.concurrency` equivalent).
+3. **Consumer fetch limits** — `consumer_fetch_*` caps how much data each poll prefetches from the broker. Defaults are tighter than franz-go/librdkafka (50 MiB / 1 MiB per partition) so multi-partition assignments get fairer turns per poll.
 
 **Max concurrent job executions** (worker):
 
@@ -364,6 +365,18 @@ Set **member count ≈ topic partition count** for partition-bound throughput. R
 | `KAFKA_BATCH_PRODUCER_REQUIRED_ACKS` | `producer_required_acks` | `all_isr` | daemon, worker | `all_isr` (safest, default) or `leader` (lower produce latency; small loss risk on unclean leader failover). Affects callbacks, events, retry reroutes, schedule dispatch. |
 
 Events consumer batching and batched callback produce are always on — no extra knob.
+
+#### Consumer fetch (daemon + worker)
+
+Applied to all daemon/worker Kafka consumers (events, retry, fair dispatch, jobs, fair-ready, priority).
+
+| Env variable | YAML key | Default | What it does |
+|--------------|----------|---------|--------------|
+| `KAFKA_BATCH_CONSUMER_FETCH_MAX_BYTES` | `consumer_fetch_max_bytes` | `1048576` (1 MiB) | Max total bytes per broker fetch response. Lower values reduce head-of-line blocking when one member holds many partitions. |
+| `KAFKA_BATCH_CONSUMER_FETCH_MAX_PARTITION_BYTES` | `consumer_fetch_max_partition_bytes` | `131072` (128 KiB) | Max bytes per partition in a fetch. Prevents one hot partition from filling the entire fetch budget. |
+| `KAFKA_BATCH_CONSUMER_FETCH_MAX_WAIT_MS` | `consumer_fetch_max_wait_ms` | `200` | Max time the broker waits to accumulate data before returning a partial fetch. |
+
+Raise these when messages are large or brokers are far away and polls return too little data; lower them when lag is uneven across partitions on the same consumer member.
 
 #### Execution plane (`kbatch worker`)
 
@@ -386,6 +399,11 @@ Fairness admission is capped by control-plane `fairness_global_concurrency` (YAM
 events_consumer_concurrency: 32
 retry_consumer_concurrency: 8
 producer_required_acks: all_isr
+
+# Optional — raise for large messages or high-latency brokers
+# consumer_fetch_max_bytes: 2097152
+# consumer_fetch_max_partition_bytes: 262144
+# consumer_fetch_max_wait_ms: 500
 
 # Worker — see job type below
 jobs_consumer_concurrency: 32
@@ -422,6 +440,8 @@ producer_required_acks: all_isr
 | Priority tier lag | Raise `KAFKA_BATCH_PRIORITY_CONSUMER_CONCURRENCY` |
 | Produce latency dominates | Try `KAFKA_BATCH_PRODUCER_REQUIRED_ACKS=leader` (trade durability) |
 | Ready topic backlog, ingest fine | Lower worker concurrency or raise `fairness_global_concurrency` on control |
+| One partition lags while others idle on same member | Lower `KAFKA_BATCH_CONSUMER_FETCH_MAX_PARTITION_BYTES` or `KAFKA_BATCH_CONSUMER_FETCH_MAX_BYTES` |
+| Polls return too few records (large messages / WAN) | Raise `KAFKA_BATCH_CONSUMER_FETCH_MAX_BYTES` and/or `KAFKA_BATCH_CONSUMER_FETCH_MAX_PARTITION_BYTES` |
 
 ## Operations (daemon / worker)
 

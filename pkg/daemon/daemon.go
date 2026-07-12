@@ -117,8 +117,9 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	ingestLag := priority.NewLagReader(lagClient)
 
 	eventsGroup := cfg.ConsumerGroup + "-events"
+	fetch := cfg.ConsumerFetchSettings()
 	RunBatchedConsumerGroupMembers(ctx, cfg.EventsConsumerMembers(), cfg.Brokers, eventsGroup,
-		[]string{cfg.EventsTopic}, func(ctx context.Context, recs []*kgo.Record) error {
+		[]string{cfg.EventsTopic}, fetch, func(ctx context.Context, recs []*kgo.Record) error {
 			reconciler.MaybeRun(ctx, cfg, st, prod)
 			if len(recs) == 0 {
 				return nil
@@ -130,8 +131,9 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 			_, err := eventProc.ProcessBatch(ctx, raw)
 			return err
 		}, consumerHealth, nil, nil)
-	log.Printf("kbatch events consumer group=%s members=%d topic=%s acks=%s",
-		eventsGroup, cfg.EventsConsumerMembers(), cfg.EventsTopic, cfg.RequiredAcks())
+	log.Printf("kbatch events consumer group=%s members=%d topic=%s acks=%s fetch_max_bytes=%d fetch_max_partition_bytes=%d fetch_max_wait=%s",
+		eventsGroup, cfg.EventsConsumerMembers(), cfg.EventsTopic, cfg.RequiredAcks(),
+		fetch.MaxBytes, fetch.MaxPartitionBytes, fetch.MaxWait)
 
 	retryTopics := cfg.RetryTopics()
 	if len(retryTopics) > 0 {
@@ -142,7 +144,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 			RunRetryConsumerTransactional(ctx, cfg, retryTopics, retryProc, consumerHealth)
 		} else {
 			retryGroup := cfg.ConsumerGroup + "-retry"
-			RunConsumerGroupMembers(ctx, cfg.RetryConsumerMembers(), cfg.Brokers, retryGroup, retryTopics,
+			RunConsumerGroupMembers(ctx, cfg.RetryConsumerMembers(), cfg.Brokers, retryGroup, retryTopics, fetch,
 				func(rec *kgo.Record) error {
 					src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
 					out, err := retryProc.Process(ctx, rec.Value, src)
@@ -255,7 +257,7 @@ func wireFairLane(
 	suffix := string(lane)
 	dispatchGroup := cfg.DispatchConsumerGroup(suffix)
 	RunConsumer(ctx, cfg.Brokers, dispatchGroup,
-		[]string{ingest}, func(rec *kgo.Record) error {
+		[]string{ingest}, cfg.ConsumerFetchSettings(), func(rec *kgo.Record) error {
 			src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
 			out, err := disp.Process(ctx, rec.Value, src)
 			if err != nil {

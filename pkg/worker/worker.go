@@ -133,11 +133,12 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 
 	group := cfg.ConsumerGroup + "-go-worker"
 	processWorkers := cfg.JobProcessWorkers()
+	fetch := cfg.ConsumerFetchSettings()
 
 	if len(jobTopics) > 0 {
 		jobsGroup := group + "-jobs"
 		daemon.RunConcurrentConsumerGroupMembers(ctx, cfg.JobsConsumerMembers(), processWorkers,
-			cfg.Brokers, jobsGroup, jobTopics, handleJob, consumerHealth, pauseCtl, live)
+			cfg.Brokers, jobsGroup, jobTopics, fetch, handleJob, consumerHealth, pauseCtl, live)
 		log.Printf("kbatch go-worker jobs group=%s members=%d process_workers=%d topics=%v",
 			jobsGroup, cfg.JobsConsumerMembers(), processWorkers, jobTopics)
 	}
@@ -158,14 +159,15 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	for _, spec := range fairReadyTopics {
 		readyGroup := cfg.GoWorkerFairReadyGroup(spec.lane)
 		daemon.RunConcurrentConsumerGroupMembers(ctx, cfg.FairReadyConsumerMembers(), processWorkers,
-			cfg.Brokers, readyGroup, []string{spec.topic}, handleJob, consumerHealth, pauseCtl, live)
+			cfg.Brokers, readyGroup, []string{spec.topic}, fetch, handleJob, consumerHealth, pauseCtl, live)
 		log.Printf("kbatch go-worker fair-ready group=%s members=%d process_workers=%d topic=%s",
 			readyGroup, cfg.FairReadyConsumerMembers(), processWorkers, spec.topic)
 	}
 
-	log.Printf("kbatch go-worker running group=%s plain=%v priority_groups=%d fair_ready=%v members(jobs=%d fair=%d prio=%d) process_workers=%d",
+	log.Printf("kbatch go-worker running group=%s plain=%v priority_groups=%d fair_ready=%v members(jobs=%d fair=%d prio=%d) process_workers=%d fetch_max_bytes=%d fetch_max_partition_bytes=%d fetch_max_wait=%s",
 		group, jobTopics, len(goPrio), fairReadyTopicNames(fairReadyTopics),
-		cfg.JobsConsumerMembers(), cfg.FairReadyConsumerMembers(), cfg.PriorityConsumerMembers(), processWorkers)
+		cfg.JobsConsumerMembers(), cfg.FairReadyConsumerMembers(), cfg.PriorityConsumerMembers(), processWorkers,
+		fetch.MaxBytes, fetch.MaxPartitionBytes, fetch.MaxWait)
 	if ready := os.Getenv("KBATCH_WORKER_READY_FILE"); ready != "" {
 		_ = os.WriteFile(ready, []byte("ok\n"), 0o644)
 	}

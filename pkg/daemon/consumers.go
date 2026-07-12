@@ -12,6 +12,7 @@ import (
 
 	"github.com/y-shashank/kafka-batch-go/pkg/config"
 	"github.com/y-shashank/kafka-batch-go/pkg/instrument"
+	"github.com/y-shashank/kafka-batch-go/pkg/kafkaclient"
 	"github.com/y-shashank/kafka-batch-go/pkg/liveness"
 	"github.com/y-shashank/kafka-batch-go/pkg/priority"
 )
@@ -37,11 +38,12 @@ func safeHandle(handle func(*kgo.Record) error, rec *kgo.Record) (err error) {
 }
 
 // RunConsumer starts a supervised Kafka consumer that restarts on broker blips.
-func RunConsumer(ctx context.Context, brokers []string, group string, topics []string, handle func(*kgo.Record) error, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter) {
+func RunConsumer(ctx context.Context, brokers []string, group string, topics []string, fetch config.ConsumerFetchSettings, handle func(*kgo.Record) error, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter) {
 	go runConsumerSupervised(ctx, consumerSpec{
 		brokers:  brokers,
 		group:    group,
 		topics:   topics,
+		fetch:    fetch,
 		handle:   handle,
 		health:   health,
 		pauseCtl: pauseCtl,
@@ -52,13 +54,13 @@ func RunConsumer(ctx context.Context, brokers []string, group string, topics []s
 // RunConsumerGroupMembers starts N supervised consumers in the same process that
 // join the same consumer group. Kafka assigns partitions across them as if they
 // were separate pods.
-func RunConsumerGroupMembers(ctx context.Context, members int, brokers []string, group string, topics []string, handle func(*kgo.Record) error, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter) {
-	RunConcurrentConsumerGroupMembers(ctx, members, 1, brokers, group, topics, handle, health, pauseCtl, live)
+func RunConsumerGroupMembers(ctx context.Context, members int, brokers []string, group string, topics []string, fetch config.ConsumerFetchSettings, handle func(*kgo.Record) error, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter) {
+	RunConcurrentConsumerGroupMembers(ctx, members, 1, brokers, group, topics, fetch, handle, health, pauseCtl, live)
 }
 
 // RunConcurrentConsumerGroupMembers starts N group members and runs up to
 // processWorkers job handlers in parallel per poll (Karafka concurrency).
-func RunConcurrentConsumerGroupMembers(ctx context.Context, members, processWorkers int, brokers []string, group string, topics []string, handle func(*kgo.Record) error, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter) {
+func RunConcurrentConsumerGroupMembers(ctx context.Context, members, processWorkers int, brokers []string, group string, topics []string, fetch config.ConsumerFetchSettings, handle func(*kgo.Record) error, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter) {
 	if members < 1 {
 		members = 1
 	}
@@ -67,13 +69,14 @@ func RunConcurrentConsumerGroupMembers(ctx context.Context, members, processWork
 	}
 	for range members {
 		if processWorkers == 1 {
-			RunConsumer(ctx, brokers, group, topics, handle, health, pauseCtl, live)
+			RunConsumer(ctx, brokers, group, topics, fetch, handle, health, pauseCtl, live)
 			continue
 		}
 		go runConcurrentConsumerSupervised(ctx, concurrentConsumerSpec{
 			brokers:        brokers,
 			group:          group,
 			topics:         topics,
+			fetch:          fetch,
 			handle:         handle,
 			processWorkers: processWorkers,
 			health:         health,
@@ -88,7 +91,7 @@ type BatchHandler func(ctx context.Context, recs []*kgo.Record) error
 
 // RunBatchedConsumerGroupMembers starts N supervised consumers that batch each
 // poll into a single handler call and commit all records together on success.
-func RunBatchedConsumerGroupMembers(ctx context.Context, members int, brokers []string, group string, topics []string, handle BatchHandler, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter) {
+func RunBatchedConsumerGroupMembers(ctx context.Context, members int, brokers []string, group string, topics []string, fetch config.ConsumerFetchSettings, handle BatchHandler, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter) {
 	if members < 1 {
 		members = 1
 	}
@@ -97,6 +100,7 @@ func RunBatchedConsumerGroupMembers(ctx context.Context, members int, brokers []
 			brokers:  brokers,
 			group:    group,
 			topics:   topics,
+			fetch:    fetch,
 			handle:   handle,
 			health:   health,
 			pauseCtl: pauseCtl,
@@ -105,10 +109,24 @@ func RunBatchedConsumerGroupMembers(ctx context.Context, members int, brokers []
 	}
 }
 
+func newGroupConsumerClient(brokers []string, fetch config.ConsumerFetchSettings, group string, topics []string) (*kgo.Client, error) {
+	opts := []kgo.Opt{
+		kgo.SeedBrokers(brokers...),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeTopics(topics...),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.BlockRebalanceOnPoll(),
+		kgo.AutoCommitMarks(),
+	}
+	opts = append(opts, kafkaclient.FetchOpts(fetch)...)
+	return kgo.NewClient(opts...)
+}
+
 type consumerSpec struct {
 	brokers  []string
 	group    string
 	topics   []string
+	fetch    config.ConsumerFetchSettings
 	handle   func(*kgo.Record) error
 	health   *ConsumerHealth
 	pauseCtl pauseChecker
@@ -119,6 +137,7 @@ type batchedConsumerSpec struct {
 	brokers  []string
 	group    string
 	topics   []string
+	fetch    config.ConsumerFetchSettings
 	handle   BatchHandler
 	health   *ConsumerHealth
 	pauseCtl pauseChecker
@@ -129,6 +148,7 @@ type concurrentConsumerSpec struct {
 	brokers        []string
 	group          string
 	topics         []string
+	fetch          config.ConsumerFetchSettings
 	handle         func(*kgo.Record) error
 	processWorkers int
 	health         *ConsumerHealth
@@ -165,14 +185,7 @@ func runConcurrentConsumerSupervised(ctx context.Context, spec concurrentConsume
 }
 
 func runConcurrentConsumerLoop(ctx context.Context, spec concurrentConsumerSpec) error {
-	cl, err := kgo.NewClient(
-		kgo.SeedBrokers(spec.brokers...),
-		kgo.ConsumerGroup(spec.group),
-		kgo.ConsumeTopics(spec.topics...),
-		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
-		kgo.BlockRebalanceOnPoll(),
-		kgo.AutoCommitMarks(),
-	)
+	cl, err := newGroupConsumerClient(spec.brokers, spec.fetch, spec.group, spec.topics)
 	if err != nil {
 		return fmt.Errorf("kafka client group=%s: %w", spec.group, err)
 	}
@@ -259,14 +272,7 @@ func runBatchedConsumerSupervised(ctx context.Context, spec batchedConsumerSpec)
 }
 
 func runBatchedConsumerLoop(ctx context.Context, spec batchedConsumerSpec) error {
-	cl, err := kgo.NewClient(
-		kgo.SeedBrokers(spec.brokers...),
-		kgo.ConsumerGroup(spec.group),
-		kgo.ConsumeTopics(spec.topics...),
-		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
-		kgo.BlockRebalanceOnPoll(),
-		kgo.AutoCommitMarks(),
-	)
+	cl, err := newGroupConsumerClient(spec.brokers, spec.fetch, spec.group, spec.topics)
 	if err != nil {
 		return fmt.Errorf("kafka client group=%s: %w", spec.group, err)
 	}
@@ -365,14 +371,7 @@ func runConsumerSupervised(ctx context.Context, spec consumerSpec) {
 }
 
 func runConsumerLoop(ctx context.Context, spec consumerSpec) error {
-	cl, err := kgo.NewClient(
-		kgo.SeedBrokers(spec.brokers...),
-		kgo.ConsumerGroup(spec.group),
-		kgo.ConsumeTopics(spec.topics...),
-		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
-		kgo.BlockRebalanceOnPoll(),
-		kgo.AutoCommitMarks(),
-	)
+	cl, err := newGroupConsumerClient(spec.brokers, spec.fetch, spec.group, spec.topics)
 	if err != nil {
 		return fmt.Errorf("kafka client group=%s: %w", spec.group, err)
 	}
@@ -489,14 +488,7 @@ func runPriorityOnce(
 	weightedTicks map[string]int,
 	processWorkers int,
 ) error {
-	cl, err := kgo.NewClient(
-		kgo.SeedBrokers(cfg.Brokers...),
-		kgo.ConsumerGroup(pc.ConsumerGroup),
-		kgo.ConsumeTopics(pc.Topics...),
-		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
-		kgo.BlockRebalanceOnPoll(),
-		kgo.AutoCommitMarks(),
-	)
+	cl, err := newGroupConsumerClient(cfg.Brokers, cfg.ConsumerFetchSettings(), pc.ConsumerGroup, pc.Topics)
 	if err != nil {
 		return fmt.Errorf("kafka client group=%s: %w", pc.ConsumerGroup, err)
 	}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/y-shashank/kafka-batch-go/pkg/config"
 	"github.com/y-shashank/kafka-batch-go/pkg/control/retry"
+	"github.com/y-shashank/kafka-batch-go/pkg/kafkaclient"
 	"github.com/y-shashank/kafka-batch-go/pkg/protocol"
 )
 
@@ -89,14 +90,16 @@ func runRetryTransactionalSupervised(ctx context.Context, cfg config.Daemon, top
 }
 
 func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []string, retryProc *retry.Processor, health *ConsumerHealth, group string) error {
-	sess, err := kgo.NewGroupTransactSession(
+	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.Brokers...),
 		kgo.TransactionalID(retryTransactionalID(cfg)),
 		kgo.FetchIsolationLevel(kgo.ReadCommitted()),
 		kgo.ConsumerGroup(group),
 		kgo.ConsumeTopics(topics...),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
-	)
+	}
+	opts = append(opts, kafkaclient.FetchOpts(cfg.ConsumerFetchSettings())...)
+	sess, err := kgo.NewGroupTransactSession(opts...)
 	if err != nil {
 		return fmt.Errorf("retry-txn client group=%s: %w", group, err)
 	}
