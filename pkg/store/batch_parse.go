@@ -11,6 +11,7 @@ func hashToBatch(h map[string]string) *Batch {
 		Meta: h["meta"], CallbackArgs: h["callback_args"],
 		Description: h["description"], TenantID: h["tenant_id"],
 		LockedAt: h["locked_at"], FinishedAt: h["finished_at"],
+		ReconcilerRefiredAt: h["reconciler_refired_at"],
 	}
 	b.TotalJobs, _ = strconv.ParseInt(h["total_jobs"], 10, 64)
 	b.CompletedCount, _ = strconv.ParseInt(h["completed_count"], 10, 64)

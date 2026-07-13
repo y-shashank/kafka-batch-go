@@ -39,7 +39,7 @@ func TestRunSchedulerTicksMaybeRun(t *testing.T) {
 	t.Fatalf("expected scheduler to trigger at least one sweep, got %d", ticks.Load())
 }
 
-func TestMaybeRunRetriesAfterLockSkip(t *testing.T) {
+func TestMaybeRunWaitsAfterLockSkip(t *testing.T) {
 	ResetScheduler()
 	t.Cleanup(ResetScheduler)
 
@@ -59,7 +59,7 @@ func TestMaybeRunRetriesAfterLockSkip(t *testing.T) {
 	MaybeRun(ctx, cfg, nil, stubProducer{})
 	waitSweepIdle(t)
 
-	if got := runs.Load(); got != 2 {
-		t.Fatalf("expected immediate retry after lock skip, got %d runs", got)
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("expected 1 sweep before interval elapses after lock skip, got %d", got)
 	}
 }

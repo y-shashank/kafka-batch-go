@@ -22,6 +22,7 @@ type Summary struct {
 	RecoveredStale int
 	RefiredLost    int
 	SkippedStale   int
+	SkippedRecent  int
 	ProduceFailed  int
 	Details        []Detail
 }
@@ -46,6 +47,7 @@ type Collector struct {
 	recovered    int
 	refired      int
 	skippedStale int
+	skippedRecent int
 	produceFail  int
 	cappedStale  bool
 	cappedLost   bool
@@ -77,6 +79,12 @@ func (c *Collector) RecordStale(batchID string, outcome staleOutcome, batch *sto
 		c.produceFail++
 	}
 	c.addDetail(batchID, string(outcome), batch)
+}
+
+// RecordLostSkippedRecently records a lost-callback batch skipped due to a recent refire.
+func (c *Collector) RecordLostSkippedRecently(batchID string, batch *store.Batch) {
+	c.skippedRecent++
+	c.addDetail(batchID, "skipped_recent_refire", batch)
 }
 
 // RecordLost records one lost-callback outcome.
@@ -118,6 +126,7 @@ func (c *Collector) Finish(duration time.Duration) Summary {
 		RecoveredStale: c.recovered,
 		RefiredLost:    c.refired,
 		SkippedStale:   c.skippedStale,
+		SkippedRecent:  c.skippedRecent,
 		ProduceFailed:  c.produceFail,
 		Details:        c.details,
 	}

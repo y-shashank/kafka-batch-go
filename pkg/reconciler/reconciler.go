@@ -57,7 +57,6 @@ func Run(ctx context.Context, cfg config.Daemon, st *store.RedisStore, prod Prod
 		if len(staleAll) > max {
 			log.Printf("[kbatch-reconciler] %d stuck-running batches; processing first %d", len(staleAll), max)
 		}
-		log.Printf("[kbatch-reconciler] found %d stuck-running, processing %d", len(staleAll), len(stale))
 
 		lostAll, err := st.DoneBatchesWithoutCallback(ctx, threshold)
 		if err != nil {
@@ -67,7 +66,6 @@ func Run(ctx context.Context, cfg config.Daemon, st *store.RedisStore, prod Prod
 		if len(lostAll) > max {
 			log.Printf("[kbatch-reconciler] %d lost-callback batches; processing first %d", len(lostAll), max)
 		}
-		log.Printf("[kbatch-reconciler] found %d lost-callback, processing %d", len(lostAll), len(lost))
 
 		collector.Identify(len(staleAll), stale, len(lostAll), lost)
 
@@ -76,7 +74,11 @@ func Run(ctx context.Context, cfg config.Daemon, st *store.RedisStore, prod Prod
 			collector.RecordStale(batch.ID, outcome, batch)
 		}
 		for _, batch := range lost {
-			outcome := refireCallback(ctx, st, prod, cfg, batch)
+			outcome := refireCallback(ctx, st, prod, cfg, interval, batch)
+			if outcome == outcomeSkippedRecentRefire {
+				collector.RecordLostSkippedRecently(batch.ID, batch)
+				continue
+			}
 			collector.RecordLost(batch.ID, outcome, batch)
 		}
 
@@ -98,7 +100,13 @@ func Run(ctx context.Context, cfg config.Daemon, st *store.RedisStore, prod Prod
 	summary := collector.Finish(duration)
 	SaveLast(ctx, st, summary)
 	instrument.ReconcilerRan(summary.RecoveredStale, summary.RefiredLost, duration, triggeredBy)
-	log.Printf("[kbatch-reconciler] done in %.2fs", duration.Seconds())
+	if summary.FoundStale == 0 && summary.FoundLost == 0 {
+		log.Printf("[kbatch-reconciler] sweep complete in %.2fs — nothing to reconcile", duration.Seconds())
+	} else {
+		log.Printf("[kbatch-reconciler] sweep complete in %.2fs found_stale=%d found_lost=%d recovered=%d refired=%d skipped_stale=%d skipped_recent_refire=%d produce_failed=%d",
+			duration.Seconds(), summary.FoundStale, summary.FoundLost,
+			summary.RecoveredStale, summary.RefiredLost, summary.SkippedStale, summary.SkippedRecent, summary.ProduceFailed)
+	}
 	return ResultCompleted
 }
 
@@ -117,9 +125,10 @@ const (
 type lostOutcome string
 
 const (
-	outcomeRefiredLost   lostOutcome = "refired_lost"
-	outcomeSkippedNotDone lostOutcome = "skipped_not_done"
-	outcomeLostProduceFailed lostOutcome = "produce_failed"
+	outcomeRefiredLost         lostOutcome = "refired_lost"
+	outcomeSkippedNotDone      lostOutcome = "skipped_not_done"
+	outcomeSkippedRecentRefire lostOutcome = "skipped_recent_refire"
+	outcomeLostProduceFailed   lostOutcome = "produce_failed"
 )
 
 func reconcileRunning(ctx context.Context, st *store.RedisStore, prod Producer, cfg config.Daemon, batch *store.Batch) staleOutcome {
@@ -129,14 +138,17 @@ func reconcileRunning(ctx context.Context, st *store.RedisStore, prod Producer, 
 
 	fresh, err := st.FindBatch(ctx, id)
 	if err != nil || fresh == nil {
+		log.Printf("[kbatch-reconciler] stuck-running batch_id=%s — gone, skipping", id)
 		return outcomeSkippedGone
 	}
 	if fresh.Status != "running" {
+		log.Printf("[kbatch-reconciler] stuck-running batch_id=%s — status=%s, skipping", id, fresh.Status)
 		return outcomeSkippedNotRunning
 	}
 	batch = fresh
 
 	if batch.LockedAt == "" {
+		log.Printf("[kbatch-reconciler] stuck-running batch_id=%s — still open (unlocked), skipping", id)
 		return outcomeSkippedOpen
 	}
 
@@ -152,6 +164,7 @@ func reconcileRunning(ctx context.Context, st *store.RedisStore, prod Producer, 
 	}
 
 	if done < total {
+		log.Printf("[kbatch-reconciler] stuck-running batch_id=%s — still in progress (%d/%d jobs), skipping", id, done, total)
 		return outcomeSkippedInProgress
 	}
 
@@ -169,7 +182,7 @@ func reconcileRunning(ctx context.Context, st *store.RedisStore, prod Producer, 
 	return outcomeRecoveredRunning
 }
 
-func refireCallback(ctx context.Context, st *store.RedisStore, prod Producer, cfg config.Daemon, batch *store.Batch) lostOutcome {
+func refireCallback(ctx context.Context, st *store.RedisStore, prod Producer, cfg config.Daemon, interval time.Duration, batch *store.Batch) lostOutcome {
 	fresh, err := st.FindBatch(ctx, batch.ID)
 	if err != nil || fresh == nil {
 		return outcomeSkippedNotDone
@@ -177,10 +190,25 @@ func refireCallback(ctx context.Context, st *store.RedisStore, prod Producer, cf
 	if fresh.Status != "success" && fresh.Status != "complete" {
 		return outcomeSkippedNotDone
 	}
+	if recentlyReconcilerRefired(fresh.ReconcilerRefiredAt, interval) {
+		return outcomeSkippedRecentRefire
+	}
 	if produceCallback(ctx, prod, cfg, fresh, fresh.Status, true) {
+		_ = st.MarkReconcilerRefired(ctx, fresh.ID)
 		return outcomeRefiredLost
 	}
 	return outcomeLostProduceFailed
+}
+
+func recentlyReconcilerRefired(at string, interval time.Duration) bool {
+	if at == "" || interval <= 0 {
+		return false
+	}
+	t, err := time.Parse(time.RFC3339, at)
+	if err != nil {
+		return false
+	}
+	return time.Since(t) < interval
 }
 
 func produceCallback(ctx context.Context, prod Producer, cfg config.Daemon, batch *store.Batch, outcome string, reconciled bool) bool {

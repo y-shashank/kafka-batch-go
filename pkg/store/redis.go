@@ -30,9 +30,10 @@ type Batch struct {
 	CallbackArgs    string
 	Description     string
 	TenantID        string
-	LockedAt        string
-	FinishedAt      string
-	CallbackClaimed bool
+	LockedAt            string
+	FinishedAt          string
+	ReconcilerRefiredAt string
+	CallbackClaimed     bool
 }
 
 // FinishedBatch is returned when a batch just completed.
@@ -164,6 +165,15 @@ func (s *RedisStore) CallbackDispatched(ctx context.Context, batchID string) (bo
 		return false, nil
 	}
 	return v != "", err
+}
+
+// MarkReconcilerRefired records that the reconciler re-produced a callback for this batch.
+func (s *RedisStore) MarkReconcilerRefired(ctx context.Context, batchID string) error {
+	if s == nil || s.client == nil {
+		return fmt.Errorf("redis store not configured")
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	return s.client.HSet(ctx, batchKey(batchID), "reconciler_refired_at", now).Err()
 }
 
 func (s *RedisStore) BatchCancelled(ctx context.Context, batchID string) (bool, error) {

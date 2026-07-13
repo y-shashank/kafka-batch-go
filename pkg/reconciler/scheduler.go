@@ -86,12 +86,11 @@ func MaybeRun(ctx context.Context, cfg config.Daemon, st *store.RedisStore, prod
 		switch runSweep(ctx, cfg, st, prod, "consumer") {
 		case ResultLockSkipped:
 			log.Printf("[kbatch-reconciler] sweep skipped — distributed lock held by another process")
-			clearLastReconcileAt()
 		case ResultFailed:
 			log.Printf("[kbatch-reconciler] sweep failed — will retry on next tick")
 			clearLastReconcileAt()
 		case ResultCompleted:
-			// Run logs completion details.
+			// Run logs completion summary.
 		}
 	}()
 }
