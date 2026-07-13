@@ -101,6 +101,21 @@ func applyRetryOutcome(ctx context.Context, cfg config.Daemon, prod kafkaProduce
 	return nil
 }
 
+// fairBackpressurePause matches Ruby Fairness::Dispatcher::BACKPRESSURE_PAUSE_MS.
+const fairBackpressurePause = 250 * time.Millisecond
+
+// fairBackpressureError signals a tenant's Redis ready window is full. The
+// dispatch consumer pauses the ingest partition briefly without committing.
+type fairBackpressureError struct {
+	lane     string
+	tenantID string
+	duration time.Duration
+}
+
+func (e *fairBackpressureError) Error() string {
+	return fmt.Sprintf("fair ingest backpressure lane=%s tenant=%s", e.lane, e.tenantID)
+}
+
 // retryPausedError signals that a retry message is not yet due. The retry
 // consumer loop sleeps for duration outside the handler so other partitions
 // are not blocked and poll cycles continue promptly after the wait.

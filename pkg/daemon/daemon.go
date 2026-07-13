@@ -293,7 +293,11 @@ func wireFairLane(
 				return err
 			}
 			if !out.CommitOffset {
-				return fmt.Errorf("fair ingest backpressure lane=%s tenant=%s", lane, out.TenantID)
+				return &fairBackpressureError{
+					lane:     laneName,
+					tenantID: out.TenantID,
+					duration: fairBackpressurePause,
+				}
 			}
 			return nil
 		}, consumerHealth, pauseCtl, live)

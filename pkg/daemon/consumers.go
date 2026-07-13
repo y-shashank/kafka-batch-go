@@ -390,6 +390,11 @@ func runConsumerLoop(ctx context.Context, spec consumerSpec) error {
 	}, func(ctx context.Context, recs []*kgo.Record) error {
 		for _, rec := range recs {
 			if err := safeHandle(spec.handle, rec); err != nil {
+				var bp *fairBackpressureError
+				if errors.As(err, &bp) {
+					deferPartitionPause(cl, rec, bp.duration)
+					continue
+				}
 				log.Printf("[kbatch-daemon] handler error group=%s topic=%s offset=%d: %v",
 					spec.group, rec.Topic, rec.Offset, err)
 				continue
