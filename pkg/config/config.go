@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -694,6 +695,7 @@ func (c Daemon) RetryTopics() []string {
 	for tier := range c.RetryTiers {
 		out = append(out, c.RetryTopic(tier))
 	}
+	sort.Strings(out)
 	return out
 }
 

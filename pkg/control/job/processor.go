@@ -144,8 +144,8 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 		ev := p.buildEvent(job, "success", src)
 		out.Event = &ev
 	}
-	if job.BatchID != nil && job.Attempt > 0 && p.Store != nil {
-		_ = p.Store.ClearFailure(ctx, *job.BatchID, job.JobID)
+	if job.BatchID != nil && job.Attempt > 0 {
+		p.clearFailure(ctx, *job.BatchID, job.JobID)
 	}
 	p.releaseUniq(ctx, job)
 	emitJobProcessed(job, instrumentSince(started, p.now()))
@@ -214,7 +214,7 @@ func (p *Processor) handleFairSkip(ctx context.Context, job protocol.JobMessage,
 	ev := p.buildEvent(job, "success", src)
 	out.Event = &ev
 	if job.Attempt > 0 {
-		_ = p.Store.ClearFailure(ctx, *job.BatchID, job.JobID)
+		p.clearFailure(ctx, *job.BatchID, job.JobID)
 	}
 	p.releaseUniq(ctx, job)
 	return out, nil
@@ -417,6 +417,16 @@ func (p *Processor) recordFailure(ctx context.Context, e store.FailureEntry) {
 	}
 	if rec != nil {
 		_ = rec.RecordFailure(ctx, e)
+	}
+}
+
+func (p *Processor) clearFailure(ctx context.Context, batchID, jobID string) {
+	rec := p.Failures
+	if rec == nil && p.Store != nil {
+		rec = p.Store
+	}
+	if rec != nil {
+		_ = rec.ClearFailure(ctx, batchID, jobID)
 	}
 }
 

@@ -133,6 +133,8 @@ type consumerSpec struct {
 	health   *ConsumerHealth
 	pauseCtl pauseChecker
 	live     *liveness.Reporter
+	loopHealth *LoopHealth
+	loopName   string
 }
 
 type batchedConsumerSpec struct {

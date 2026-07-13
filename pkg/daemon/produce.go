@@ -69,6 +69,8 @@ func applyJobOutcome(ctx context.Context, cfg config.Daemon, prod kafkaProducer,
 	return nil
 }
 
+const retryProduceTimeout = 30 * time.Second
+
 func applyRetryOutcome(ctx context.Context, cfg config.Daemon, prod kafkaProducer, out retry.Outcome, src protocol.SourceCoords) error {
 	if out.Event != nil {
 		if err := produceEventWithRetry(ctx, cfg, prod, out.Event); err != nil {
@@ -76,7 +78,10 @@ func applyRetryOutcome(ctx context.Context, cfg config.Daemon, prod kafkaProduce
 		}
 	}
 	if out.ProduceBody != nil {
-		if err := prod.Produce(ctx, out.ProduceTopic, out.ProduceKey, out.ProduceBody); err != nil {
+		produceCtx, cancel := context.WithTimeout(ctx, retryProduceTimeout)
+		err := prod.Produce(produceCtx, out.ProduceTopic, out.ProduceKey, out.ProduceBody)
+		cancel()
+		if err != nil {
 			return err
 		}
 		if out.ProduceTopic != src.Topic {

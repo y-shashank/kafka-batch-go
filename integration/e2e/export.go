@@ -93,6 +93,21 @@ func ApplyFastConsumptionRefresh(s *Stack, cfg *daemonYAML) {
 	cfg.ConsumptionRefreshInterval = 1
 }
 
+// MySQLFailuresDSN returns the integration MySQL DSN when configured.
+func MySQLFailuresDSN() string {
+	return mysqlFailuresDSN()
+}
+
+// PrepareMySQLFailuresTable creates kafka_batch_failures for failure-store tests.
+func PrepareMySQLFailuresTable(conn string) error {
+	return prepareMySQLFailures(conn)
+}
+
+// TruncateMySQLFailuresTable clears kafka_batch_failures between tests.
+func TruncateMySQLFailuresTable(conn string) error {
+	return truncateMySQLFailures(conn)
+}
+
 // CreateTopicPartitions creates a topic with the given partition count for a stack
 // (used by cross-runtime partitioning tests that need more than one partition).
 func (s *Stack) CreateTopicPartitions(topic string, partitions int32) {

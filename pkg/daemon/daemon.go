@@ -53,6 +53,9 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	if err := cfg.ValidateMySQLConfig(); err != nil {
 		return err
 	}
+	if err := cfg.ValidateRetryConsumers(); err != nil {
+		return err
+	}
 	if manifest.HasGoHandlers() {
 		log.Printf("kbatch daemon: runtime:go handlers run in kbatch worker (not in control plane)")
 	}
@@ -149,26 +152,26 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 		fetch.MaxBytes, fetch.MaxPartitionBytes, fetch.MaxWait)
 
 	retryTopics := cfg.RetryTopics()
-	if len(retryTopics) > 0 {
-		if cfg.RetryTransactionalEnabled {
-			// Exactly-once retry pipeline (produce + offset commit atomic via Kafka
-			// transactions). Opt-in: requires broker/topic transaction support, so it is
-			// off by default and the non-transactional path below remains the fallback.
-			RunRetryConsumerTransactional(ctx, cfg, retryTopics, retryProc, consumerHealth)
-		} else {
-			retryGroup := cfg.ConsumerGroup + "-retry"
-			RunRetryConsumerMembers(ctx, cfg.RetryConsumerMembers(), cfg.Brokers, retryGroup, retryTopics, fetch,
-				func(rec *kgo.Record) error {
-					src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
-					out, err := retryProc.Process(ctx, rec.Value, src)
-					if err != nil {
-						return err
-					}
-					return applyRetryOutcome(ctx, cfg, prod, out, src)
-				}, consumerHealth, pauseCtl, live)
-			log.Printf("kbatch retry consumer group=%s members=%d topics=%v",
-				retryGroup, cfg.RetryConsumerMembers(), retryTopics)
-		}
+	retryGroup := cfg.ConsumerGroup + "-retry"
+	if cfg.RetryTransactionalEnabled {
+		// Exactly-once retry pipeline (produce + offset commit atomic via Kafka
+		// transactions). Opt-in: requires broker/topic transaction support, so it is
+		// off by default and the non-transactional path below remains the fallback.
+		RunRetryConsumerTransactional(ctx, cfg, retryTopics, retryProc, consumerHealth, loopHealth)
+		log.Printf("kbatch retry consumer (transactional) group=%s topics=%v txn_id=%s",
+			retryGroup, retryTopics, retryTransactionalID(cfg))
+	} else {
+		RunRetryConsumerMembers(ctx, cfg.RetryConsumerMembers(), cfg.Brokers, retryGroup, retryTopics, fetch,
+			func(rec *kgo.Record) error {
+				src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
+				out, err := retryProc.Process(ctx, rec.Value, src)
+				if err != nil {
+					return err
+				}
+				return applyRetryOutcome(ctx, cfg, prod, out, src)
+			}, consumerHealth, pauseCtl, live, loopHealth)
+		log.Printf("kbatch retry consumer group=%s members=%d topics=%v",
+			retryGroup, cfg.RetryConsumerMembers(), retryTopics)
 	}
 
 	if cfg.SchedulePollerEnabled {

@@ -200,7 +200,7 @@ func TestProcessRecordsRetryFailureAndClearsOnSuccess(t *testing.T) {
 		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3,
 		BatchSeq: &seq, CompleteAfterRetries: 3,
 	})
-	p := &Processor{Cfg: config.DefaultDaemon(), Store: st, Producer: &memProducer{},
+	p := &Processor{Cfg: config.DefaultDaemon(), Store: st, Failures: &store.CompositeFailures{Redis: st}, Producer: &memProducer{},
 		Now: func() time.Time { return time.Unix(0, 0) }}
 	out, err := p.Process(context.Background(), rawFail, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 10})
 	if err != nil || out.RetryPayload == nil {

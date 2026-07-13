@@ -73,6 +73,18 @@ func nullIfEmpty(s string) interface{} {
 	return s
 }
 
+// ClearFailure removes a per-batch failure row after a successful retry.
+func (m *MySQLFailures) ClearFailure(ctx context.Context, batchID, jobID string) error {
+	if m == nil || m.db == nil || batchID == "" || jobID == "" {
+		return nil
+	}
+	_, err := m.db.ExecContext(ctx,
+		`DELETE FROM kafka_batch_failures WHERE batch_id = ? AND job_id = ?`,
+		batchID, jobID,
+	)
+	return err
+}
+
 // CompositeFailures writes to Redis and optionally MySQL.
 type CompositeFailures struct {
 	Redis *RedisStore
@@ -87,4 +99,19 @@ func (c *CompositeFailures) RecordFailure(ctx context.Context, e FailureEntry) e
 		return c.MySQL.RecordFailure(ctx, e)
 	}
 	return nil
+}
+
+func (c *CompositeFailures) ClearFailure(ctx context.Context, batchID, jobID string) error {
+	var err error
+	if c.Redis != nil {
+		if e := c.Redis.ClearFailure(ctx, batchID, jobID); e != nil {
+			err = e
+		}
+	}
+	if c.MySQL != nil {
+		if e := c.MySQL.ClearFailure(ctx, batchID, jobID); e != nil {
+			err = e
+		}
+	}
+	return err
 }

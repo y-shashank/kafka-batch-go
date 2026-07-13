@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 
@@ -37,11 +38,12 @@ import (
 // sidestep that: each poll's single record gets committed or not, in isolation. The cost
 // is a Begin/End round trip per retry message, which is expected to be negligible since
 // retries are the exception path, not the primary job-execution volume.
-func RunRetryConsumerTransactional(ctx context.Context, cfg config.Daemon, topics []string, retryProc *retry.Processor, health *ConsumerHealth) {
+func RunRetryConsumerTransactional(ctx context.Context, cfg config.Daemon, topics []string, retryProc *retry.Processor, health *ConsumerHealth, loopHealth *LoopHealth) {
 	if len(topics) == 0 {
 		return
 	}
-	go runRetryTransactionalSupervised(ctx, cfg, topics, retryProc, health)
+	log.Printf("[kbatch-daemon] starting transactional retry consumer topics=%v", topics)
+	go runRetryTransactionalSupervised(ctx, cfg, topics, retryProc, health, loopHealth)
 }
 
 // retryTransactionalID must be stable across restarts of the same logical daemon
@@ -59,17 +61,20 @@ func retryTransactionalID(cfg config.Daemon) string {
 	return cfg.ConsumerGroup + "-retry-txn-" + node
 }
 
-func runRetryTransactionalSupervised(ctx context.Context, cfg config.Daemon, topics []string, retryProc *retry.Processor, health *ConsumerHealth) {
+func runRetryTransactionalSupervised(ctx context.Context, cfg config.Daemon, topics []string, retryProc *retry.Processor, health *ConsumerHealth, loopHealth *LoopHealth) {
 	group := cfg.ConsumerGroup + "-retry"
+	loopName := "retry-txn-" + group
 	if health != nil {
 		health.Register(group)
 	}
-	runLoopSupervised(ctx, "retry-txn-"+group, nil, func(ctx context.Context) error {
-		return runRetryTransactionalLoop(ctx, cfg, topics, retryProc, health, group)
+	runLoopSupervised(ctx, loopName, loopHealth, func(ctx context.Context) error {
+		loopCtx, touch, stopWatchdog := startStallWatchdog(ctx, consumerStallTimeout)
+		defer stopWatchdog()
+		return runRetryTransactionalLoop(loopCtx, cfg, topics, retryProc, health, loopHealth, group, loopName, touch)
 	})
 }
 
-func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []string, retryProc *retry.Processor, health *ConsumerHealth, group string) error {
+func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []string, retryProc *retry.Processor, health *ConsumerHealth, loopHealth *LoopHealth, group, loopName string, touch func()) error {
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.Brokers...),
 		kgo.TransactionalID(retryTransactionalID(cfg)),
@@ -86,10 +91,14 @@ func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []
 	defer sess.Close()
 
 	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
+		if err := consumerLoopDoneErr(ctx); err != nil {
+			if errors.Is(err, errConsumerStalled) {
+				return fmt.Errorf("retry-txn consumer group=%s stalled — restarting client", group)
+			}
+			return err
+		}
+		if touch != nil {
+			touch()
 		}
 
 		fetches := sess.PollRecords(ctx, 1)
@@ -99,13 +108,19 @@ func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []
 					continue
 				}
 				if isContextErr(e.Err) {
-					return nil
+					return consumerLoopDoneErr(ctx)
 				}
 				return fmt.Errorf("poll group=%s topic=%s: %w", group, e.Topic, e.Err)
 			}
 		}
 		if health != nil {
 			health.RecordPoll(group)
+		}
+		if loopHealth != nil && loopName != "" {
+			loopHealth.RecordTick(loopName)
+		}
+		if touch != nil {
+			touch()
 		}
 		recs := fetches.Records()
 		if len(recs) == 0 {
@@ -178,7 +193,9 @@ func produceRetryOutcomeTxn(ctx context.Context, cfg config.Daemon, sess *kgo.Gr
 	if len(recs) == 0 {
 		return nil
 	}
-	results := sess.ProduceSync(ctx, recs...)
+	produceCtx, cancel := context.WithTimeout(ctx, retryProduceTimeout)
+	defer cancel()
+	results := sess.ProduceSync(produceCtx, recs...)
 	if err := results.FirstErr(); err != nil {
 		return err
 	}
