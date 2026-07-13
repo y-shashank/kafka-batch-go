@@ -68,13 +68,11 @@ func runRetryTransactionalSupervised(ctx context.Context, cfg config.Daemon, top
 		health.Register(group)
 	}
 	runLoopSupervised(ctx, loopName, loopHealth, func(ctx context.Context) error {
-		loopCtx, touch, stopWatchdog := startStallWatchdog(ctx, consumerStallTimeout)
-		defer stopWatchdog()
-		return runRetryTransactionalLoop(loopCtx, cfg, topics, retryProc, health, loopHealth, group, loopName, touch)
+		return runRetryTransactionalLoop(ctx, cfg, topics, retryProc, health, loopHealth, group, loopName)
 	})
 }
 
-func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []string, retryProc *retry.Processor, health *ConsumerHealth, loopHealth *LoopHealth, group, loopName string, touch func()) error {
+func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []string, retryProc *retry.Processor, health *ConsumerHealth, loopHealth *LoopHealth, group, loopName string) error {
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.Brokers...),
 		kgo.TransactionalID(retryTransactionalID(cfg)),
@@ -88,12 +86,16 @@ func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []
 	if err != nil {
 		return fmt.Errorf("retry-txn client group=%s: %w", group, err)
 	}
-	defer sess.Close()
+	defer closeGroupConsumer(sess)
+
+	label := "retry-txn consumer group=" + group
+	loopCtx, touch, stopGuard := attachConsumerStallGuard(ctx, sess, label)
+	defer stopGuard()
 
 	for {
-		if err := consumerLoopDoneErr(ctx); err != nil {
+		if err := consumerLoopDoneErr(loopCtx); err != nil {
 			if errors.Is(err, errConsumerStalled) {
-				return fmt.Errorf("retry-txn consumer group=%s stalled — restarting client", group)
+				return stalledRestartErr(group)
 			}
 			return err
 		}
@@ -101,17 +103,9 @@ func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []
 			touch()
 		}
 
-		fetches := sess.PollRecords(ctx, 1)
-		if errs := fetches.Errors(); len(errs) > 0 {
-			for _, e := range errs {
-				if e.Err == nil {
-					continue
-				}
-				if isContextErr(e.Err) {
-					return consumerLoopDoneErr(ctx)
-				}
-				return fmt.Errorf("poll group=%s topic=%s: %w", group, e.Topic, e.Err)
-			}
+		fetches := sess.PollRecords(loopCtx, 1)
+		if err := checkFetchErrs(loopCtx, sess, fetches, group); err != nil {
+			return err
 		}
 		if health != nil {
 			health.RecordPoll(group)
@@ -133,11 +127,11 @@ func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []
 		}
 
 		src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
-		out, procErr := safeRetryProcess(retryProc, ctx, rec.Value, src)
+		out, procErr := safeRetryProcess(retryProc, loopCtx, rec.Value, src)
 
 		var produceErr error
 		if procErr == nil {
-			produceErr = produceRetryOutcomeTxn(ctx, cfg, sess, out, src)
+			produceErr = produceRetryOutcomeTxn(loopCtx, cfg, sess, out, src)
 		}
 
 		// Commit iff processing succeeded, producing succeeded, and the outcome
@@ -145,7 +139,7 @@ func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []
 		// produced in this transaction lands, and the offset stays uncommitted so
 		// the exact same record is redelivered on the next PollRecords call.
 		commit := shouldCommitRetryOutcome(procErr, produceErr, out)
-		committed, endErr := sess.End(ctx, kgo.TransactionEndTry(commit))
+		committed, endErr := sess.End(loopCtx, kgo.TransactionEndTry(commit))
 		if endErr != nil {
 			return fmt.Errorf("retry-txn end group=%s: %w", group, endErr)
 		}
@@ -158,7 +152,7 @@ func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []
 				group, rec.Topic, rec.Offset, produceErr)
 		}
 		if out.Pause && !committed {
-			pauseForRetry(ctx, out.PauseFor)
+			pauseForRetry(loopCtx, out.PauseFor)
 		}
 	}
 }

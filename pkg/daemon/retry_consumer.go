@@ -22,13 +22,13 @@ func RunRetryConsumerMembers(ctx context.Context, members int, brokers []string,
 	}
 	log.Printf("[kbatch-daemon] starting retry consumers group=%s members=%d topics=%v", group, members, topics)
 	spec := consumerSpec{
-		brokers:  brokers,
-		group:    group,
-		topics:   topics,
-		fetch:    fetch,
-		handle:   handle,
-		health:   health,
-		pauseCtl: pauseCtl,
+		brokers:    brokers,
+		group:      group,
+		topics:     topics,
+		fetch:      fetch,
+		handle:     handle,
+		health:     health,
+		pauseCtl:   pauseCtl,
 		live:       live,
 		loopHealth: loopHealth,
 		loopName:   "retry-" + group,
@@ -43,42 +43,34 @@ func runRetryConsumerSupervised(ctx context.Context, spec consumerSpec) {
 		spec.health.Register(spec.group)
 	}
 	runLoopSupervised(ctx, spec.loopName, spec.loopHealth, func(ctx context.Context) error {
-		loopCtx, touch, stopWatchdog := startStallWatchdog(ctx, consumerStallTimeout)
-		defer stopWatchdog()
-		return runRetryConsumerLoop(loopCtx, spec, touch)
+		return runRetryConsumerLoop(ctx, spec)
 	})
 }
 
-func runRetryConsumerLoop(ctx context.Context, spec consumerSpec, touch func()) error {
+func runRetryConsumerLoop(ctx context.Context, spec consumerSpec) error {
 	cl, err := newGroupConsumerClient(spec.brokers, spec.fetch, spec.group, spec.topics)
 	if err != nil {
 		return fmt.Errorf("kafka client group=%s: %w", spec.group, err)
 	}
-	defer cl.Close()
+	defer closeGroupConsumer(cl)
+
+	label := "retry consumer group=" + spec.group
+	loopCtx, touch, stopGuard := attachConsumerStallGuard(ctx, cl, label)
+	defer stopGuard()
 
 	for {
-		if err := consumerLoopDoneErr(ctx); err != nil {
+		if err := consumerLoopDoneErr(loopCtx); err != nil {
 			if errors.Is(err, errConsumerStalled) {
-				return fmt.Errorf("retry consumer group=%s stalled — restarting client", spec.group)
+				return stalledRestartErr(spec.group)
 			}
 			return err
 		}
 		if touch != nil {
 			touch()
 		}
-		// One record per poll: leaving an earlier offset uncommitted must not
-		// strand the consumer when later offsets in the same fetch were handled.
-		fetches := cl.PollRecords(ctx, 1)
-		if errs := fetches.Errors(); len(errs) > 0 {
-			for _, e := range errs {
-				if e.Err == nil {
-					continue
-				}
-				if isContextErr(e.Err) {
-					return consumerLoopDoneErr(ctx)
-				}
-				return fmt.Errorf("poll group=%s topic=%s: %w", spec.group, e.Topic, e.Err)
-			}
+		fetches := cl.PollRecords(loopCtx, 1)
+		if err := checkFetchErrs(loopCtx, cl, fetches, spec.group); err != nil {
+			return err
 		}
 		if spec.health != nil {
 			spec.health.RecordPoll(spec.group)
@@ -89,9 +81,9 @@ func runRetryConsumerLoop(ctx context.Context, spec consumerSpec, touch func()) 
 		if touch != nil {
 			touch()
 		}
-		recs := collectPollRecords(ctx, spec.group, fetches, spec.pauseCtl, spec.live)
+		recs := collectPollRecords(loopCtx, spec.group, fetches, spec.pauseCtl, spec.live)
 		if len(recs) > 0 {
-			processOneRetryRecord(ctx, cl, spec.handle, recs[0], spec.group)
+			processOneRetryRecord(loopCtx, cl, spec.handle, recs[0], spec.group)
 		}
 		cl.AllowRebalance()
 	}

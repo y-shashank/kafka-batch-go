@@ -194,32 +194,31 @@ func runConcurrentConsumerLoop(ctx context.Context, spec concurrentConsumerSpec)
 	if err != nil {
 		return fmt.Errorf("kafka client group=%s: %w", spec.group, err)
 	}
-	defer cl.Close()
+	defer closeGroupConsumer(cl)
+
+	label := "concurrent consumer group=" + spec.group
+	loopCtx, touch, stopGuard := attachConsumerStallGuard(ctx, cl, label)
+	defer stopGuard()
 
 	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
-		fetches := cl.PollFetches(ctx)
-		if errs := fetches.Errors(); len(errs) > 0 {
-			for _, e := range errs {
-				if e.Err == nil {
-					continue
-				}
-				if isContextErr(e.Err) {
-					return nil
-				}
-				return fmt.Errorf("poll group=%s topic=%s: %w", spec.group, e.Topic, e.Err)
+		if err := consumerLoopDoneErr(loopCtx); err != nil {
+			if errors.Is(err, errConsumerStalled) {
+				return stalledRestartErr(spec.group)
 			}
+			return err
+		}
+		touch()
+		fetches := cl.PollFetches(loopCtx)
+		if err := checkFetchErrs(loopCtx, cl, fetches, spec.group); err != nil {
+			return err
 		}
 		if spec.health != nil {
 			spec.health.RecordPoll(spec.group)
 		}
-		recs := collectPollRecords(ctx, spec.group, fetches, spec.pauseCtl, spec.live)
+		touch()
+		recs := collectPollRecords(loopCtx, spec.group, fetches, spec.pauseCtl, spec.live)
 		if len(recs) > 0 {
-			processRecordsConcurrent(ctx, cl, spec.handle, recs, spec.processWorkers, spec.group)
+			processRecordsConcurrent(loopCtx, cl, spec.handle, recs, spec.processWorkers, spec.group)
 		}
 		cl.AllowRebalance()
 	}
@@ -281,35 +280,34 @@ func runBatchedConsumerLoop(ctx context.Context, spec batchedConsumerSpec) error
 	if err != nil {
 		return fmt.Errorf("kafka client group=%s: %w", spec.group, err)
 	}
-	defer cl.Close()
+	defer closeGroupConsumer(cl)
+
+	label := "batched consumer group=" + spec.group
+	loopCtx, touch, stopGuard := attachConsumerStallGuard(ctx, cl, label)
+	defer stopGuard()
 
 	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
-		fetches := cl.PollFetches(ctx)
-		if errs := fetches.Errors(); len(errs) > 0 {
-			for _, e := range errs {
-				if e.Err == nil {
-					continue
-				}
-				if isContextErr(e.Err) {
-					return nil
-				}
-				return fmt.Errorf("poll group=%s topic=%s: %w", spec.group, e.Topic, e.Err)
+		if err := consumerLoopDoneErr(loopCtx); err != nil {
+			if errors.Is(err, errConsumerStalled) {
+				return stalledRestartErr(spec.group)
 			}
+			return err
+		}
+		touch()
+		fetches := cl.PollFetches(loopCtx)
+		if err := checkFetchErrs(loopCtx, cl, fetches, spec.group); err != nil {
+			return err
 		}
 		if spec.health != nil {
 			spec.health.RecordPoll(spec.group)
 		}
 		if spec.onPoll != nil {
-			spec.onPoll(ctx)
+			spec.onPoll(loopCtx)
 		}
-		recs := collectPollRecords(ctx, spec.group, fetches, spec.pauseCtl, spec.live)
+		touch()
+		recs := collectPollRecords(loopCtx, spec.group, fetches, spec.pauseCtl, spec.live)
 		if len(recs) > 0 {
-			if err := safeBatchHandle(ctx, spec.handle, recs); err != nil {
+			if err := safeBatchHandle(loopCtx, spec.handle, recs); err != nil {
 				log.Printf("[kbatch-daemon] batched handler error group=%s records=%d: %v",
 					spec.group, len(recs), err)
 			} else {
@@ -383,36 +381,35 @@ func runConsumerLoop(ctx context.Context, spec consumerSpec) error {
 	if err != nil {
 		return fmt.Errorf("kafka client group=%s: %w", spec.group, err)
 	}
-	defer cl.Close()
+	defer closeGroupConsumer(cl)
+
+	label := "consumer group=" + spec.group
+	loopCtx, touch, stopGuard := attachConsumerStallGuard(ctx, cl, label)
+	defer stopGuard()
 
 	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
-		fetches := cl.PollFetches(ctx)
-		if errs := fetches.Errors(); len(errs) > 0 {
-			for _, e := range errs {
-				if e.Err == nil {
-					continue
-				}
-				if isContextErr(e.Err) {
-					return nil
-				}
-				return fmt.Errorf("poll group=%s topic=%s: %w", spec.group, e.Topic, e.Err)
+		if err := consumerLoopDoneErr(loopCtx); err != nil {
+			if errors.Is(err, errConsumerStalled) {
+				return stalledRestartErr(spec.group)
 			}
+			return err
+		}
+		touch()
+		fetches := cl.PollFetches(loopCtx)
+		if err := checkFetchErrs(loopCtx, cl, fetches, spec.group); err != nil {
+			return err
 		}
 		if spec.health != nil {
 			spec.health.RecordPoll(spec.group)
 		}
+		touch()
 		fetches.EachRecord(func(rec *kgo.Record) {
-			if pauseCtl := spec.pauseCtl; pauseCtl != nil && pauseCtl.Paused(ctx, spec.group, rec.Topic, rec.Partition) {
+			if pauseCtl := spec.pauseCtl; pauseCtl != nil && pauseCtl.Paused(loopCtx, spec.group, rec.Topic, rec.Partition) {
 				time.Sleep(time.Second)
 				return
 			}
 			if spec.live != nil {
-				spec.live.Heartbeat(ctx, rec.Topic)
+				spec.live.Heartbeat(loopCtx, rec.Topic)
 			}
 			if err := safeHandle(spec.handle, rec); err != nil {
 				log.Printf("[kbatch-daemon] handler error group=%s topic=%s offset=%d: %v",
@@ -500,41 +497,40 @@ func runPriorityOnce(
 	if err != nil {
 		return fmt.Errorf("kafka client group=%s: %w", pc.ConsumerGroup, err)
 	}
-	defer cl.Close()
+	defer closeGroupConsumer(cl)
+
+	label := "priority consumer group=" + pc.ConsumerGroup
+	loopCtx, touch, stopGuard := attachConsumerStallGuard(ctx, cl, label)
+	defer stopGuard()
 
 	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
-		fetches := cl.PollFetches(ctx)
-		if errs := fetches.Errors(); len(errs) > 0 {
-			for _, e := range errs {
-				if e.Err == nil {
-					continue
-				}
-				if isContextErr(e.Err) {
-					return nil
-				}
-				return fmt.Errorf("poll group=%s topic=%s: %w", pc.ConsumerGroup, e.Topic, e.Err)
+		if err := consumerLoopDoneErr(loopCtx); err != nil {
+			if errors.Is(err, errConsumerStalled) {
+				return stalledRestartErr(pc.ConsumerGroup)
 			}
+			return err
+		}
+		touch()
+		fetches := cl.PollFetches(loopCtx)
+		if err := checkFetchErrs(loopCtx, cl, fetches, pc.ConsumerGroup); err != nil {
+			return err
 		}
 		if health != nil {
 			health.RecordPoll(pc.ConsumerGroup)
 		}
+		touch()
 		ready := make([]*kgo.Record, 0)
 		fetches.EachRecord(func(rec *kgo.Record) {
 			spec, ok := specByTopic[rec.Topic]
 			if !ok {
 				return
 			}
-			if pauseCtl != nil && pauseCtl.Paused(ctx, pc.ConsumerGroup, rec.Topic, rec.Partition) {
+			if pauseCtl != nil && pauseCtl.Paused(loopCtx, pc.ConsumerGroup, rec.Topic, rec.Partition) {
 				time.Sleep(yieldSleep)
 				return
 			}
 			if live != nil {
-				live.Heartbeat(ctx, rec.Topic)
+				live.Heartbeat(loopCtx, rec.Topic)
 			}
 			tick := weightedTicks[rec.Topic]
 			if yield, _ := priority.ShouldYield(spec, gate, &tick, ctx); yield {

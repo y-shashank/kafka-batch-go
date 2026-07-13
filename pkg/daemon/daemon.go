@@ -169,7 +169,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 					return err
 				}
 				return applyRetryOutcome(ctx, cfg, prod, out, src)
-			}, consumerHealth, pauseCtl, live, loopHealth)
+			}, consumerHealth, nil, live, loopHealth)
 		log.Printf("kbatch retry consumer group=%s members=%d topics=%v",
 			retryGroup, cfg.RetryConsumerMembers(), retryTopics)
 	}
