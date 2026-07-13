@@ -49,6 +49,9 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	if err := cfg.ValidateFairReadySplit(manifest); err != nil {
 		return err
 	}
+	if err := cfg.ValidateMySQLConfig(); err != nil {
+		return err
+	}
 	if manifest.HasGoHandlers() {
 		log.Printf("kbatch daemon: runtime:go handlers run in kbatch worker (not in control plane)")
 	}
@@ -97,9 +100,15 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 
 	eventProc := &event.Processor{Cfg: cfg, Store: st, Producer: prod}
 	retryProc := &retry.Processor{Producer: prod, MaxPause: cfg.RetryMaxPause}
-	pauseCtl, _, closePauseCtl := BuildPauseControl(cfg, rdb)
+	pauseCtl, _, closePauseCtl, err := BuildPauseControl(cfg, rdb)
+	if err != nil {
+		return err
+	}
 	defer closePauseCtl()
-	failures, closeFailures := BuildFailureRecorder(cfg, st)
+	failures, closeFailures, err := BuildFailureRecorder(cfg, st)
+	if err != nil {
+		return err
+	}
 	defer closeFailures()
 	live := NewLivenessReporter(cfg, rdb)
 	tenants := BuildTenantPartitions(cfg, rdb, prod)
@@ -163,6 +172,9 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 		var mysqlSched *schedule.MysqlStore
 		switch strings.ToLower(cfg.ScheduleStore) {
 		case "mysql":
+			if strings.TrimSpace(cfg.ScheduleMySQLDSN) == "" {
+				return fmt.Errorf("schedule_mysql_dsn is required when schedule_store is mysql")
+			}
 			ms, err := schedule.NewMysqlStore(cfg.ScheduleMySQLDSN, cfg.ScheduleBatchSize*5)
 			if err != nil {
 				return fmt.Errorf("schedule mysql store: %w", err)
@@ -192,7 +204,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 			Cancelled: st.BatchCancelled,
 		}
 		go poller.Run(ctx)
-		log.Printf("kbatch schedule poller enabled topic=%s", cfg.ScheduledTopic)
+		log.Printf("kbatch schedule poller enabled topic=%s store=%s", cfg.ScheduledTopic, cfg.ScheduleStore)
 	}
 
 	if cfg.FairnessEnabled {

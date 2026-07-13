@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -13,8 +14,9 @@ import (
 
 // MysqlStore implements the delayed-job index on kafka_batch_scheduled_jobs.
 type MysqlStore struct {
-	db    *sql.DB
-	limit int
+	db         *sql.DB
+	limit      int
+	readMisses sync.Map // member -> int64; mirrors Redis HINCRBY for read-miss drops
 }
 
 func NewMysqlStore(conn string, readMissLimit int) (*MysqlStore, error) {
@@ -183,10 +185,13 @@ func (s *MysqlStore) Reclaim(ctx context.Context, now time.Time) (int, error) {
 }
 
 func (s *MysqlStore) RecordReadMiss(ctx context.Context, member string) (int64, error) {
-	// MySQL store has no read-miss counter; poller drops via retention path only.
-	return 1, nil
+	val, _ := s.readMisses.LoadOrStore(member, int64(0))
+	n := val.(int64) + 1
+	s.readMisses.Store(member, n)
+	return n, nil
 }
 
 func (s *MysqlStore) ClearReadMiss(ctx context.Context, member string) error {
+	s.readMisses.Delete(member)
 	return nil
 }

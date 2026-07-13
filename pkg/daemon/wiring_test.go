@@ -40,7 +40,10 @@ func TestBuildPauseControlRedisOnly(t *testing.T) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	cfg := config.DefaultDaemon()
-	ctl, mysql, closeFn := BuildPauseControl(cfg, rdb)
+	ctl, mysql, closeFn, err := BuildPauseControl(cfg, rdb)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer closeFn()
 	if mysql != nil {
 		t.Fatal("expected nil mysql pause store")
