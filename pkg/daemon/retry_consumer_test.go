@@ -23,7 +23,8 @@ func TestProcessOneRetryRecordPausesWithoutCommit(t *testing.T) {
 	handle := func(*kgo.Record) error {
 		return &retryPausedError{duration: time.Millisecond}
 	}
-	processOneRetryRecord(context.Background(), cl, handle, rec, "kafka-batch-retry")
+	// nil pause client skips PauseFetchPartitions; commit behavior is what we assert.
+	processOneRetryRecord(context.Background(), cl, nil, handle, rec, "kafka-batch-retry")
 	if len(cl.committed) != 0 {
 		t.Fatalf("committed=%v", cl.committed)
 	}
@@ -33,7 +34,7 @@ func TestProcessOneRetryRecordCommitsOnDispatch(t *testing.T) {
 	cl := &retryCommitClient{}
 	rec := &kgo.Record{Topic: "retry.short", Partition: 2, Offset: 10}
 	handle := func(*kgo.Record) error { return nil }
-	processOneRetryRecord(context.Background(), cl, handle, rec, "kafka-batch-retry")
+	processOneRetryRecord(context.Background(), cl, nil, handle, rec, "kafka-batch-retry")
 	if len(cl.committed) != 1 || cl.committed[0].Offset != 10 {
 		t.Fatalf("committed=%v", cl.committed)
 	}
@@ -43,7 +44,7 @@ func TestProcessOneRetryRecordDoesNotCommitOnHandlerError(t *testing.T) {
 	cl := &retryCommitClient{}
 	rec := &kgo.Record{Topic: "retry.short", Partition: 2, Offset: 10}
 	handle := func(*kgo.Record) error { return errors.New("produce failed") }
-	processOneRetryRecord(context.Background(), cl, handle, rec, "kafka-batch-retry")
+	processOneRetryRecord(context.Background(), cl, nil, handle, rec, "kafka-batch-retry")
 	if len(cl.committed) != 0 {
 		t.Fatalf("committed=%v", cl.committed)
 	}

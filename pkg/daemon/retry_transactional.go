@@ -64,15 +64,18 @@ func retryTransactionalID(cfg config.Daemon) string {
 func runRetryTransactionalSupervised(ctx context.Context, cfg config.Daemon, topics []string, retryProc *retry.Processor, health *ConsumerHealth, loopHealth *LoopHealth) {
 	group := cfg.ConsumerGroup + "-retry"
 	loopName := "retry-txn-" + group
+	healthKey := healthMemberKey(group, 1, 1)
 	if health != nil {
-		health.Register(group)
+		health.Register(healthKey)
 	}
+	log.Printf("[kbatch-daemon] transactional retry consumer member=1/1 group=%s topics=%v", group, topics)
 	runLoopSupervised(ctx, loopName, loopHealth, func(ctx context.Context) error {
-		return runRetryTransactionalLoop(ctx, cfg, topics, retryProc, health, loopHealth, group, loopName)
+		return runRetryTransactionalLoop(ctx, cfg, topics, retryProc, health, loopHealth, group, loopName, healthKey)
 	})
 }
 
-func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []string, retryProc *retry.Processor, health *ConsumerHealth, loopHealth *LoopHealth, group, loopName string) error {
+func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []string, retryProc *retry.Processor, health *ConsumerHealth, loopHealth *LoopHealth, group, loopName, healthKey string) error {
+	var abort pollAbortController
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.Brokers...),
 		kgo.TransactionalID(retryTransactionalID(cfg)),
@@ -80,6 +83,11 @@ func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []
 		kgo.ConsumerGroup(group),
 		kgo.ConsumeTopics(topics...),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.BlockRebalanceOnPoll(),
+		kgo.OnPartitionsCallbackBlocked(func(context.Context, *kgo.Client) {
+			log.Printf("[kbatch-daemon] group=%s member=1/1 rebalance waiting — aborting in-flight txn processing", group)
+			abort.trigger()
+		}),
 	}
 	opts = append(opts, kafkaclient.FetchOpts(cfg.ConsumerFetchSettings())...)
 	sess, err := kgo.NewGroupTransactSession(opts...)
@@ -99,6 +107,9 @@ func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []
 			}
 			return err
 		}
+
+		sess.AllowRebalance()
+
 		if touch != nil {
 			touch()
 		}
@@ -108,7 +119,7 @@ func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []
 			return err
 		}
 		if health != nil {
-			health.RecordPoll(group)
+			health.RecordPoll(healthKey)
 		}
 		if loopHealth != nil && loopName != "" {
 			loopHealth.RecordTick(loopName)
@@ -122,16 +133,18 @@ func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []
 		}
 		rec := recs[0]
 
+		procCtx, endProc := abort.begin(loopCtx)
 		if err := sess.Begin(); err != nil {
+			endProc()
 			return fmt.Errorf("retry-txn begin group=%s: %w", group, err)
 		}
 
 		src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
-		out, procErr := safeRetryProcess(retryProc, loopCtx, rec.Value, src)
+		out, procErr := safeRetryProcess(retryProc, procCtx, rec.Value, src)
 
 		var produceErr error
 		if procErr == nil {
-			produceErr = produceRetryOutcomeTxn(loopCtx, cfg, sess, out, src)
+			produceErr = produceRetryOutcomeTxn(procCtx, cfg, sess, out, src)
 		}
 
 		// Commit iff processing succeeded, producing succeeded, and the outcome
@@ -139,7 +152,8 @@ func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []
 		// produced in this transaction lands, and the offset stays uncommitted so
 		// the exact same record is redelivered on the next PollRecords call.
 		commit := shouldCommitRetryOutcome(procErr, produceErr, out)
-		committed, endErr := sess.End(loopCtx, kgo.TransactionEndTry(commit))
+		committed, endErr := sess.End(procCtx, kgo.TransactionEndTry(commit))
+		endProc()
 		if endErr != nil {
 			return fmt.Errorf("retry-txn end group=%s: %w", group, endErr)
 		}
@@ -152,8 +166,9 @@ func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []
 				group, rec.Topic, rec.Offset, produceErr)
 		}
 		if out.Pause && !committed {
-			pauseForRetry(loopCtx, out.PauseFor)
+			deferPartitionPause(sess.Client(), rec, out.PauseFor)
 		}
+		sess.AllowRebalance()
 	}
 }
 

@@ -77,9 +77,15 @@ retry_tiers:                         # tier => delay seconds (topics: retry.{tie
 
 # ── Control-plane consumer throughput (daemon pod) ────────────────────────────
 # In-process members join the same consumer group; Kafka splits partitions across them.
+#
+# Prefer scaling daemon *pods* over very high in-process concurrency. Each member is a
+# separate franz-go client with BlockRebalanceOnPoll; many members in one process
+# increases rebalance coordination cost and can wedge the group if poll loops block.
+# Start with 1–2 members per group per pod; increase only when partition count requires
+# it and /health shows all members polling (keys like {group}#m2 when members > 1).
 
-# events_consumer_concurrency: 8     # {group}-events — match events topic partition count
-# retry_consumer_concurrency: 4      # {group}-retry — match retry tier partition count
+# events_consumer_concurrency: 8     # {group}-events — prefer ≤ partition count
+# retry_consumer_concurrency: 2      # {group}-retry — prefer pods over 10 in-process
 # producer_required_acks: all_isr    # all_isr (default) | leader
 
 # Consumer fetch tuning (daemon + worker consumers)
@@ -145,6 +151,8 @@ fairness_enabled: true
 #   globex: 1
 
 # ── Consumption pause/resume (/lag UI) ────────────────────────────────────────
+# Go consumers mirror killswitch state via franz-go PauseFetchTopics/Partitions so
+# paused topics do not advance offsets (Ruby ConsumptionGate parity).
 
 # consumption_control_refresh_interval: 30   # sec — how often consumers re-read pause state
 

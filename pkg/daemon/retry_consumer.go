@@ -21,88 +21,82 @@ func RunRetryConsumerMembers(ctx context.Context, members int, brokers []string,
 		members = 1
 	}
 	log.Printf("[kbatch-daemon] starting retry consumers group=%s members=%d topics=%v", group, members, topics)
-	spec := consumerSpec{
-		brokers:    brokers,
-		group:      group,
-		topics:     topics,
-		fetch:      fetch,
-		handle:     handle,
-		health:     health,
-		pauseCtl:   pauseCtl,
-		live:       live,
-		loopHealth: loopHealth,
-		loopName:   "retry-" + group,
-	}
-	for range members {
+	for member := 1; member <= members; member++ {
+		spec := consumerSpec{
+			brokers:     brokers,
+			group:       group,
+			topics:      topics,
+			fetch:       fetch,
+			handle:      handle,
+			health:      health,
+			pauseCtl:    pauseCtl,
+			live:        live,
+			loopHealth:  loopHealth,
+			loopName:    "retry-" + group,
+			memberLabel: memberLabel(member, members),
+			healthKey:   healthMemberKey(group, member, members),
+		}
 		go runRetryConsumerSupervised(ctx, spec)
 	}
 }
 
 func runRetryConsumerSupervised(ctx context.Context, spec consumerSpec) {
 	if spec.health != nil {
-		spec.health.Register(spec.group)
+		spec.health.Register(spec.healthKey)
 	}
+	log.Printf("[kbatch-daemon] retry consumer member=%s group=%s topics=%v",
+		spec.memberLabel, spec.group, spec.topics)
 	runLoopSupervised(ctx, spec.loopName, spec.loopHealth, func(ctx context.Context) error {
 		return runRetryConsumerLoop(ctx, spec)
 	})
 }
 
 func runRetryConsumerLoop(ctx context.Context, spec consumerSpec) error {
-	cl, err := newGroupConsumerClient(spec.brokers, spec.fetch, spec.group, spec.topics)
+	cl, err := newGroupConsumerClient(spec.brokers, spec.fetch, spec.group, spec.memberLabel, spec.topics)
 	if err != nil {
 		return fmt.Errorf("kafka client group=%s: %w", spec.group, err)
 	}
 	defer closeGroupConsumer(cl)
 
-	label := "retry consumer group=" + spec.group
-	loopCtx, touch, stopGuard := attachConsumerStallGuard(ctx, cl, label)
-	defer stopGuard()
-
-	for {
-		if err := consumerLoopDoneErr(loopCtx); err != nil {
-			if errors.Is(err, errConsumerStalled) {
-				return stalledRestartErr(spec.group)
-			}
-			return err
-		}
-		if touch != nil {
-			touch()
-		}
-		fetches := cl.PollRecords(loopCtx, 1)
-		if err := checkFetchErrs(loopCtx, cl, fetches, spec.group); err != nil {
-			return err
-		}
-		if spec.health != nil {
-			spec.health.RecordPoll(spec.group)
-		}
-		if spec.loopHealth != nil && spec.loopName != "" {
-			spec.loopHealth.RecordTick(spec.loopName)
-		}
-		if touch != nil {
-			touch()
-		}
-		recs := collectPollRecords(loopCtx, spec.group, fetches, spec.pauseCtl, spec.live)
-		if len(recs) > 0 {
-			processOneRetryRecord(loopCtx, cl, spec.handle, recs[0], spec.group)
-		}
-		cl.AllowRebalance()
-	}
+	return runGroupPollLoop(ctx, cl, pollLoopConfig{
+		label:       "retry consumer group=" + spec.group + " member=" + spec.memberLabel,
+		group:       spec.group,
+		memberLabel: spec.memberLabel,
+		healthKey:   spec.healthKey,
+		topics:      spec.topics,
+		maxRecords:  1,
+		health:      spec.health,
+		loopHealth:  spec.loopHealth,
+		loopName:    spec.loopName,
+		pauseCtl:    spec.pauseCtl,
+		live:        spec.live,
+	}, func(ctx context.Context, recs []*kgo.Record) error {
+		processOneRetryRecord(ctx, cl, cl, spec.handle, recs[0], spec.group)
+		return nil
+	})
 }
 
-func processOneRetryRecord(ctx context.Context, cl retryCommitMarker, handle func(*kgo.Record) error, rec *kgo.Record, group string) {
+func processOneRetryRecord(ctx context.Context, commit recordCommitter, pause fetchPauser, handle func(*kgo.Record) error, rec *kgo.Record, group string) {
 	if err := safeHandle(handle, rec); err != nil {
 		var pe *retryPausedError
 		if errors.As(err, &pe) && pe.duration > 0 {
-			pauseForRetry(ctx, pe.duration)
+			deferPartitionPause(pause, rec, pe.duration)
 			return
 		}
 		log.Printf("[kbatch-daemon] retry handler error group=%s topic=%s partition=%d offset=%d: %v",
 			group, rec.Topic, rec.Partition, rec.Offset, err)
 		return
 	}
-	cl.MarkCommitRecords(rec)
+	commit.MarkCommitRecords(rec)
 }
 
-type retryCommitMarker interface {
+type recordCommitter interface {
 	MarkCommitRecords(...*kgo.Record)
+}
+
+type fetchPauser interface {
+	PauseFetchPartitions(map[string][]int32) map[string][]int32
+	ResumeFetchPartitions(map[string][]int32)
+	PauseFetchTopics(...string) []string
+	ResumeFetchTopics(...string)
 }
