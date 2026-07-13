@@ -100,11 +100,13 @@ func parseTime(v interface{}) *time.Time {
 	if !ok || s == "" {
 		return nil
 	}
-	t, err := time.Parse(time.RFC3339, s)
-	if err != nil {
-		return nil
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		t, err := time.Parse(layout, s)
+		if err == nil {
+			return &t
+		}
 	}
-	return &t
+	return nil
 }
 
 func dltRaw(raw []byte, topic string) ([]byte, string) {

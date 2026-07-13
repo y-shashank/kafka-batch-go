@@ -17,6 +17,7 @@ import (
 	"github.com/y-shashank/kafka-batch-go/pkg/control/event"
 	"github.com/y-shashank/kafka-batch-go/pkg/control/retry"
 	"github.com/y-shashank/kafka-batch-go/pkg/fairness"
+	"github.com/y-shashank/kafka-batch-go/pkg/health"
 	"github.com/y-shashank/kafka-batch-go/pkg/jobexpiry"
 	"github.com/y-shashank/kafka-batch-go/pkg/kafkaclient"
 	"github.com/y-shashank/kafka-batch-go/pkg/liveness"
@@ -113,7 +114,8 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	live := NewLivenessReporter(cfg, rdb)
 	tenants := BuildTenantPartitions(cfg, rdb, prod)
 	consumerHealth := NewConsumerHealth(cfg)
-	StartHealthServer(ctx, cfg, "daemon", consumerHealth)
+	loopHealth := NewLoopHealth(cfg)
+	StartHealthServer(ctx, cfg, "daemon", compositeHealth{checkers: []health.Checker{consumerHealth, loopHealth}})
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -129,7 +131,6 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	fetch := cfg.ConsumerFetchSettings()
 	RunBatchedConsumerGroupMembers(ctx, cfg.EventsConsumerMembers(), cfg.Brokers, eventsGroup,
 		[]string{cfg.EventsTopic}, fetch, func(ctx context.Context, recs []*kgo.Record) error {
-			reconciler.MaybeRun(ctx, cfg, st, prod)
 			if len(recs) == 0 {
 				return nil
 			}
@@ -139,7 +140,10 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 			}
 			_, err := eventProc.ProcessBatch(ctx, raw)
 			return err
-		}, consumerHealth, nil, nil)
+		}, consumerHealth, nil, nil, nil)
+	reconciler.RunScheduler(ctx, cfg, st, prod, func() {
+		loopHealth.RecordTick("reconciler")
+	})
 	log.Printf("kbatch events consumer group=%s members=%d topic=%s acks=%s fetch_max_bytes=%d fetch_max_partition_bytes=%d fetch_max_wait=%s",
 		eventsGroup, cfg.EventsConsumerMembers(), cfg.EventsTopic, cfg.RequiredAcks(),
 		fetch.MaxBytes, fetch.MaxPartitionBytes, fetch.MaxWait)
@@ -153,7 +157,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 			RunRetryConsumerTransactional(ctx, cfg, retryTopics, retryProc, consumerHealth)
 		} else {
 			retryGroup := cfg.ConsumerGroup + "-retry"
-			RunConsumerGroupMembers(ctx, cfg.RetryConsumerMembers(), cfg.Brokers, retryGroup, retryTopics, fetch,
+			RunRetryConsumerMembers(ctx, cfg.RetryConsumerMembers(), cfg.Brokers, retryGroup, retryTopics, fetch,
 				func(rec *kgo.Record) error {
 					src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
 					out, err := retryProc.Process(ctx, rec.Value, src)
@@ -202,15 +206,21 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 				Tenants:  tenants,
 			},
 			Cancelled: st.BatchCancelled,
+			RecordActivity: func() {
+				loopHealth.RecordTick("schedule-poller")
+			},
 		}
-		go poller.Run(ctx)
+		go runLoopSupervised(ctx, "schedule-poller", loopHealth, func(ctx context.Context) error {
+			poller.Run(ctx)
+			return nil
+		})
 		log.Printf("kbatch schedule poller enabled topic=%s store=%s", cfg.ScheduledTopic, cfg.ScheduleStore)
 	}
 
 	if cfg.FairnessEnabled {
-		wireFairLane(ctx, cfg, manifest, rdb, prod, st, failures, consumerHealth, pauseCtl, live, ingestLag,
+		wireFairLane(ctx, cfg, manifest, rdb, prod, st, failures, consumerHealth, loopHealth, pauseCtl, live, ingestLag,
 			fairness.LaneTime, cfg.FairnessTimeIngest, cfg.FairnessTimeSettings())
-		wireFairLane(ctx, cfg, manifest, rdb, prod, st, failures, consumerHealth, pauseCtl, live, ingestLag,
+		wireFairLane(ctx, cfg, manifest, rdb, prod, st, failures, consumerHealth, loopHealth, pauseCtl, live, ingestLag,
 			fairness.LaneThroughput, cfg.FairnessThroughputIngest, cfg.FairnessThroughputSettings())
 		log.Printf("kbatch fairness ingest dispatch enabled time=%s throughput=%s",
 			cfg.FairnessTimeIngest, cfg.FairnessThroughputIngest)
@@ -233,6 +243,7 @@ func wireFairLane(
 	st *store.RedisStore,
 	failures store.FailureRecorder,
 	consumerHealth *ConsumerHealth,
+	loopHealth *LoopHealth,
 	pauseCtl pauseChecker,
 	live *liveness.Reporter,
 	ingestLag fairness.IngestLagCounter,
@@ -245,23 +256,25 @@ func wireFairLane(
 	laneName := string(lane)
 	resolveReady := fairReadyResolver(manifest, cfg, laneName)
 	expPub := newExpiredPublisher(cfg, prod, st, failures)
-	coord := fairness.NewCoordinator(func(l fairness.Lane) {
-		if l != lane {
-			return
-		}
-		fwd := &fairness.Forwarder{
-			Lane: l, Scheduler: sched, ResolveReadyTopic: resolveReady, Producer: prod,
-			OnExpired: func(ctx context.Context, _ *fairness.CheckoutResult, raw []byte) error {
-				var m map[string]interface{}
-				_ = json.Unmarshal(raw, &m)
-				src := jobexpiry.SourceCoords(m)
-				return expPub.publish(ctx, raw, src)
-			},
-		}
-		go fwd.Run(ctx)
+	fwdName := "fair-forward-" + laneName
+	fwd := &fairness.Forwarder{
+		Lane: lane, Scheduler: sched, ResolveReadyTopic: resolveReady, Producer: prod,
+		OnExpired: func(ctx context.Context, _ *fairness.CheckoutResult, raw []byte) error {
+			var m map[string]interface{}
+			_ = json.Unmarshal(raw, &m)
+			src := jobexpiry.SourceCoords(m)
+			return expPub.publish(ctx, raw, src)
+		},
+		RecordActivity: func() {
+			loopHealth.RecordTick(fwdName)
+		},
+	}
+	go runLoopSupervised(ctx, fwdName, loopHealth, func(ctx context.Context) error {
+		fwd.Run(ctx)
+		return nil
 	})
 	disp := &fairness.Dispatcher{
-		Lane: lane, Scheduler: sched, OnStartFwd: coord.OnStart(lane),
+		Lane: lane, Scheduler: sched,
 		OnExpired: func(ctx context.Context, raw []byte, src protocol.SourceCoords) error {
 			return expPub.publish(ctx, raw, src)
 		},

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/y-shashank/kafka-batch-go/pkg/config"
@@ -78,6 +79,10 @@ func applyRetryOutcome(ctx context.Context, cfg config.Daemon, prod kafkaProduce
 		if err := prod.Produce(ctx, out.ProduceTopic, out.ProduceKey, out.ProduceBody); err != nil {
 			return err
 		}
+		if out.ProduceTopic != src.Topic {
+			log.Printf("[kbatch-retry] dispatched job_id=%s to %s (from %s partition=%d offset=%d)",
+				out.ProduceKey, out.ProduceTopic, src.Topic, src.Partition, src.Offset)
+		}
 	}
 	if out.DLTPayload != nil {
 		if err := prod.Produce(ctx, cfg.DeadLetterTopic, out.DLTKey, out.DLTPayload); err != nil {
@@ -86,10 +91,30 @@ func applyRetryOutcome(ctx context.Context, cfg config.Daemon, prod kafkaProduce
 		emitRetryDLT(out.DLTPayload, src.Topic)
 	}
 	if out.Pause {
-		time.Sleep(out.PauseFor)
-		return fmt.Errorf("retry paused")
+		return &retryPausedError{duration: out.PauseFor}
 	}
 	return nil
+}
+
+// retryPausedError signals that a retry message is not yet due. The retry
+// consumer loop sleeps for duration outside the handler so other partitions
+// are not blocked and poll cycles continue promptly after the wait.
+type retryPausedError struct {
+	duration time.Duration
+}
+
+func (e *retryPausedError) Error() string { return "retry paused" }
+
+func pauseForRetry(ctx context.Context, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
 }
 
 func emitRetryDLT(raw []byte, sourceTopic string) {

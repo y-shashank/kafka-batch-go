@@ -91,7 +91,8 @@ type BatchHandler func(ctx context.Context, recs []*kgo.Record) error
 
 // RunBatchedConsumerGroupMembers starts N supervised consumers that batch each
 // poll into a single handler call and commit all records together on success.
-func RunBatchedConsumerGroupMembers(ctx context.Context, members int, brokers []string, group string, topics []string, fetch config.ConsumerFetchSettings, handle BatchHandler, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter) {
+// onPoll, when set, runs after every successful poll (even when the batch is empty).
+func RunBatchedConsumerGroupMembers(ctx context.Context, members int, brokers []string, group string, topics []string, fetch config.ConsumerFetchSettings, handle BatchHandler, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter, onPoll func(context.Context)) {
 	if members < 1 {
 		members = 1
 	}
@@ -105,6 +106,7 @@ func RunBatchedConsumerGroupMembers(ctx context.Context, members int, brokers []
 			health:   health,
 			pauseCtl: pauseCtl,
 			live:     live,
+			onPoll:   onPoll,
 		})
 	}
 }
@@ -142,6 +144,7 @@ type batchedConsumerSpec struct {
 	health   *ConsumerHealth
 	pauseCtl pauseChecker
 	live     *liveness.Reporter
+	onPoll   func(context.Context)
 }
 
 type concurrentConsumerSpec struct {
@@ -298,6 +301,9 @@ func runBatchedConsumerLoop(ctx context.Context, spec batchedConsumerSpec) error
 		}
 		if spec.health != nil {
 			spec.health.RecordPoll(spec.group)
+		}
+		if spec.onPoll != nil {
+			spec.onPoll(ctx)
 		}
 		recs := collectPollRecords(ctx, spec.group, fetches, spec.pauseCtl, spec.live)
 		if len(recs) > 0 {

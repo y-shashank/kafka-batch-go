@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
@@ -65,28 +64,9 @@ func runRetryTransactionalSupervised(ctx context.Context, cfg config.Daemon, top
 	if health != nil {
 		health.Register(group)
 	}
-	backoff := consumerRestartInitial
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		err := runRetryTransactionalLoop(ctx, cfg, topics, retryProc, health, group)
-		if ctx.Err() != nil || err == nil {
-			return
-		}
-		log.Printf("[kbatch-daemon] retry-txn consumer group=%s error=%v — restarting in %s", group, err, backoff)
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff):
-		}
-		if backoff < consumerRestartMax {
-			backoff *= 2
-			if backoff > consumerRestartMax {
-				backoff = consumerRestartMax
-			}
-		}
-	}
+	runLoopSupervised(ctx, "retry-txn-"+group, nil, func(ctx context.Context) error {
+		return runRetryTransactionalLoop(ctx, cfg, topics, retryProc, health, group)
+	})
 }
 
 func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []string, retryProc *retry.Processor, health *ConsumerHealth, group string) error {
@@ -163,7 +143,7 @@ func runRetryTransactionalLoop(ctx context.Context, cfg config.Daemon, topics []
 				group, rec.Topic, rec.Offset, produceErr)
 		}
 		if out.Pause && !committed {
-			time.Sleep(out.PauseFor)
+			pauseForRetry(ctx, out.PauseFor)
 		}
 	}
 }

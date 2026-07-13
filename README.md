@@ -640,6 +640,7 @@ Set **member count ≈ topic partition count** for partition-bound throughput. R
 |--------------|----------|---------|---------|--------------|
 | `KAFKA_BATCH_EVENTS_CONSUMER_CONCURRENCY` | `events_consumer_concurrency` | `8` | daemon | In-process members for `{group}-events`. Each poll is batched through `ProcessBatch` (one pipelined Redis round trip per poll). Set to **events topic partition count** (e.g. `32`) when event lag grows. |
 | `KAFKA_BATCH_RETRY_CONSUMER_CONCURRENCY` | `retry_consumer_concurrency` | `4` | daemon | In-process members for `{group}-retry` (non-transactional path). Set up to **retry topic partition count** if retry-tier lag is high. |
+| `KAFKA_BATCH_RETRY_MAX_PAUSE` | `retry_max_pause` | `30` (sec) | daemon | Max sleep before re-checking a not-yet-due retry message (Ruby: `retry_max_pause_seconds`). Lower = faster dispatch after `retry_after`. |
 | `KAFKA_BATCH_PRODUCER_REQUIRED_ACKS` | `producer_required_acks` | `all_isr` | daemon, worker | `all_isr` (safest, default) or `leader` (lower produce latency; small loss risk on unclean leader failover). Affects callbacks, events, retry reroutes, schedule dispatch. |
 
 Events consumer batching and batched callback produce are always on — no extra knob.

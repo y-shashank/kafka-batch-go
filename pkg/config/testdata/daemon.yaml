@@ -8,6 +8,7 @@ events_topic: acme.events
 callbacks_topic: acme.callbacks
 schedule_poller_enabled: true
 fairness_enabled: true
+retry_max_pause: 12
 fairness_time_ready_go: acme.fair_time_ready.go
 fairness_time_ready_ruby: acme.fair_time_ready.ruby
 liveness_enabled: true

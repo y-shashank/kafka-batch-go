@@ -22,6 +22,8 @@ type Daemon struct {
 	RetryTiers                map[string]int // seconds
 	RetryProgression          []string
 	RetryJitter               float64
+	// RetryMaxPause caps how long the retry consumer sleeps before re-checking a
+	// not-yet-due message (mirrors Ruby retry_max_pause_seconds).
 	RetryMaxPause             time.Duration
 	MaxRetries                int
 	CompleteAfter             int
@@ -253,6 +255,7 @@ func LoadDaemon(path string) (Daemon, error) {
 		MaxRetries                           int              `yaml:"max_retries"`
 		CompleteAfter                        int              `yaml:"complete_after_retries"`
 		RetryTransactionalEnabled            bool             `yaml:"retry_transactional_enabled"`
+		RetryMaxPauseSec                     float64          `yaml:"retry_max_pause"`
 		EventsConsumerConcurrency            int              `yaml:"events_consumer_concurrency"`
 		RetryConsumerConcurrency             int              `yaml:"retry_consumer_concurrency"`
 		ProducerRequiredAcks                 string           `yaml:"producer_required_acks"`
@@ -354,6 +357,9 @@ func LoadDaemon(path string) (Daemon, error) {
 	}
 	if doc.RetryTransactionalEnabled {
 		cfg.RetryTransactionalEnabled = true
+	}
+	if doc.RetryMaxPauseSec > 0 {
+		cfg.RetryMaxPause = time.Duration(doc.RetryMaxPauseSec * float64(time.Second))
 	}
 	if doc.EventsConsumerConcurrency > 0 {
 		cfg.EventsConsumerConcurrency = doc.EventsConsumerConcurrency
@@ -582,6 +588,11 @@ func applyEnv(cfg *Daemon) {
 			cfg.RetryConsumerConcurrency = n
 		}
 	}
+	if v := os.Getenv("KAFKA_BATCH_RETRY_MAX_PAUSE"); v != "" {
+		if n, err := parsePositiveFloat(v); err == nil {
+			cfg.RetryMaxPause = time.Duration(n * float64(time.Second))
+		}
+	}
 	if v := os.Getenv("KAFKA_BATCH_PRODUCER_REQUIRED_ACKS"); v != "" {
 		cfg.ProducerRequiredAcks = strings.TrimSpace(v)
 	}
@@ -628,6 +639,15 @@ func parsePositiveInt(s string) (int, error) {
 	_, err := fmt.Sscanf(strings.TrimSpace(s), "%d", &n)
 	if err != nil || n < 1 {
 		return 0, fmt.Errorf("invalid positive int %q", s)
+	}
+	return n, nil
+}
+
+func parsePositiveFloat(s string) (float64, error) {
+	var n float64
+	_, err := fmt.Sscanf(strings.TrimSpace(s), "%f", &n)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("invalid positive float %q", s)
 	}
 	return n, nil
 }

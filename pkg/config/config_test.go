@@ -38,6 +38,9 @@ func TestLoadDaemonFromYAML(t *testing.T) {
 	if !cfg.LivenessEnabled {
 		t.Fatal("liveness should be enabled")
 	}
+	if cfg.RetryMaxPause != 12*time.Second {
+		t.Fatalf("retry_max_pause=%s", cfg.RetryMaxPause)
+	}
 }
 
 func TestLoadDaemonEnvOverridesYAML(t *testing.T) {
@@ -181,6 +184,9 @@ func TestDefaultDaemonConsumerConcurrency(t *testing.T) {
 	if cfg.RetryConsumerConcurrency != 4 {
 		t.Fatalf("retry members=%d", cfg.RetryConsumerConcurrency)
 	}
+	if cfg.RetryMaxPause != 30*time.Second {
+		t.Fatalf("retry_max_pause=%s", cfg.RetryMaxPause)
+	}
 	if cfg.RequiredAcks() != "all_isr" {
 		t.Fatalf("acks=%q", cfg.RequiredAcks())
 	}
@@ -233,6 +239,18 @@ func TestConsumerFetchEnvOverrides(t *testing.T) {
 	}
 	if s.MaxWait != 500*time.Millisecond {
 		t.Fatalf("max_wait=%s", s.MaxWait)
+	}
+}
+
+func TestRetryMaxPauseEnvOverride(t *testing.T) {
+	t.Setenv("KAFKA_BATCH_RETRY_MAX_PAUSE", "7")
+
+	cfg, err := LoadDaemon("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RetryMaxPause != 7*time.Second {
+		t.Fatalf("retry_max_pause=%s", cfg.RetryMaxPause)
 	}
 }
 

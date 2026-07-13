@@ -23,6 +23,7 @@ type Result int
 const (
 	ResultCompleted Result = iota
 	ResultLockSkipped
+	ResultFailed
 )
 
 // Run sweeps stuck-running and lost-callback batches (Ruby KafkaBatch::Reconciler.run).
@@ -83,11 +84,14 @@ func Run(ctx context.Context, cfg config.Daemon, st *store.RedisStore, prod Prod
 		return nil
 	})
 	if err != nil {
-		log.Printf("[kbatch-reconciler] lock error: %v", err)
+		log.Printf("[kbatch-reconciler] sweep error: %v", err)
 	}
 	if !ran || !lockOK {
 		SaveSkip(ctx, st)
 		return ResultLockSkipped
+	}
+	if err != nil {
+		return ResultFailed
 	}
 
 	duration := time.Since(start)

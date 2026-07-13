@@ -114,6 +114,9 @@ func runReconcile(args []string) {
 	case reconciler.ResultLockSkipped:
 		fmt.Println("reconcile: lock held by another process")
 		os.Exit(0)
+	case reconciler.ResultFailed:
+		fmt.Fprintf(os.Stderr, "reconcile: failed\n")
+		os.Exit(1)
 	case reconciler.ResultCompleted:
 		fmt.Println("reconcile: completed")
 	}

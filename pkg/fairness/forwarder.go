@@ -22,10 +22,11 @@ type Forwarder struct {
 	ReadyTopic        string
 	ResolveReadyTopic func(payload []byte) (string, error)
 	Producer          Producer
-	IdleSleep  time.Duration
-	Burst      int
-	Now        func() time.Time
-	OnExpired  func(ctx context.Context, job *CheckoutResult, raw []byte) error
+	IdleSleep      time.Duration
+	Burst          int
+	Now            func() time.Time
+	OnExpired      func(ctx context.Context, job *CheckoutResult, raw []byte) error
+	RecordActivity func() // optional hook for liveness probes
 
 	lastLeaseReclaim   time.Time
 	lastForwardReclaim time.Time
@@ -122,6 +123,9 @@ func (f *Forwarder) Run(ctx context.Context) {
 			return
 		default:
 		}
+		if f.RecordActivity != nil {
+			f.RecordActivity()
+		}
 		forwarded := 0
 		for forwarded < burst {
 			if !f.ForwardOnce(ctx) {
@@ -140,7 +144,9 @@ func (f *Forwarder) maybeReclaim(ctx context.Context) {
 	now := time.Now()
 	if now.Sub(f.lastLeaseReclaim) >= reclaimInterval {
 		f.lastLeaseReclaim = now
-		if n, err := f.Scheduler.ReclaimExpiredLeases(ctx); err == nil && n > 0 {
+		if n, err := f.Scheduler.ReclaimExpiredLeases(ctx); err != nil {
+			log.Printf("[kbatch-fair-forwarder] reclaim leases lane=%s: %v", f.Lane, err)
+		} else if n > 0 {
 			log.Printf("[kbatch-fair-forwarder] reclaimed %d expired lease(s) lane=%s", n, f.Lane)
 		}
 	}
@@ -148,16 +154,19 @@ func (f *Forwarder) maybeReclaim(ctx context.Context) {
 		f.lastForwardReclaim = now
 		stale, err := f.Scheduler.ListStaleForwards(ctx)
 		if err != nil {
+			log.Printf("[kbatch-fair-forwarder] list stale forwards lane=%s: %v", f.Lane, err)
 			return
 		}
 		for _, e := range stale {
-			_ = f.Scheduler.ReclaimStaleForward(ctx, e, func(payload []byte, key string) error {
+			if err := f.Scheduler.ReclaimStaleForward(ctx, e, func(payload []byte, key string) error {
 				readyTopic, err := f.readyTopicFor(payload)
 				if err != nil {
 					return err
 				}
 				return f.Producer.Produce(ctx, readyTopic, key, payload)
-			})
+			}); err != nil {
+				log.Printf("[kbatch-fair-forwarder] reclaim stale forward lane=%s slot=%s: %v", f.Lane, e.SlotID, err)
+			}
 		}
 	}
 }

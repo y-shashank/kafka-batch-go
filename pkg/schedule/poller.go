@@ -32,13 +32,14 @@ type BatchCancelled func(ctx context.Context, batchID string) (bool, error)
 
 // Poller drains the delayed-job index (Ruby SchedulePoller).
 type Poller struct {
-	Cfg       config.Daemon
-	Store     IndexStore
-	Reader    PayloadReader
-	Producer  Producer
-	Router    Router
-	Cancelled BatchCancelled
-	Now       func() time.Time
+	Cfg            config.Daemon
+	Store          IndexStore
+	Reader         PayloadReader
+	Producer       Producer
+	Router         Router
+	Cancelled      BatchCancelled
+	Now            func() time.Time
+	RecordActivity func() // optional hook for liveness probes
 
 	lastReclaim time.Time
 }
@@ -116,7 +117,9 @@ func (p *Poller) Tick(ctx context.Context) (int, error) {
 		}
 	}
 	if len(done) > 0 {
-		_ = p.Store.Ack(ctx, done)
+		if err := p.Store.Ack(ctx, done); err != nil {
+			log.Printf("[kbatch-schedule] ack error (%d members): %v", len(done), err)
+		}
 	}
 	return acked, nil
 }
@@ -201,6 +204,9 @@ func (p *Poller) Run(ctx context.Context) {
 		default:
 		}
 		n, err := p.Tick(ctx)
+		if p.RecordActivity != nil {
+			p.RecordActivity()
+		}
 		if err != nil {
 			log.Printf("[kbatch-schedule] tick error: %v", err)
 			time.Sleep(p.jittered(wait))

@@ -1,106 +1,183 @@
-# Example kbatch daemon config (Phase 3).
-# Copy to your app as config/kbatch_daemon.yml and adjust.
+# Example kbatch daemon config.
+# Copy to your app as config/daemon.yml (or config/kbatch_daemon.yml) and adjust.
 #
-# Environment overrides (applied on top of YAML when set):
-#   KAFKA_BROKERS              comma-separated broker list
-#   KAFKA_PREFIX               topic + consumer_group prefix
-#   REDIS_URL                  Redis connection URL
-#   KAFKA_BATCH_HANDLER_MANIFEST  path to kafka_batch_handlers.yml
-#   KAFKA_BATCH_SCHEDULE_MYSQL_DSN  when schedule_store is mysql
-#   KAFKA_BATCH_PRIORITY_CONFIG(S)  priority YAML path(s) — daemon/worker only
-#   KAFKA_BATCH_STORE_MYSQL_DSN     batch failures / pause MySQL — daemon/worker only
-#     Both MYSQL_DSN vars accept a go-sql-driver DSN
-#       user:pass@tcp(host:3306)/db?parseTime=true&loc=UTC
-#     or a Rails-style URL
-#       mysql2://user:pass@host:3306/db?parseTime=true&loc=UTC
-#   KAFKA_BATCH_METRICS_*           metrics — daemon/worker only
-#   KAFKA_BATCH_LIVENESS_*          health HTTP — daemon/worker only
+# ── Environment overrides (applied on top of YAML when set) ───────────────────
+#   KAFKA_BROKERS                              comma-separated broker list
+#   KAFKA_PREFIX                               topic + consumer_group prefix
+#   REDIS_URL                                  Redis connection URL
+#   KAFKA_BATCH_HANDLER_MANIFEST               path to kafka_batch_handlers.yml
+#   KAFKA_BATCH_SCHEDULE_MYSQL_DSN             when schedule_store is mysql
+#   KAFKA_BATCH_STORE_MYSQL_DSN                failures / pause MySQL DSN
+#   KAFKA_BATCH_PRIORITY_CONFIG                single priority YAML path
+#   KAFKA_BATCH_PRIORITY_CONFIGS               comma-separated priority YAML paths
+#   KAFKA_BATCH_METRICS_ENABLED                1 | true
+#   KAFKA_BATCH_METRICS_PREFIX
+#   KAFKA_BATCH_METRICS_STATSD_ADDR
+#   KAFKA_BATCH_LIVENESS_ENABLED               1 | true
+#   KAFKA_BATCH_LIVENESS_HTTP_ADDR
+#   KAFKA_BATCH_EVENTS_CONSUMER_CONCURRENCY
+#   KAFKA_BATCH_RETRY_CONSUMER_CONCURRENCY
+#   KAFKA_BATCH_RETRY_MAX_PAUSE                seconds
+#   KAFKA_BATCH_PRODUCER_REQUIRED_ACKS         all_isr | leader
+#   KAFKA_BATCH_JOBS_CONSUMER_CONCURRENCY      worker only
+#   KAFKA_BATCH_FAIR_READY_CONSUMER_CONCURRENCY worker only
+#   KAFKA_BATCH_PRIORITY_CONSUMER_CONCURRENCY  worker only
+#   KAFKA_BATCH_JOB_PROCESS_CONCURRENCY        worker only
+#   KAFKA_BATCH_CONSUMER_FETCH_MAX_BYTES
+#   KAFKA_BATCH_CONSUMER_FETCH_MAX_PARTITION_BYTES
+#   KAFKA_BATCH_CONSUMER_FETCH_MAX_WAIT_MS
 #
-# Env interpolation: any value may reference an env var with ${VAR} or
-# ${VAR:-default}. One variable can then feed the client, control, and
-# execution roles — e.g. set KB_MYSQL_URL once and point both DSN keys at it:
+# Env interpolation: any value may use ${VAR} or ${VAR:-default}, e.g.:
+#   redis_url: ${REDIS_URL:-redis://localhost:6379/0}
 #   schedule_mysql_dsn: ${KB_MYSQL_URL}
-#   store_mysql_dsn:    ${KB_MYSQL_URL}
-# (A bare $VAR is left untouched so a literal '$' in a password survives.)
+#   store_mysql_dsn: ${KB_MYSQL_URL}
+
+# ── Kafka & identity ──────────────────────────────────────────────────────────
 
 brokers:
   - localhost:9092
 
-# Optional — when set, prefixes events/callbacks/retry topics and consumer_group
+# Optional namespace — prefixes topics and consumer_group (e.g. mothership.kafka_batch.events)
 # topic_prefix: mothership
 
 consumer_group: kafka-batch
 
-# Optional explicit job topics; when omitted, derived from handler manifest Go topics
+# Stable per-replica id for transactional retry producer fencing (default: hostname).
+# Set explicitly when multiple processes share a host.
+# node_id: pod-abc123
+
+handler_manifest: config/kafka_batch_handlers.yml
+
+# Explicit Go job topics for schedule routing / lag UI; usually derived from handler manifest.
 # jobs_topics:
 #   - kafka_batch.jobs
 #   - segment.exports
 
-handler_manifest: config/kafka_batch_handlers.yml
+redis_url: ${REDIS_URL:-redis://localhost:6379/0}
+
+# ── Core topics ───────────────────────────────────────────────────────────────
 
 events_topic: kafka_batch.events
 callbacks_topic: kafka_batch.callbacks
 dead_letter_topic: kafka_batch.dead_letter
 retry_topic: kafka_batch.jobs.retry
 
-# Env interpolation in action: use REDIS_URL if set, else fall back to localhost.
-redis_url: ${REDIS_URL:-redis://localhost:6379/0}
+# ── Job retry policy (used when Go job processor schedules failures) ────────────
 
 max_retries: 7
+# complete_after_retries: 7          # count job toward batch after N retries
 
-# Phase 3 — control-plane throughput (single pod, multi-partition topics)
-# In-process Kafka group members split partition assignment across goroutines.
-# With 32 events partitions, set events_consumer_concurrency up to 32.
-# events_consumer_concurrency: 8
-# retry_consumer_concurrency: 4
-# producer_required_acks: all_isr   # all_isr (default) | leader
-
-# kbatch worker throughput (single pod, multi-partition job topics)
-# jobs_consumer_concurrency: 32        # plain go job topics — match partition count
-# fair_ready_consumer_concurrency: 32  # per fair-ready lane (time / throughput)
-# priority_consumer_concurrency: 8     # per priority YAML group
-# job_process_concurrency: 1           # parallel jobs per poll per member (Karafka concurrency); try 4–8 for CPU-bound handlers
-
-# Consumer fetch fairness (daemon + worker consumers; tighter than franz-go defaults)
-# consumer_fetch_max_bytes: 1048576          # 1 MiB total per broker fetch (default)
-# consumer_fetch_max_partition_bytes: 131072 # 128 KiB per partition (default)
-# consumer_fetch_max_wait_ms: 200            # max broker wait before partial fetch (default)
-
-# Phase 3b — delayed jobs (perform_in / perform_at). Runs on control only.
-# Enable both keys for hybrid setups using MySQL schedule index (Ruby gem default).
-schedule_poller_enabled: true
-scheduled_topic: kafka_batch.scheduled
-schedule_store: redis                  # redis (default) | mysql
-# schedule_mysql_dsn: ${KB_MYSQL_URL}  # required when schedule_store: mysql
-# schedule_poll_interval: 5              # sec   — base poll cadence while jobs are flowing
-# schedule_poll_max_interval: 60         # sec   — cap for exponential backoff while idle
-# schedule_poll_jitter: 0.1              # ±frac — jitter on the sleep so pods de-sync (0 disables)
-# schedule_batch_size: 100               # int   — max due jobs claimed (query LIMIT) per poll
-# schedule_lease_seconds: 60             # sec   — lease TTL on a claimed job pointer
-# schedule_reclaim_interval: 30          # sec   — how often to reclaim expired leases
-
-# Priority YAML groups (one file per consumer group suffix)
-# priority_config_paths:
-#   - config/priority.example.yml
-# priority_lag_check_interval: 2
-# priority_weighted_interleave: 4
-
-# Phase 3c — fairness time lane (ingest → WFQ → ready.go / ready.ruby → perform)
-fairness_enabled: true
-# fairness_time_ingest: kafka_batch.fair_time_ingest
-# fairness_time_ready_go: kafka_batch.fair_time_ready.go
-# fairness_time_ready_ruby: kafka_batch.fair_time_ready.ruby
-# fairness_throughput_ready_go: kafka_batch.fair_throughput_ready.go
-# fairness_throughput_ready_ruby: kafka_batch.fair_throughput_ready.ruby
-# fairness_global_concurrency: 50
-# fairness_lease_ttl: 1800
-
-retry_tiers:
+retry_tiers:                         # tier => delay seconds (topics: retry.{tier})
   short: 30
   medium: 420
   large: 1200
 
-# HTTP health — consumer poll activity; K8s liveness/readiness should hit /health
+# retry_max_pause: 30                # sec — max sleep before re-checking not-yet-due retry (Ruby: retry_max_pause_seconds)
+# retry_transactional_enabled: false # exactly-once retry via Kafka transactions (opt-in)
+
+# ── Control-plane consumer throughput (daemon pod) ────────────────────────────
+# In-process members join the same consumer group; Kafka splits partitions across them.
+
+# events_consumer_concurrency: 8     # {group}-events — match events topic partition count
+# retry_consumer_concurrency: 4      # {group}-retry — match retry tier partition count
+# producer_required_acks: all_isr    # all_isr (default) | leader
+
+# Consumer fetch tuning (daemon + worker consumers)
+# consumer_fetch_max_bytes: 1048576           # 1 MiB total per broker fetch (default)
+# consumer_fetch_max_partition_bytes: 131072  # 128 KiB per partition (default)
+# consumer_fetch_max_wait_ms: 200             # max broker wait before partial fetch (default)
+
+# ── Worker throughput (kbatch worker only — listed here for one-file reference) ─
+# jobs_consumer_concurrency: 8
+# fair_ready_consumer_concurrency: 8
+# priority_consumer_concurrency: 4
+# job_process_concurrency: 1                  # parallel jobs per poll per member
+
+# ── Delayed jobs — perform_in / perform_at (daemon only) ─────────────────────
+
+schedule_poller_enabled: true
+scheduled_topic: kafka_batch.scheduled
+schedule_store: redis                  # redis | mysql
+# schedule_mysql_dsn: ${KB_MYSQL_URL}  # required when schedule_store: mysql
+# schedule_poll_interval: 5              # sec — base poll cadence while work is flowing
+# schedule_poll_max_interval: 60       # sec — idle backoff cap (exponential)
+# schedule_poll_jitter: 0.1            # ±fraction on sleep to de-sync pods (0 disables)
+# schedule_batch_size: 100             # max due jobs claimed per poll (SQL LIMIT)
+# schedule_lease_seconds: 60             # lease TTL on a claimed schedule pointer
+# schedule_reclaim_interval: 30        # sec — how often to reclaim expired leases
+
+# ── Priority YAML groups (daemon schedule routing + worker execution) ─────────
+
+# priority_config_paths:
+#   - config/priority/jobs-fast.yml
+#   - config/priority/jobs-slow.yml
+# priority_lag_check_interval: 2         # sec — priority consumer lag re-check
+# priority_weighted_interleave: 4      # weighted mode: 1-in-N lower-rank jobs
+
+# ── Fairness dispatch (daemon only) ───────────────────────────────────────────
+
+fairness_enabled: true
+
+# Time lane (weighted wall-clock)
+# fairness_time_ingest: kafka_batch.fair_time_ingest
+# fairness_time_ready: kafka_batch.fair_time_ready           # legacy combined ready topic
+# fairness_time_ready_go: kafka_batch.fair_time_ready.go
+# fairness_time_ready_ruby: kafka_batch.fair_time_ready.ruby
+
+# Throughput lane (weighted job count)
+# fairness_throughput_ingest: kafka_batch.fair_throughput_ingest
+# fairness_throughput_ready: kafka_batch.fair_throughput_ready
+# fairness_throughput_ready_go: kafka_batch.fair_throughput_ready.go
+# fairness_throughput_ready_ruby: kafka_batch.fair_throughput_ready.ruby
+
+# fairness_ready_window: 100            # WFQ ready-topic scan window
+# fairness_global_concurrency: 50       # in-flight window per lane
+# fairness_max_inflight_per_tenant: 0   # hard per-tenant cap (0 = dynamic share only)
+# fairness_lease_ttl: 1800              # sec — slot lease TTL (must exceed max job runtime)
+# fairness_default_weight: 1.0
+# fairness_weighted_concurrency: true   # false = equal cap per active tenant
+# fairness_active_count_ttl: 5          # sec — in-flight count cache TTL
+# fairness_active_count_source: inflight_plus_ready   # inflight_plus_ready | inflight
+# fairness_tenant_partition_cache_ttl: 30  # sec — in-process tenant→partition cache
+# fairness_dynamic_tenant_partitions: false
+# fairness_tenant_partitions:             # pin tenants to ingest partitions
+#   acme: 0
+#   globex: 1
+
+# ── Consumption pause/resume (/lag UI) ────────────────────────────────────────
+
+# consumption_control_refresh_interval: 30   # sec — how often consumers re-read pause state
+
+# ── Batch store / failures (daemon + worker) ──────────────────────────────────
+
+# store: redis                         # redis (default) | mysql
+# store_mysql_dsn: ${KB_MYSQL_URL}    # required when store: mysql (failures + pause tables)
+
+# skip_cancelled_jobs: true             # drop schedule dispatches for cancelled batches (default true; code default only — not YAML-loaded today)
+
+# ── Reconciler (daemon — triggered from events consumer) ──────────────────────
+# Recovers stuck running batches and re-fires lost callbacks. Manual run:
+#   kbatch reconcile --config config/daemon.yml
+
+# reconciliation_interval: 300         # sec — sweep interval + staleness threshold
+# reconciler_lock_ttl: 600             # sec — Redis lock TTL if reconciler crashes
+# max_reconcile_per_run: 100           # max stuck-running + lost-callback batches per sweep
+
+# ── Liveness HTTP (daemon health) ─────────────────────────────────────────────
+
 # liveness_enabled: true
 # liveness_http_addr: ":8080"
-# liveness_ttl: 30s
+# liveness_ttl: 30                     # sec — consumer heartbeat TTL for /health
+# track_running_jobs: true             # per-job /live writes (false = heartbeats only)
+
+# ── Metrics (daemon + worker) ─────────────────────────────────────────────────
+
+# metrics_enabled: false
+# metrics_prefix: kafka_batch
+# metrics_statsd_addr: localhost:8125
+
+# ── Code defaults not exposed in YAML (change requires code / future YAML keys) ─
+# retry_jitter: 0.1                    # unused in Go retry scheduling today
+# batch_ttl: 604800                    # sec — Redis batch hash TTL (7 days)
+# event_emit_retries: 3
+# event_emit_backoff: 1                # sec
