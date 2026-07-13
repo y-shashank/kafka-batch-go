@@ -14,9 +14,63 @@ import (
 // errConsumerStalled is returned when a consumer loop makes no progress for too long.
 var errConsumerStalled = errors.New("consumer stalled")
 
-// consumerStallTimeout is how long a consumer may go without loop progress before
-// the watchdog force-closes the franz-go client and the supervised loop reconnects.
-const consumerStallTimeout = 90 * time.Second
+// defaultConsumerStallTimeout is how long a consumer may go without loop progress
+// before the watchdog force-closes the franz-go client and the supervised loop reconnects.
+const defaultConsumerStallTimeout = 90 * time.Second
+
+var consumerStallTimeoutSetting = defaultConsumerStallTimeout
+
+// SetConsumerStallTimeout configures the stall watchdog duration for all consumer loops.
+func SetConsumerStallTimeout(d time.Duration) {
+	if d > 0 {
+		consumerStallTimeoutSetting = d
+	}
+}
+
+func effectiveStallTimeout(override time.Duration) time.Duration {
+	if override > 0 {
+		return override
+	}
+	return consumerStallTimeoutSetting
+}
+
+func stallHeartbeatInterval(stall time.Duration) time.Duration {
+	tick := stall / 6
+	if tick < 100*time.Millisecond {
+		return 100 * time.Millisecond
+	}
+	return tick
+}
+
+// runWithStallHeartbeat runs fn while periodically calling touch() so long processing
+// does not trip the stall watchdog between poll cycles.
+func runWithStallHeartbeat(touch func(), stall time.Duration, fn func() error) error {
+	if fn == nil {
+		return nil
+	}
+	if touch != nil {
+		touch()
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- fn()
+	}()
+	ticker := time.NewTicker(stallHeartbeatInterval(effectiveStallTimeout(stall)))
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-done:
+			if touch != nil {
+				touch()
+			}
+			return err
+		case <-ticker.C:
+			if touch != nil {
+				touch()
+			}
+		}
+	}
+}
 
 type rebalanceCloser interface {
 	AllowRebalance()
@@ -28,7 +82,7 @@ type rebalanceCloser interface {
 // CloseAllowingRebalance from a side goroutine — required because franz-go's
 // BlockRebalanceOnPoll can deadlock on ctx cancel or Close() alone.
 func attachConsumerStallGuard(parent context.Context, cl rebalanceCloser, label string) (context.Context, func(), func()) {
-	return attachConsumerStallGuardFor(parent, cl, label, consumerStallTimeout)
+	return attachConsumerStallGuardFor(parent, cl, label, consumerStallTimeoutSetting)
 }
 
 func attachConsumerStallGuardFor(parent context.Context, cl rebalanceCloser, label string, stall time.Duration) (context.Context, func(), func()) {
@@ -41,10 +95,7 @@ func attachConsumerStallGuardFor(parent context.Context, cl rebalanceCloser, lab
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		tick := stall / 6
-		if tick < 100*time.Millisecond {
-			tick = 100 * time.Millisecond
-		}
+		tick := stallHeartbeatInterval(stall)
 		ticker := time.NewTicker(tick)
 		defer ticker.Stop()
 		for {

@@ -36,6 +36,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	if err != nil {
 		return err
 	}
+	SetConsumerStallTimeout(cfg.ConsumerStallTimeoutDuration())
 	if manifestPath != "" {
 		cfg.HandlerManifest = manifestPath
 	}

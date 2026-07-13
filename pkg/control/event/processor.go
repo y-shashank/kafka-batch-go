@@ -80,25 +80,14 @@ func (p *Processor) ProcessBatch(ctx context.Context, rawEvents [][]byte) (Outco
 		out.Callbacks = append(out.Callbacks, cb)
 	}
 
-	for _, batchID := range result.Replays {
-		dispatched, err := p.Store.CallbackDispatched(ctx, batchID)
-		if err != nil {
-			return out, err
-		}
-		if dispatched {
-			continue
-		}
-		batch, err := p.Store.FindBatch(ctx, batchID)
-		if err != nil || batch == nil {
-			continue
-		}
-		if batch.Status != "success" && batch.Status != "complete" {
-			continue
-		}
-		outcome := batch.Status
+	replayBatches, err := p.Store.FindReplayCallbackBatches(ctx, result.Replays)
+	if err != nil {
+		return out, err
+	}
+	for _, batch := range replayBatches {
 		out.Callbacks = append(out.Callbacks, protocol.CallbackMessage{
 			BatchID:        batch.ID,
-			Outcome:        outcome,
+			Outcome:        batch.Status,
 			TotalJobs:      batch.TotalJobs,
 			CompletedCount: batch.CompletedCount,
 			FailedCount:    batch.FailedCount,

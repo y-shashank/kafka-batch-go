@@ -59,6 +59,9 @@ type Daemon struct {
 	ConsumerFetchMaxPartitionBytes int32
 	// ConsumerFetchMaxWait is max broker wait before returning a partial fetch.
 	ConsumerFetchMaxWait              time.Duration
+	// ConsumerStallTimeout is how long a consumer loop may go without progress
+	// before the watchdog force-closes the client and reconnects.
+	ConsumerStallTimeout              time.Duration
 	SchedulePollerEnabled             bool
 	ScheduledTopic                    string
 	SchedulePollInterval              time.Duration
@@ -169,6 +172,7 @@ func DefaultDaemon() Daemon {
 		ConsumerFetchMaxBytes:             DefaultConsumerFetchMaxBytes,
 		ConsumerFetchMaxPartitionBytes:    DefaultConsumerFetchMaxPartitionBytes,
 		ConsumerFetchMaxWait:              DefaultConsumerFetchMaxWait,
+		ConsumerStallTimeout:              90 * time.Second,
 	}
 }
 
@@ -228,6 +232,14 @@ func (c Daemon) JobProcessWorkers() int {
 	return c.JobProcessConcurrency
 }
 
+// ConsumerStallTimeoutDuration returns the configured consumer stall watchdog duration.
+func (c Daemon) ConsumerStallTimeoutDuration() time.Duration {
+	if c.ConsumerStallTimeout <= 0 {
+		return 90 * time.Second
+	}
+	return c.ConsumerStallTimeout
+}
+
 func LoadDaemon(path string) (Daemon, error) {
 	cfg := DefaultDaemon()
 	if path == "" {
@@ -267,6 +279,7 @@ func LoadDaemon(path string) (Daemon, error) {
 		ConsumerFetchMaxBytes                int32            `yaml:"consumer_fetch_max_bytes"`
 		ConsumerFetchMaxPartitionBytes       int32            `yaml:"consumer_fetch_max_partition_bytes"`
 		ConsumerFetchMaxWaitMs               float64          `yaml:"consumer_fetch_max_wait_ms"`
+		ConsumerStallTimeoutSec              float64          `yaml:"consumer_stall_timeout"`
 		SchedulePollerEnabled                bool             `yaml:"schedule_poller_enabled"`
 		ScheduledTopic                       string           `yaml:"scheduled_topic"`
 		ScheduleLeaseSeconds                 int              `yaml:"schedule_lease_seconds"`
@@ -391,6 +404,9 @@ func LoadDaemon(path string) (Daemon, error) {
 	}
 	if doc.ConsumerFetchMaxWaitMs > 0 {
 		cfg.ConsumerFetchMaxWait = time.Duration(doc.ConsumerFetchMaxWaitMs * float64(time.Millisecond))
+	}
+	if doc.ConsumerStallTimeoutSec > 0 {
+		cfg.ConsumerStallTimeout = time.Duration(doc.ConsumerStallTimeoutSec * float64(time.Second))
 	}
 	if doc.SchedulePollerEnabled {
 		cfg.SchedulePollerEnabled = true
@@ -630,6 +646,11 @@ func applyEnv(cfg *Daemon) {
 	if v := os.Getenv("KAFKA_BATCH_CONSUMER_FETCH_MAX_WAIT_MS"); v != "" {
 		if n, err := parsePositiveInt(v); err == nil {
 			cfg.ConsumerFetchMaxWait = time.Duration(n) * time.Millisecond
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_CONSUMER_STALL_TIMEOUT"); v != "" {
+		if n, err := parsePositiveFloat(v); err == nil {
+			cfg.ConsumerStallTimeout = time.Duration(n * float64(time.Second))
 		}
 	}
 	cfg.prefixTopics()

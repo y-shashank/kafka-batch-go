@@ -167,6 +167,41 @@ func (s *RedisStore) CallbackDispatched(ctx context.Context, batchID string) (bo
 	return v != "", err
 }
 
+// FindReplayCallbackBatches loads callback-eligible batches for replay IDs in one pipelined round trip.
+func (s *RedisStore) FindReplayCallbackBatches(ctx context.Context, ids []string) ([]*Batch, error) {
+	if s == nil || s.client == nil || len(ids) == 0 {
+		return nil, nil
+	}
+	pipe := s.client.Pipeline()
+	cmds := make([]*redis.MapStringStringCmd, len(ids))
+	for i, id := range ids {
+		cmds[i] = pipe.HGetAll(ctx, batchKey(id))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+		return nil, err
+	}
+
+	out := make([]*Batch, 0, len(ids))
+	for _, cmd := range cmds {
+		h, err := cmd.Result()
+		if err != nil {
+			return nil, err
+		}
+		if len(h) == 0 || h["callback_dispatched_at"] != "" {
+			continue
+		}
+		b := hashToBatch(h)
+		if b == nil {
+			continue
+		}
+		if b.Status != "success" && b.Status != "complete" {
+			continue
+		}
+		out = append(out, b)
+	}
+	return out, nil
+}
+
 // MarkReconcilerRefired records that the reconciler re-produced a callback for this batch.
 func (s *RedisStore) MarkReconcilerRefired(ctx context.Context, batchID string) error {
 	if s == nil || s.client == nil {

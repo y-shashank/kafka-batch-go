@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
@@ -15,24 +16,25 @@ import (
 
 // defaultEventsPollRecords caps each events poll when using BlockRebalanceOnPoll so
 // rebalance is not blocked for an unbounded batch (franz-go recommends PollRecords).
-const defaultEventsPollRecords = 100
+const defaultEventsPollRecords = 25
 
 // defaultPriorityPollRecords bounds priority worker polls per franz-go guidance.
 const defaultPriorityPollRecords = 100
 
 type pollLoopConfig struct {
-	label       string
-	group       string
-	memberLabel string
-	healthKey   string
-	topics      []string
-	maxRecords  int // 0 = PollFetches (all buffered), >0 = PollRecords(n)
-	health      *ConsumerHealth
-	loopHealth  *LoopHealth
-	loopName    string
-	pauseCtl    pauseChecker
-	live        *liveness.Reporter
-	onPoll      func(context.Context)
+	label        string
+	group        string
+	memberLabel  string
+	healthKey    string
+	topics       []string
+	maxRecords   int // 0 = PollFetches (all buffered), >0 = PollRecords(n)
+	stallTimeout time.Duration
+	health       *ConsumerHealth
+	loopHealth   *LoopHealth
+	loopName     string
+	pauseCtl     pauseChecker
+	live         *liveness.Reporter
+	onPoll       func(context.Context)
 }
 
 type consumerClient struct {
@@ -93,7 +95,7 @@ func runGroupPollLoop(
 	cfg pollLoopConfig,
 	process func(ctx context.Context, recs []*kgo.Record) error,
 ) error {
-	loopCtx, touch, stopGuard := attachConsumerStallGuard(ctx, cl, cfg.label)
+	loopCtx, touch, stopGuard := attachConsumerStallGuardFor(ctx, cl, cfg.label, effectiveStallTimeout(cfg.stallTimeout))
 	defer stopGuard()
 
 	healthKey := cfg.healthKey
@@ -138,7 +140,9 @@ func runGroupPollLoop(
 		recs := collectPollRecords(procCtx, cl, cfg.group, fetches, cfg.pauseCtl, cfg.live)
 		var procErr error
 		if len(recs) > 0 {
-			procErr = process(procCtx, recs)
+			procErr = runWithStallHeartbeat(touch, cfg.stallTimeout, func() error {
+				return process(procCtx, recs)
+			})
 		}
 		endProc()
 
