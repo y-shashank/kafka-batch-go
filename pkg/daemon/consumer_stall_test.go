@@ -3,6 +3,9 @@ package daemon
 import (
 	"context"
 	"errors"
+	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -59,4 +62,28 @@ func TestRunWithStallHeartbeatTouchesDuringWork(t *testing.T) {
 	if touches < 2 {
 		t.Fatalf("touches=%d want >= 2", touches)
 	}
+}
+
+func TestRunWithStallHeartbeatRunsFnOnCallingGoroutine(t *testing.T) {
+	var callerID int64
+	var fnID int64
+	callerID = int64(currentGoroutineID())
+	err := runWithStallHeartbeat(nil, 90*time.Second, func() error {
+		fnID = int64(currentGoroutineID())
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected err=%v", err)
+	}
+	if callerID != fnID {
+		t.Fatalf("fn ran on goroutine %d, caller was %d", fnID, callerID)
+	}
+}
+
+func currentGoroutineID() uint64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	idField := strings.Fields(strings.TrimPrefix(string(buf[:n]), "goroutine "))[0]
+	id, _ := strconv.ParseUint(idField, 10, 64)
+	return id
 }

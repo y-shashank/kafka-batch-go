@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -42,8 +43,9 @@ func stallHeartbeatInterval(stall time.Duration) time.Duration {
 	return tick
 }
 
-// runWithStallHeartbeat runs fn while periodically calling touch() so long processing
-// does not trip the stall watchdog between poll cycles.
+// runWithStallHeartbeat runs fn on the poll goroutine while a side goroutine
+// periodically calls touch(). fn must stay on the poll thread so franz-go client
+// calls (MarkCommitRecords, etc.) are not made from a worker goroutine.
 func runWithStallHeartbeat(touch func(), stall time.Duration, fn func() error) error {
 	if fn == nil {
 		return nil
@@ -51,25 +53,31 @@ func runWithStallHeartbeat(touch func(), stall time.Duration, fn func() error) e
 	if touch != nil {
 		touch()
 	}
-	done := make(chan error, 1)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
-		done <- fn()
-	}()
-	ticker := time.NewTicker(stallHeartbeatInterval(effectiveStallTimeout(stall)))
-	defer ticker.Stop()
-	for {
-		select {
-		case err := <-done:
-			if touch != nil {
-				touch()
-			}
-			return err
-		case <-ticker.C:
-			if touch != nil {
-				touch()
+		defer wg.Done()
+		ticker := time.NewTicker(stallHeartbeatInterval(effectiveStallTimeout(stall)))
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				if touch != nil {
+					touch()
+				}
 			}
 		}
+	}()
+	err := fn()
+	close(stop)
+	wg.Wait()
+	if touch != nil {
+		touch()
 	}
+	return err
 }
 
 type rebalanceCloser interface {

@@ -18,6 +18,10 @@ import (
 // rebalance is not blocked for an unbounded batch (franz-go recommends PollRecords).
 const defaultEventsPollRecords = 25
 
+// defaultDispatchPollRecords caps fair-dispatch polls at one record so backpressure
+// and AllowRebalance run per message (franz-go BlockRebalanceOnPoll guidance).
+const defaultDispatchPollRecords = 1
+
 // defaultPriorityPollRecords bounds priority worker polls per franz-go guidance.
 const defaultPriorityPollRecords = 100
 

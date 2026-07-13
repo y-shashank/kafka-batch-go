@@ -47,6 +47,7 @@ func RunConsumer(ctx context.Context, brokers []string, group string, topics []s
 		health:      health,
 		pauseCtl:    pauseCtl,
 		live:        live,
+		maxRecords:  defaultDispatchPollRecords,
 		memberLabel: memberLabel(1, 1),
 		healthKey:   healthMemberKey(group, 1, 1),
 	})
@@ -134,6 +135,7 @@ type consumerSpec struct {
 	topics      []string
 	fetch       config.ConsumerFetchSettings
 	handle      func(*kgo.Record) error
+	maxRecords  int
 	health      *ConsumerHealth
 	pauseCtl    pauseChecker
 	live        *liveness.Reporter
@@ -381,6 +383,7 @@ func runConsumerLoop(ctx context.Context, spec consumerSpec) error {
 		memberLabel: spec.memberLabel,
 		healthKey:   spec.healthKey,
 		topics:      spec.topics,
+		maxRecords:  spec.maxRecords,
 		health:      spec.health,
 		pauseCtl:    spec.pauseCtl,
 		live:        spec.live,
