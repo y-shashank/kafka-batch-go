@@ -94,10 +94,10 @@ retry_tiers:                         # tier => delay seconds (topics: retry.{tie
 # consumer_fetch_max_wait_ms: 200             # max broker wait before partial fetch (default)
 
 # ── Worker throughput (kbatch worker only — listed here for one-file reference) ─
-# jobs_consumer_concurrency: 8
+jobs_consumer_concurrency: 8
 # fair_ready_consumer_concurrency: 8
 # priority_consumer_concurrency: 4
-# job_process_concurrency: 1                  # parallel jobs per poll per member
+job_process_concurrency: 4                  # parallel jobs per poll per member
 
 # ── Delayed jobs — perform_in / perform_at (daemon only) ─────────────────────
 
