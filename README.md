@@ -96,9 +96,12 @@ kbatch daemon --config config/daemon.yml --manifest config/kafka_batch_handlers.
 # 2 — Go execution (handlers registered via kbatch.Register in your worker main)
 kbatch worker --config config/daemon.yml --manifest config/kafka_batch_handlers.yml
 
-# 3 — Ruby execution (Karafka JobConsumer on ruby topics from the gem)
-bundle exec karafka server --include-consumer-groups "${CG}-jobs,${CG}-jobs-fair-time"
+# 3 — Ruby execution only (no kafka-batch-control / dispatch-* — Go daemon owns tier 2)
+bundle exec karafka server --include-consumer-groups \
+  "${CG}-jobs,${CG}-jobs-fast,${CG}-jobs-fair-time,${CG}-jobs-fair-throughput"
 ```
+
+Enable `fairness_enabled` and `schedule_poller_enabled` in `config/daemon.yml` — see [Setup: `config/daemon.yml`](#setup-configdaemonyml-go-control-plane).
 
 Go and Ruby APIs both enqueue via their respective clients using the **same manifest and Redis URL**. A single batch can push Go and Ruby jobs; the batch completes when every job emits a success/failure event and control updates the ledger.
 
@@ -190,8 +193,85 @@ Or CLI:
 
 ```bash
 go build -o kbatch ./cmd/kbatch
-kbatch daemon --config config/kbatch_daemon.yml --manifest config/kafka_batch_handlers.yml
+kbatch daemon --config config/daemon.yml --manifest config/kafka_batch_handlers.yml
 ```
+
+### Setup: `config/daemon.yml` (Go control plane)
+
+Copy `config/daemon.example.yml` to your app as `config/daemon.yml`. The daemon **only** starts consumers for settings you enable — unlike Ruby Karafka's single `kafka-batch-control` group, Go splits control into separate Kafka groups:
+
+| YAML / behavior | Kafka consumer group(s) | What it does |
+|-----------------|-------------------------|--------------|
+| always | `{consumer_group}-events` | Batch completion events, ledger updates |
+| `retry_tiers` present | `{consumer_group}-retry` | Tiered retry consumption |
+| `fairness_enabled: true` | `{consumer_group}-dispatch-time`, `{consumer_group}-dispatch-throughput` | Fair ingest → Redis WFQ → ready topics |
+| `schedule_poller_enabled: true` | *(no group — in-process poller)* | Dispatches due `perform_in` / `perform_at` jobs from the schedule index |
+
+With `consumer_group: kafka-batch` (no `topic_prefix`), a fully wired control plane looks like:
+
+```yaml
+# config/daemon.yml — minimal Go control plane for hybrid Go control + Ruby execution
+brokers:
+  - localhost:9092
+
+consumer_group: kafka-batch
+handler_manifest: config/kafka_batch_handlers.yml
+
+events_topic: kafka_batch.events
+callbacks_topic: kafka_batch.callbacks
+dead_letter_topic: kafka_batch.dead_letter
+retry_topic: kafka_batch.jobs.retry
+
+redis_url: ${REDIS_URL:-redis://localhost:6379/0}
+
+max_retries: 7
+retry_tiers:
+  short: 30
+  medium: 420
+  large: 1200
+
+# Fairness dispatch (tier 2) — REQUIRED for fair_time_ingest / fair_throughput_ingest handlers.
+# Without this, jobs sit on ingest topics and never reach fair_*_ready.* execution topics.
+fairness_enabled: true
+fairness_global_concurrency: 500   # in-flight window per lane (time + throughput)
+fairness_lease_ttl: 1800           # seconds; must exceed longest job runtime
+
+# Delayed jobs (tier 2) — REQUIRED when clients use perform_in / perform_at.
+# Index store: redis (default) or mysql (pairs with schedule_mysql_dsn).
+schedule_poller_enabled: true
+schedule_store: mysql                # redis | mysql
+scheduled_topic: kafka_batch.scheduled
+schedule_mysql_dsn: ${KAFKA_BATCH_SCHEDULE_MYSQL_DSN:-mysql2://user:pass@127.0.0.1:3306/kafka_batch_development}
+
+# Priority YAML paths — daemon uses these for schedule routing defaults; worker
+# loads the same files for kafka-batch-jobs-fast / kafka-batch-jobs-slow groups.
+priority_config_paths:
+  - config/priority/jobs-fast.yml
+  - config/priority/jobs-slow.yml
+
+events_consumer_concurrency: 8
+retry_consumer_concurrency: 4
+producer_required_acks: all_isr
+
+liveness_enabled: true
+liveness_http_addr: ":8080"
+```
+
+**Hybrid local dev (Go control + Ruby execution)** — three terminals:
+
+```bash
+# 1 — Go control (events, retry, fair dispatch, schedule poller)
+kbatch daemon --config config/daemon.yml --manifest config/kafka_batch_handlers.yml
+
+# 2 — Go worker (runtime: go handlers)
+kbatch worker --config config/daemon.yml --manifest config/kafka_batch_handlers.yml
+
+# 3 — Ruby execution ONLY — do NOT include kafka-batch-control or dispatch-* groups
+bundle exec karafka server --include-consumer-groups \
+  "kafka-batch-jobs,kafka-batch-jobs-fast,kafka-batch-jobs-slow,kafka-batch-jobs-fair-time,kafka-batch-jobs-fair-throughput"
+```
+
+Do **not** run Go `kbatch daemon` and Ruby `kafka-batch-control` on the same events/retry topics (double consumption). Pick one control runtime.
 
 Consumes: fair **ingest** (dispatch + forwarder), **events**, **retry**, schedule poller. Does **not** run job handlers or batch callbacks.
 
@@ -420,14 +500,14 @@ kbatch topics create|validate [--manifest PATH]
 export KAFKA_PREFIX=dev
 export REDIS_URL=redis://localhost:6379/0
 
-# Terminal A — control
-kbatch daemon --config config/daemon.example.yml --manifest config/kafka_batch_handlers.yml
+# Terminal A — control (see Setup: config/daemon.yml above for required YAML keys)
+kbatch daemon --config config/daemon.yml --manifest config/kafka_batch_handlers.yml
 
 # Terminal B — execution (link your handlers via kbatch.Register in worker main)
-kbatch worker --config config/daemon.example.yml --manifest config/kafka_batch_handlers.yml
+kbatch worker --config config/daemon.yml --manifest config/kafka_batch_handlers.yml
 ```
 
-**Mixed Go control + Ruby execution** — add a Ruby Karafka worker pod/process using the same config + manifest as the Go daemon. Jobs with `runtime: ruby` in the manifest are consumed by Ruby; `runtime: go` jobs stay on the Go worker.
+**Mixed Go control + Ruby execution** — Go daemon owns tier 2 (`-events`, `-retry`, `-dispatch-*`, schedule poller). Ruby Karafka runs **execution groups only** (`-jobs`, `-jobs-fast`, `-jobs-fair-*`) with the same brokers, Redis URL, and manifest. See [Setup: `config/daemon.yml`](#setup-configdaemonyml-go-control-plane).
 
 **Mixed clients** — a Go service uses `pkg/client`; a Rails app uses `KafkaBatch::Batch`. Both point at the same brokers, Redis, and manifest; batch IDs and job envelopes are wire-compatible.
 
