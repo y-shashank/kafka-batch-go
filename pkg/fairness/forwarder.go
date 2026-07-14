@@ -38,23 +38,41 @@ const (
 	reclaimInterval  = 30 * time.Second
 )
 
+// forwardOutcome distinguishes idle ready-list from transient forward failures so
+// Run can drain backlog without treating produce errors as "no work".
+type forwardOutcome int
+
+const (
+	forwardDidWork forwardOutcome = iota
+	forwardIdle
+	forwardFailed
+)
+
 // ForwardOnce forwards one job when available.
 func (f *Forwarder) ForwardOnce(ctx context.Context) bool {
+	return f.forwardOnceOutcome(ctx) == forwardDidWork
+}
+
+func (f *Forwarder) forwardOnceOutcome(ctx context.Context) forwardOutcome {
 	if f.Scheduler == nil {
-		return false
+		return forwardIdle
 	}
 	job, err := f.Scheduler.Checkout(ctx)
-	if err != nil || job == nil {
-		return false
+	if err != nil {
+		log.Printf("[kbatch-fair-forwarder] checkout error lane=%s: %v", f.Lane, err)
+		return forwardFailed
+	}
+	if job == nil {
+		return forwardIdle
 	}
 	if f.handleExpired(ctx, job) {
-		return true
+		return forwardDidWork
 	}
 	if err := f.forwardJob(ctx, job); err != nil {
 		log.Printf("[kbatch-fair-forwarder] forward error lane=%s: %v", f.Lane, err)
-		return false
+		return forwardFailed
 	}
-	return true
+	return forwardDidWork
 }
 
 func (f *Forwarder) handleExpired(ctx context.Context, job *CheckoutResult) bool {
@@ -106,6 +124,10 @@ func (f *Forwarder) forwardJob(ctx context.Context, job *CheckoutResult) error {
 }
 
 // Run blocks until ctx is cancelled.
+//
+// While Redis has ready jobs (worker backlog), Run drains them in bursts with no
+// idle sleep — produce → ready topic continuously. Only after a burst finds the
+// ready list empty (or makes no progress) does it resume the idle wait cycle.
 func (f *Forwarder) Run(ctx context.Context) {
 	idle := f.IdleSleep
 	if idle <= 0 {
@@ -126,18 +148,41 @@ func (f *Forwarder) Run(ctx context.Context) {
 		if f.RecordActivity != nil {
 			f.RecordActivity()
 		}
-		forwarded := 0
-		for forwarded < burst {
-			if !f.ForwardOnce(ctx) {
-				break
-			}
-			forwarded++
-		}
+		n, empty, failed := f.drainBurst(ctx, burst)
 		f.maybeReclaim(ctx)
-		if forwarded == 0 {
+		switch {
+		case n == burst && !empty && !failed:
+			// Full burst with more ready work likely remaining — keep draining.
+			continue
+		case n > 0 && failed:
+			// Partial progress then error — retry immediately, do not idle-sleep.
+			continue
+		default:
+			// Ready backlog cleared (empty) or no progress — resume poll wait.
 			time.Sleep(idle)
 		}
 	}
+}
+
+// drainBurst forwards up to burst jobs. empty means Checkout reported no ready
+// work; failed means a checkout/produce error stopped the burst early.
+func (f *Forwarder) drainBurst(ctx context.Context, burst int) (n int, empty, failed bool) {
+	for n < burst {
+		select {
+		case <-ctx.Done():
+			return n, false, false
+		default:
+		}
+		switch f.forwardOnceOutcome(ctx) {
+		case forwardDidWork:
+			n++
+		case forwardIdle:
+			return n, true, false
+		case forwardFailed:
+			return n, false, true
+		}
+	}
+	return n, false, false
 }
 
 func (f *Forwarder) maybeReclaim(ctx context.Context) {

@@ -184,6 +184,10 @@ func (p *Poller) now() time.Time {
 }
 
 // Run blocks until ctx is cancelled.
+//
+// When due jobs exist, Tick runs in a tight drain loop with no sleep — claim →
+// produce → ack in batches until a tick returns 0. Only then does the poller
+// resume the idle wait cycle (exponential backoff up to SchedulePollMaxInterval).
 func (p *Poller) Run(ctx context.Context) {
 	interval := p.Cfg.SchedulePollInterval
 	if interval <= 0 {
@@ -203,22 +207,45 @@ func (p *Poller) Run(ctx context.Context) {
 			return
 		default:
 		}
-		n, err := p.Tick(ctx)
-		if p.RecordActivity != nil {
-			p.RecordActivity()
-		}
+		drained, err := p.drainDue(ctx)
 		if err != nil {
 			log.Printf("[kbatch-schedule] tick error: %v", err)
 			time.Sleep(p.jittered(wait))
 			wait = min(wait*2, cap)
 			continue
 		}
-		if n == 0 {
-			time.Sleep(p.jittered(wait))
-			wait = min(wait*2, cap)
-		} else {
+		if drained {
 			wait = interval
 		}
+		// No more due work (or just finished draining) — resume poll wait.
+		time.Sleep(p.jittered(wait))
+		if !drained {
+			wait = min(wait*2, cap)
+		}
+	}
+}
+
+// drainDue repeatedly Ticks while due jobs remain. Returns whether any job was
+// dispatched. Errors from an empty-progress Tick are returned to the caller.
+func (p *Poller) drainDue(ctx context.Context) (drained bool, err error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return drained, nil
+		default:
+		}
+		n, tickErr := p.Tick(ctx)
+		if p.RecordActivity != nil {
+			p.RecordActivity()
+		}
+		if tickErr != nil {
+			return drained, tickErr
+		}
+		if n == 0 {
+			return drained, nil
+		}
+		drained = true
+		// More due work may remain — keep claiming without idle sleep.
 	}
 }
 

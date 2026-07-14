@@ -152,6 +152,9 @@ func closeGroupConsumer(cl rebalanceCloser) {
 	if cl == nil {
 		return
 	}
+	if c, ok := cl.(*consumerClient); ok {
+		c.invalidateDeferredPauses()
+	}
 	cl.CloseAllowingRebalance()
 }
 

@@ -68,7 +68,7 @@ func (c *consumerClient) anyTopicPaused() bool {
 			return true
 		}
 	}
-	return len(c.partPaused) > 0 || len(c.deferredPaused) > 0
+	return len(c.partPaused) > 0 || len(c.deferredPaused) > 0 || len(c.enginePaused) > 0
 }
 
 // pollWaitCtx bounds PollRecords while topics/partitions are fetch-paused so the

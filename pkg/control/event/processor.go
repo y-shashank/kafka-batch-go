@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 
 	"github.com/y-shashank/kafka-batch-go/pkg/config"
 	"github.com/y-shashank/kafka-batch-go/pkg/instrument"
@@ -37,12 +38,18 @@ type Outcome struct {
 func (p *Processor) ProcessBatch(ctx context.Context, rawEvents [][]byte) (Outcome, error) {
 	out := Outcome{}
 	events := make([]store.CompletionEvent, 0, len(rawEvents))
+	skipped := 0
 	for _, raw := range rawEvents {
 		var ev protocol.EventMessage
 		if err := json.Unmarshal(raw, &ev); err != nil {
+			skipped++
+			log.Printf("[kbatch-event] skip malformed event: %v", err)
 			continue
 		}
 		if ev.BatchID == "" || ev.BatchSeq <= 0 {
+			skipped++
+			log.Printf("[kbatch-event] skip invalid event batch_id=%q batch_seq=%d job_id=%q",
+				ev.BatchID, ev.BatchSeq, ev.JobID)
 			continue
 		}
 		events = append(events, store.CompletionEvent{
@@ -50,7 +57,13 @@ func (p *Processor) ProcessBatch(ctx context.Context, rawEvents [][]byte) (Outco
 		})
 	}
 	if len(events) == 0 {
+		if skipped > 0 {
+			log.Printf("[kbatch-event] batch had %d invalid event(s) and no valid ones — acknowledging to avoid poison loop", skipped)
+		}
 		return out, nil
+	}
+	if skipped > 0 {
+		log.Printf("[kbatch-event] skipped %d invalid event(s); processing %d valid", skipped, len(events))
 	}
 
 	result, err := p.Store.RecordCompletionsBatch(ctx, events)

@@ -171,3 +171,28 @@ func TestProcessBatchReplayProducesCallbackWhenNotDispatched(t *testing.T) {
 		t.Fatalf("produced %+v", prod.msgs)
 	}
 }
+
+func TestProcessBatchSkipsInvalidWithoutFailing(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mr.Close)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := store.NewRedisStore(rdb, time.Hour)
+	prod := &memProducer{}
+	cfg := config.DefaultDaemon()
+	cfg.CallbacksTopic = "callbacks"
+	p := &Processor{Cfg: cfg, Store: st, Producer: prod}
+
+	out, err := p.ProcessBatch(context.Background(), [][]byte{
+		[]byte(`not-json`),
+		[]byte(`{"batch_id":"","batch_seq":1,"job_id":"j","status":"success"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Callbacks) != 0 {
+		t.Fatalf("callbacks %+v", out.Callbacks)
+	}
+}

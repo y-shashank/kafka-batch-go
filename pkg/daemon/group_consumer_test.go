@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 func TestPollAbortControllerCancelsProcessing(t *testing.T) {
@@ -158,6 +160,7 @@ func TestDeferredPauseNotClearedByConsumptionSync(t *testing.T) {
 		deferredPaused: map[string]map[int32]int64{},
 		pauseOps:       fp,
 	}
+	cc.initDeferLifecycle()
 	cc.pauseDeferredPartition("retry.short", 0, 7)
 	if !cc.anyTopicPaused() {
 		t.Fatal("expected deferred pause to count as paused")
@@ -175,6 +178,42 @@ func TestDeferredPauseNotClearedByConsumptionSync(t *testing.T) {
 	}
 	if len(fp.partResumed["retry.short"]) != 1 || fp.partResumed["retry.short"][0] != 0 {
 		t.Fatalf("partResumed=%v", fp.partResumed)
+	}
+}
+
+func TestEnginePauseCountsForPollWait(t *testing.T) {
+	fp := &recordingFetchPauser{}
+	cc := &consumerClient{
+		topicPaused:  map[string]bool{},
+		enginePaused: map[string]map[int32]struct{}{},
+		pauseOps:     fp,
+	}
+	cc.pauseEnginePartition("events", 0)
+	if !cc.anyTopicPaused() {
+		t.Fatal("expected engine pause to bound pollWaitCtx")
+	}
+	cc.resumeEnginePartition("events", 0)
+	if cc.anyTopicPaused() {
+		t.Fatal("expected engine pause cleared")
+	}
+}
+
+func TestInvalidateDeferredPausesCancelsTimers(t *testing.T) {
+	fp := &recordingFetchPauser{partResumed: map[string][]int32{}}
+	cc := &consumerClient{
+		deferredPaused: map[string]map[int32]int64{},
+		pauseOps:       fp,
+	}
+	cc.initDeferLifecycle()
+	rec := &kgo.Record{Topic: "retry.short", Partition: 0, Offset: 3}
+	deferClientPartitionPause(cc, rec, 50*time.Millisecond)
+	cc.invalidateDeferredPauses()
+	time.Sleep(80 * time.Millisecond)
+	if len(fp.partResumed["retry.short"]) != 0 {
+		t.Fatalf("timer resumed after invalidate: %v", fp.partResumed)
+	}
+	if len(cc.deferredPaused) != 0 {
+		t.Fatalf("deferredPaused=%v", cc.deferredPaused)
 	}
 }
 

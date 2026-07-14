@@ -164,7 +164,9 @@ func newPartitionConsumerClient(cfg partitionConsumerConfig, e *partitionEngine)
 		topicPaused:    map[string]bool{},
 		partPaused:     map[string][]int32{},
 		deferredPaused: map[string]map[int32]int64{},
+		enginePaused:   map[string]map[int32]struct{}{},
 	}
+	cc.initDeferLifecycle()
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.brokers...),
 		kgo.ConsumerGroup(cfg.group),
@@ -271,7 +273,10 @@ func (e *partitionEngine) committer() offsetCommitter {
 	if e.commitOps != nil {
 		return e.commitOps
 	}
-	return e.cl.Client
+	if e.cl != nil {
+		return e.cl.Client
+	}
+	return nil
 }
 
 func (e *partitionEngine) workerFor(topic string, partition int32) *partitionWorker {
@@ -401,6 +406,8 @@ func (e *partitionEngine) route(ctx context.Context, fetches kgo.Fetches) {
 		}
 		w := e.workerFor(ftp.Topic, ftp.Partition)
 		if w == nil {
+			log.Printf("[kbatch-daemon] group=%s route skipped topic=%s partition=%d records=%d (no worker)",
+				e.cfg.group, ftp.Topic, ftp.Partition, len(ftp.Records))
 			return
 		}
 		e.deliver(ctx, w, ftp)
@@ -418,18 +425,52 @@ func (e *partitionEngine) deliver(ctx context.Context, w *partitionWorker, ftp k
 		return
 	default:
 	}
-	parts := map[string][]int32{ftp.Topic: {ftp.Partition}}
-	e.pauser().PauseFetchPartitions(parts)
+	e.pauseDeliverPartition(ftp.Topic, ftp.Partition)
 	go func() {
 		select {
 		case w.recs <- ftp:
-			e.pauser().ResumeFetchPartitions(parts)
+			e.resumeDeliverPartition(ftp.Topic, ftp.Partition)
 		case <-w.quit:
 			// Partition revoked while we waited; leave it paused — a resume here
-			// would target a partition we no longer own.
+			// would target a partition we no longer own. Drop engine tracking so
+			// pollWaitCtx is not stuck if the client is reused after reassign.
+			e.clearDeliverPauseTracking(ftp.Topic, ftp.Partition)
 		case <-ctx.Done():
+			e.clearDeliverPauseTracking(ftp.Topic, ftp.Partition)
 		}
 	}()
+}
+
+func (e *partitionEngine) pauseDeliverPartition(topic string, partition int32) {
+	if e.cl != nil {
+		e.cl.pauseEnginePartition(topic, partition)
+		return
+	}
+	e.pauser().PauseFetchPartitions(map[string][]int32{topic: {partition}})
+}
+
+func (e *partitionEngine) resumeDeliverPartition(topic string, partition int32) {
+	if e.cl != nil {
+		e.cl.resumeEnginePartition(topic, partition)
+		return
+	}
+	e.pauser().ResumeFetchPartitions(map[string][]int32{topic: {partition}})
+}
+
+func (e *partitionEngine) clearDeliverPauseTracking(topic string, partition int32) {
+	if e.cl == nil {
+		return
+	}
+	e.cl.pauseMu.Lock()
+	if e.cl.enginePaused != nil {
+		if parts, ok := e.cl.enginePaused[topic]; ok {
+			delete(parts, partition)
+			if len(parts) == 0 {
+				delete(e.cl.enginePaused, topic)
+			}
+		}
+	}
+	e.cl.pauseMu.Unlock()
 }
 
 func (e *partitionEngine) drainAllWorkers() {
@@ -443,5 +484,13 @@ func (e *partitionEngine) drainAllWorkers() {
 	e.mu.Unlock()
 	for _, w := range stop {
 		<-w.done
+	}
+	// Best-effort flush of marks after workers finish (shutdown / client restart).
+	if c := e.committer(); c != nil {
+		commitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := c.CommitMarkedOffsets(commitCtx); err != nil && !isContextErr(err) {
+			log.Printf("[kbatch-daemon] group=%s commit-on-drain error: %v", e.cfg.group, err)
+		}
 	}
 }

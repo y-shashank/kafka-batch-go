@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
@@ -72,6 +73,10 @@ func runRetryConsumerLoop(ctx context.Context, spec consumerSpec) error {
 	})
 }
 
+// retryHandlerErrorBackoff pauses the partition after a non-pause handler failure so
+// transient produce/broker errors do not tight-loop PollRecords(1) on the same offset.
+const retryHandlerErrorBackoff = time.Second
+
 func processOneRetryRecord(ctx context.Context, commit recordCommitter, cl *consumerClient, handle func(*kgo.Record) error, rec *kgo.Record, group string) {
 	if err := safeHandle(handle, rec); err != nil {
 		var pe *retryPausedError
@@ -81,6 +86,8 @@ func processOneRetryRecord(ctx context.Context, commit recordCommitter, cl *cons
 		}
 		log.Printf("[kbatch-daemon] retry handler error group=%s topic=%s partition=%d offset=%d: %v",
 			group, rec.Topic, rec.Partition, rec.Offset, err)
+		// Unmarked + deferred pause: redeliver after backoff (same seek-on-resume path).
+		deferClientPartitionPause(cl, rec, retryHandlerErrorBackoff)
 		return
 	}
 	commit.MarkCommitRecords(rec)

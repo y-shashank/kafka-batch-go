@@ -149,7 +149,10 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 			_, err := eventProc.ProcessBatch(ctx, raw)
 			return err
 		},
-		health: consumerHealth,
+		health:     consumerHealth,
+		loopHealth: loopHealth,
+		loopName:   "events-" + eventsGroup,
+		live:       live,
 	})
 	reconciler.RunScheduler(ctx, cfg, st, prod, func() {
 		loopHealth.RecordTick("reconciler")

@@ -49,7 +49,17 @@ type consumerClient struct {
 	// not-yet-due (or deferred) record is redelivered — franz-go does not re-emit a
 	// Polled-but-unmarked record after ResumeFetchPartitions alone.
 	deferredPaused map[string]map[int32]int64
-	pauseOps       fetchPauser // tests only; nil uses embedded Client
+	// enginePaused tracks partition_engine deliver backpressure pauses so pollWaitCtx
+	// bounds PollRecords while a single-partition assignment is fetch-paused.
+	enginePaused map[string]map[int32]struct{}
+	pauseOps     fetchPauser // tests only; nil uses embedded Client
+
+	// deferGen / deferLife cancel outstanding deferred-pause timers on client close
+	// so SetOffsets/Resume cannot run against a restarted or closed client.
+	deferMu   sync.Mutex
+	deferGen  uint64
+	deferLife context.Context
+	deferStop context.CancelFunc
 }
 
 func (c *consumerClient) pauser() fetchPauser {
@@ -68,7 +78,9 @@ func newGroupConsumerClient(brokers []string, fetch config.ConsumerFetchSettings
 		topicPaused:    map[string]bool{},
 		partPaused:     map[string][]int32{},
 		deferredPaused: map[string]map[int32]int64{},
+		enginePaused:   map[string]map[int32]struct{}{},
 	}
+	cc.initDeferLifecycle()
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(brokers...),
 		kgo.ConsumerGroup(group),
