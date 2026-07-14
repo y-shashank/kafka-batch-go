@@ -12,32 +12,28 @@ import (
 	"github.com/y-shashank/kafka-batch-go/pkg/liveness"
 )
 
-// RunRetryConsumerMembers starts N supervised retry consumers in the same group.
-// Each poll handles at most one record (PollRecords(1)) so a not-yet-due
-// message can stay uncommitted without franz-go losing track of it across
-// batched PollFetches — matching Ruby RetryConsumer pause/break semantics.
-func RunRetryConsumerMembers(ctx context.Context, members int, brokers []string, group string, topics []string, fetch config.ConsumerFetchSettings, handle func(*kgo.Record) error, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter, loopHealth *LoopHealth) {
-	if members < 1 {
-		members = 1
+// RunRetryConsumer starts a single supervised retry consumer (one kgo.Client, one group
+// member) for this process. Each poll handles at most one record (PollRecords(1)) so a
+// not-yet-due message stays uncommitted without franz-go advancing the committed offset
+// past it — matching Ruby RetryConsumer pause/break semantics. Retry topics are low
+// volume; scale horizontally by adding pods, which Kafka assigns partitions across.
+func RunRetryConsumer(ctx context.Context, brokers []string, group string, topics []string, fetch config.ConsumerFetchSettings, handle func(*kgo.Record) error, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter, loopHealth *LoopHealth) {
+	log.Printf("[kbatch-daemon] starting retry consumer group=%s topics=%v", group, topics)
+	spec := consumerSpec{
+		brokers:     brokers,
+		group:       group,
+		topics:      topics,
+		fetch:       fetch,
+		handle:      handle,
+		health:      health,
+		pauseCtl:    pauseCtl,
+		live:        live,
+		loopHealth:  loopHealth,
+		loopName:    "retry-" + group,
+		memberLabel: memberLabel(1, 1),
+		healthKey:   healthMemberKey(group, 1, 1),
 	}
-	log.Printf("[kbatch-daemon] starting retry consumers group=%s members=%d topics=%v", group, members, topics)
-	for member := 1; member <= members; member++ {
-		spec := consumerSpec{
-			brokers:     brokers,
-			group:       group,
-			topics:      topics,
-			fetch:       fetch,
-			handle:      handle,
-			health:      health,
-			pauseCtl:    pauseCtl,
-			live:        live,
-			loopHealth:  loopHealth,
-			loopName:    "retry-" + group,
-			memberLabel: memberLabel(member, members),
-			healthKey:   healthMemberKey(group, member, members),
-		}
-		go runRetryConsumerSupervised(ctx, spec)
-	}
+	go runRetryConsumerSupervised(ctx, spec)
 }
 
 func runRetryConsumerSupervised(ctx context.Context, spec consumerSpec) {

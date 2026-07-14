@@ -178,20 +178,11 @@ func TestJobTopicsGoExcludesFairAndRuby(t *testing.T) {
 
 func TestDefaultDaemonConsumerConcurrency(t *testing.T) {
 	cfg := DefaultDaemon()
-	if cfg.EventsConsumerConcurrency != 8 {
-		t.Fatalf("events members=%d", cfg.EventsConsumerConcurrency)
-	}
-	if cfg.RetryConsumerConcurrency != 4 {
-		t.Fatalf("retry members=%d", cfg.RetryConsumerConcurrency)
-	}
 	if cfg.RetryMaxPause != 30*time.Second {
 		t.Fatalf("retry_max_pause=%s", cfg.RetryMaxPause)
 	}
 	if cfg.RequiredAcks() != "all_isr" {
 		t.Fatalf("acks=%q", cfg.RequiredAcks())
-	}
-	if cfg.EventsConsumerMembers() != 8 {
-		t.Fatalf("events members helper=%d", cfg.EventsConsumerMembers())
 	}
 	if cfg.JobsConsumerMembers() != 8 {
 		t.Fatalf("jobs members=%d", cfg.JobsConsumerMembers())

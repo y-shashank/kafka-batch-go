@@ -14,10 +14,6 @@ import (
 	"github.com/y-shashank/kafka-batch-go/pkg/liveness"
 )
 
-// defaultEventsPollRecords caps each events poll when using BlockRebalanceOnPoll so
-// rebalance is not blocked for an unbounded batch (franz-go recommends PollRecords).
-const defaultEventsPollRecords = 25
-
 // defaultDispatchPollRecords caps fair-dispatch polls at one record so backpressure
 // and AllowRebalance run per message (franz-go BlockRebalanceOnPoll guidance).
 const defaultDispatchPollRecords = 1

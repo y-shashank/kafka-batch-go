@@ -249,8 +249,6 @@ priority_config_paths:
   - config/priority/jobs-fast.yml
   - config/priority/jobs-slow.yml
 
-events_consumer_concurrency: 8
-retry_consumer_concurrency: 4
 producer_required_acks: all_isr
 
 liveness_enabled: true
@@ -638,8 +636,6 @@ Set **member count ≈ topic partition count** for partition-bound throughput. R
 
 | Env variable | YAML key | Default | Used by | What it does |
 |--------------|----------|---------|---------|--------------|
-| `KAFKA_BATCH_EVENTS_CONSUMER_CONCURRENCY` | `events_consumer_concurrency` | `8` | daemon | In-process members for `{group}-events`. Each poll is batched through `ProcessBatch` (one pipelined Redis round trip per poll). Set to **events topic partition count** (e.g. `32`) when event lag grows. |
-| `KAFKA_BATCH_RETRY_CONSUMER_CONCURRENCY` | `retry_consumer_concurrency` | `4` | daemon | In-process members for `{group}-retry` (non-transactional path). Set up to **retry topic partition count** if retry-tier lag is high. |
 | `KAFKA_BATCH_RETRY_MAX_PAUSE` | `retry_max_pause` | `30` (sec) | daemon | Max sleep before re-checking a not-yet-due retry message (Ruby: `retry_max_pause_seconds`). Lower = faster dispatch after `retry_after`. |
 | `KAFKA_BATCH_PRODUCER_REQUIRED_ACKS` | `producer_required_acks` | `all_isr` | daemon, worker | `all_isr` (safest, default) or `leader` (lower produce latency; small loss risk on unclean leader failover). Affects callbacks, events, retry reroutes, schedule dispatch. |
 
@@ -674,9 +670,8 @@ Fairness admission is capped by control-plane `fairness_global_concurrency` (YAM
 **32 partitions per topic** (typical production):
 
 ```yaml
-# Control — match partition count
-events_consumer_concurrency: 32
-retry_consumer_concurrency: 8
+# Control — one client per group per pod; the events consumer fans out one
+# goroutine per assigned partition. Scale by adding daemon pods and/or partitions.
 producer_required_acks: all_isr
 
 # Optional — raise for large messages or high-latency brokers
@@ -711,8 +706,8 @@ producer_required_acks: all_isr
 
 | Symptom | Likely fix |
 |---------|------------|
-| Events topic lag (control) | Raise `KAFKA_BATCH_EVENTS_CONSUMER_CONCURRENCY` toward partition count |
-| Retry topic lag (control) | Raise `KAFKA_BATCH_RETRY_CONSUMER_CONCURRENCY` |
+| Events topic lag (control) | Add events-topic partitions and/or daemon pods (one client fans out per-partition goroutines; more pods = more owned partitions) |
+| Retry topic lag (control) | Add retry-topic partitions and/or daemon pods |
 | Job topic lag, I/O-bound handlers | Raise `KAFKA_BATCH_JOBS_CONSUMER_CONCURRENCY` toward partition count |
 | Job topic lag, CPU-bound handlers | Raise `KAFKA_BATCH_JOB_PROCESS_CONCURRENCY` (and/or members) |
 | Fair ready lag, admission OK | Raise `KAFKA_BATCH_FAIR_READY_CONSUMER_CONCURRENCY` |

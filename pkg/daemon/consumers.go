@@ -104,31 +104,6 @@ func RunConcurrentConsumerGroupMembers(ctx context.Context, members, processWork
 // BatchHandler processes all records from one PollFetches call together.
 type BatchHandler func(ctx context.Context, recs []*kgo.Record) error
 
-// RunBatchedConsumerGroupMembers starts N supervised consumers that batch each
-// poll into a single handler call and commit all records together on success.
-// onPoll, when set, runs after every successful poll (even when the batch is empty).
-func RunBatchedConsumerGroupMembers(ctx context.Context, members int, brokers []string, group string, topics []string, fetch config.ConsumerFetchSettings, handle BatchHandler, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter, onPoll func(context.Context)) {
-	if members < 1 {
-		members = 1
-	}
-	for member := 1; member <= members; member++ {
-		go runBatchedConsumerSupervised(ctx, batchedConsumerSpec{
-			brokers:     brokers,
-			group:       group,
-			topics:      topics,
-			fetch:       fetch,
-			handle:      handle,
-			health:      health,
-			pauseCtl:    pauseCtl,
-			live:        live,
-			onPoll:      onPoll,
-			memberLabel: memberLabel(member, members),
-			healthKey:   healthMemberKey(group, member, members),
-		})
-	}
-}
-
-
 type consumerSpec struct {
 	brokers     []string
 	group       string
@@ -160,20 +135,6 @@ func collectPollRecords(ctx context.Context, cl *consumerClient, group string, f
 		recs = append(recs, rec)
 	})
 	return recs
-}
-
-type batchedConsumerSpec struct {
-	brokers     []string
-	group       string
-	topics      []string
-	fetch       config.ConsumerFetchSettings
-	handle      BatchHandler
-	health      *ConsumerHealth
-	pauseCtl    pauseChecker
-	live        *liveness.Reporter
-	onPoll      func(context.Context)
-	memberLabel string
-	healthKey   string
 }
 
 type concurrentConsumerSpec struct {
@@ -263,65 +224,6 @@ func processRecordsConcurrent(ctx context.Context, cl *kgo.Client, handle func(*
 		}(rec)
 	}
 	wg.Wait()
-}
-
-func runBatchedConsumerSupervised(ctx context.Context, spec batchedConsumerSpec) {
-	if spec.health != nil {
-		spec.health.Register(spec.healthKey)
-	}
-	log.Printf("[kbatch-daemon] batched consumer member=%s group=%s topics=%v",
-		spec.memberLabel, spec.group, spec.topics)
-	backoff := consumerRestartInitial
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		err := runBatchedConsumerLoop(ctx, spec)
-		if ctx.Err() != nil || err == nil {
-			return
-		}
-		log.Printf("[kbatch] batched consumer group=%s error=%v — restarting in %s", spec.group, err, backoff)
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff):
-		}
-		if backoff < consumerRestartMax {
-			backoff *= 2
-			if backoff > consumerRestartMax {
-				backoff = consumerRestartMax
-			}
-		}
-	}
-}
-
-func runBatchedConsumerLoop(ctx context.Context, spec batchedConsumerSpec) error {
-	cl, err := newGroupConsumerClient(spec.brokers, spec.fetch, spec.group, spec.memberLabel, spec.topics)
-	if err != nil {
-		return fmt.Errorf("kafka client group=%s: %w", spec.group, err)
-	}
-	defer closeGroupConsumer(cl)
-
-	return runGroupPollLoop(ctx, cl, pollLoopConfig{
-		label:       "batched consumer group=" + spec.group + " member=" + spec.memberLabel,
-		group:       spec.group,
-		memberLabel: spec.memberLabel,
-		healthKey:   spec.healthKey,
-		topics:      spec.topics,
-		maxRecords:  defaultEventsPollRecords,
-		health:      spec.health,
-		pauseCtl:    spec.pauseCtl,
-		live:        spec.live,
-		onPoll:      spec.onPoll,
-	}, func(ctx context.Context, recs []*kgo.Record) error {
-		if err := safeBatchHandle(ctx, spec.handle, recs); err != nil {
-			log.Printf("[kbatch-daemon] batched handler error group=%s records=%d: %v",
-				spec.group, len(recs), err)
-			return nil
-		}
-		cl.MarkCommitRecords(recs...)
-		return nil
-	})
 }
 
 func safeBatchHandle(ctx context.Context, handle BatchHandler, recs []*kgo.Record) (err error) {

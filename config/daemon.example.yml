@@ -73,19 +73,14 @@ retry_tiers:                         # tier => delay seconds (topics: retry.{tie
   large: 1200
 
 # retry_max_pause: 30                # sec — max sleep before re-checking not-yet-due retry (Ruby: retry_max_pause_seconds)
-# retry_transactional_enabled: false # exactly-once retry via Kafka transactions (opt-in)
 
 # ── Control-plane consumer throughput (daemon pod) ────────────────────────────
-# In-process members join the same consumer group; Kafka splits partitions across them.
-#
-# Prefer scaling daemon *pods* over very high in-process concurrency. Each member is a
-# separate franz-go client with BlockRebalanceOnPoll; many members in one process
-# increases rebalance coordination cost and can wedge the group if poll loops block.
-# Start with 1–2 members per group per pod; increase only when partition count requires
-# it and /health shows all members polling (keys like {group}#m2 when members > 1).
-
-events_consumer_concurrency: 3     # {group}-events — prefer ≤ partition count
-retry_consumer_concurrency: 1      # {group}-retry — prefer pods over 10 in-process
+# Each control-plane group runs exactly ONE franz-go client (one group member) per
+# daemon pod. The events consumer fans records out to one goroutine per assigned
+# partition, so a single client parallelizes across all partitions it owns while keeping
+# per-partition ordering. Scale throughput by adding daemon *pods* (Kafka splits the
+# partitions across them) and/or by adding partitions to the events/retry topics — not
+# by in-process members. There are no *_consumer_concurrency knobs anymore.
 # consumer_stall_timeout: 90       # sec — force reconnect when poll loop makes no progress
 # producer_required_acks: all_isr  # all_isr (default) | leader
 

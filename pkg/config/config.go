@@ -35,13 +35,6 @@ type Daemon struct {
 	HandlerManifest           string
 	SkipCancelledJobs         bool
 	NodeID                    string
-	RetryTransactionalEnabled bool
-	// EventsConsumerConcurrency is the number of in-process Kafka group members
-	// for the events consumer (same group, partition assignment split by broker).
-	EventsConsumerConcurrency int
-	// RetryConsumerConcurrency is the number of in-process group members for the
-	// non-transactional retry consumer.
-	RetryConsumerConcurrency int
 	// ProducerRequiredAcks is "all_isr" (default, safest) or "leader".
 	ProducerRequiredAcks string
 	// JobsConsumerConcurrency is in-process group members for plain go job topics.
@@ -162,8 +155,6 @@ func DefaultDaemon() Daemon {
 		ReconciliationInterval:            300 * time.Second,
 		ReconcilerLockTTL:                 600 * time.Second,
 		MaxReconcilePerRun:                100,
-		EventsConsumerConcurrency:         8,
-		RetryConsumerConcurrency:          4,
 		ProducerRequiredAcks:              "all_isr",
 		JobsConsumerConcurrency:           8,
 		FairReadyConsumerConcurrency:      8,
@@ -182,22 +173,6 @@ func (c Daemon) RequiredAcks() string {
 		return "all_isr"
 	}
 	return c.ProducerRequiredAcks
-}
-
-// EventsConsumerMembers returns a positive member count for the events group.
-func (c Daemon) EventsConsumerMembers() int {
-	if c.EventsConsumerConcurrency < 1 {
-		return 1
-	}
-	return c.EventsConsumerConcurrency
-}
-
-// RetryConsumerMembers returns a positive member count for the retry group.
-func (c Daemon) RetryConsumerMembers() int {
-	if c.RetryConsumerConcurrency < 1 {
-		return 1
-	}
-	return c.RetryConsumerConcurrency
 }
 
 // JobsConsumerMembers returns in-process group members for plain go job topics.
@@ -267,10 +242,7 @@ func LoadDaemon(path string) (Daemon, error) {
 		HandlerManifest                      string           `yaml:"handler_manifest"`
 		MaxRetries                           int              `yaml:"max_retries"`
 		CompleteAfter                        int              `yaml:"complete_after_retries"`
-		RetryTransactionalEnabled            bool             `yaml:"retry_transactional_enabled"`
 		RetryMaxPauseSec                     float64          `yaml:"retry_max_pause"`
-		EventsConsumerConcurrency            int              `yaml:"events_consumer_concurrency"`
-		RetryConsumerConcurrency             int              `yaml:"retry_consumer_concurrency"`
 		ProducerRequiredAcks                 string           `yaml:"producer_required_acks"`
 		JobsConsumerConcurrency              int              `yaml:"jobs_consumer_concurrency"`
 		FairReadyConsumerConcurrency         int              `yaml:"fair_ready_consumer_concurrency"`
@@ -369,17 +341,8 @@ func LoadDaemon(path string) (Daemon, error) {
 	if doc.CompleteAfter > 0 {
 		cfg.CompleteAfter = doc.CompleteAfter
 	}
-	if doc.RetryTransactionalEnabled {
-		cfg.RetryTransactionalEnabled = true
-	}
 	if doc.RetryMaxPauseSec > 0 {
 		cfg.RetryMaxPause = time.Duration(doc.RetryMaxPauseSec * float64(time.Second))
-	}
-	if doc.EventsConsumerConcurrency > 0 {
-		cfg.EventsConsumerConcurrency = doc.EventsConsumerConcurrency
-	}
-	if doc.RetryConsumerConcurrency > 0 {
-		cfg.RetryConsumerConcurrency = doc.RetryConsumerConcurrency
 	}
 	if doc.ProducerRequiredAcks != "" {
 		cfg.ProducerRequiredAcks = doc.ProducerRequiredAcks
@@ -594,16 +557,6 @@ func applyEnv(cfg *Daemon) {
 	}
 	if v := os.Getenv("KAFKA_BATCH_METRICS_STATSD_ADDR"); v != "" {
 		cfg.MetricsStatsDAddr = strings.TrimSpace(v)
-	}
-	if v := os.Getenv("KAFKA_BATCH_EVENTS_CONSUMER_CONCURRENCY"); v != "" {
-		if n, err := parsePositiveInt(v); err == nil {
-			cfg.EventsConsumerConcurrency = n
-		}
-	}
-	if v := os.Getenv("KAFKA_BATCH_RETRY_CONSUMER_CONCURRENCY"); v != "" {
-		if n, err := parsePositiveInt(v); err == nil {
-			cfg.RetryConsumerConcurrency = n
-		}
 	}
 	if v := os.Getenv("KAFKA_BATCH_RETRY_MAX_PAUSE"); v != "" {
 		if n, err := parsePositiveFloat(v); err == nil {
