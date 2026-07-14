@@ -162,6 +162,7 @@ type daemonYAML struct {
 	LivenessEnabled             bool           `yaml:"liveness_enabled,omitempty"`
 	LivenessHTTPAddr            string         `yaml:"liveness_http_addr,omitempty"`
 	ConsumptionRefreshInterval  float64        `yaml:"consumption_control_refresh_interval,omitempty"`
+	JobsConsumerConcurrency     int            `yaml:"jobs_consumer_concurrency,omitempty"`
 	Store                       string         `yaml:"store,omitempty"`
 	StoreMySQLDSN               string         `yaml:"store_mysql_dsn,omitempty"`
 }

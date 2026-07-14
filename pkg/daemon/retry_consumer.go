@@ -72,11 +72,11 @@ func runRetryConsumerLoop(ctx context.Context, spec consumerSpec) error {
 	})
 }
 
-func processOneRetryRecord(ctx context.Context, commit recordCommitter, pause fetchPauser, handle func(*kgo.Record) error, rec *kgo.Record, group string) {
+func processOneRetryRecord(ctx context.Context, commit recordCommitter, cl *consumerClient, handle func(*kgo.Record) error, rec *kgo.Record, group string) {
 	if err := safeHandle(handle, rec); err != nil {
 		var pe *retryPausedError
 		if errors.As(err, &pe) && pe.duration > 0 {
-			deferPartitionPause(pause, rec, pe.duration)
+			deferClientPartitionPause(cl, rec, pe.duration)
 			return
 		}
 		log.Printf("[kbatch-daemon] retry handler error group=%s topic=%s partition=%d offset=%d: %v",

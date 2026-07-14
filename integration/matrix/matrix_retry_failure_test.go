@@ -59,6 +59,8 @@ func runRetryFailureStoreScenario(t *testing.T, combo Combo, mysql bool, mysqlDS
 	}
 
 	s := e2e.NewStack(t, e2e.BaseHandlersStack, func(_ *e2e.Stack, cfg *e2e.DaemonYAML) {
+		// Keep "retrying" visible long enough for WaitFailureStatus (zero-delay can race).
+		cfg.RetryTiers = map[string]int{"short": 2, "medium": 2, "large": 2}
 		if mysql {
 			cfg.Store = "mysql"
 			cfg.StoreMySQLDSN = mysqlDSN

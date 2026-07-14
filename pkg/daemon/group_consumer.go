@@ -43,8 +43,13 @@ type consumerClient struct {
 	topics      []string
 	pauseMu     sync.Mutex
 	topicPaused map[string]bool
-	partPaused  map[string][]int32
-	pauseOps    fetchPauser // tests only; nil uses embedded Client
+	partPaused  map[string][]int32 // consumption killswitch partition pauses (synced via pauseCtl)
+	// deferredPaused tracks retry/yield/backpressure pauses that must not be cleared by
+	// syncConsumptionFetchPause. Value is the offset to SetOffsets on resume so the
+	// not-yet-due (or deferred) record is redelivered — franz-go does not re-emit a
+	// Polled-but-unmarked record after ResumeFetchPartitions alone.
+	deferredPaused map[string]map[int32]int64
+	pauseOps       fetchPauser // tests only; nil uses embedded Client
 }
 
 func (c *consumerClient) pauser() fetchPauser {
@@ -59,9 +64,10 @@ func (c *consumerClient) pauser() fetchPauser {
 
 func newGroupConsumerClient(brokers []string, fetch config.ConsumerFetchSettings, group, memberLabel string, topics []string) (*consumerClient, error) {
 	cc := &consumerClient{
-		topics:      append([]string(nil), topics...),
-		topicPaused: map[string]bool{},
-		partPaused:  map[string][]int32{},
+		topics:         append([]string(nil), topics...),
+		topicPaused:    map[string]bool{},
+		partPaused:     map[string][]int32{},
+		deferredPaused: map[string]map[int32]int64{},
 	}
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(brokers...),
@@ -115,12 +121,14 @@ func runGroupPollLoop(
 		cl.syncConsumptionFetchPause(loopCtx, cfg.pauseCtl, cfg.group)
 
 		touch()
+		pollCtx, endPollWait := cl.pollWaitCtx(loopCtx)
 		var fetches kgo.Fetches
 		if cfg.maxRecords > 0 {
-			fetches = cl.PollRecords(loopCtx, cfg.maxRecords)
+			fetches = cl.PollRecords(pollCtx, cfg.maxRecords)
 		} else {
-			fetches = cl.PollFetches(loopCtx)
+			fetches = cl.PollFetches(pollCtx)
 		}
+		endPollWait()
 		if err := checkFetchErrs(loopCtx, cl, fetches, cfg.group); err != nil {
 			return err
 		}

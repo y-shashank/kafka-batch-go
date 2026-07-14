@@ -294,7 +294,7 @@ func runConsumerLoop(ctx context.Context, spec consumerSpec) error {
 			if err := safeHandle(spec.handle, rec); err != nil {
 				var bp *fairBackpressureError
 				if errors.As(err, &bp) {
-					deferPartitionPause(cl, rec, bp.duration)
+					deferClientPartitionPause(cl, rec, bp.duration)
 					continue
 				}
 				log.Printf("[kbatch-daemon] handler error group=%s topic=%s offset=%d: %v",
@@ -459,7 +459,7 @@ func filterPriorityRecords(
 				"kbatch.priority", p0, spec.ConsumerGroup,
 				yieldSleep.Milliseconds(), string(spec.Mode), spec.Rank, spec.HigherTopics,
 			)
-			deferPartitionPause(cl, rec, yieldSleep)
+			deferClientPartitionPause(cl, rec, yieldSleep)
 			continue
 		}
 		weightedTicks[rec.Topic] = tick

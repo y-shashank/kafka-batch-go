@@ -87,9 +87,10 @@ type partitionEngine struct {
 	workers map[partitionKey]*partitionWorker
 	wg      sync.WaitGroup
 
-	// procCtx is the context handed to worker processing; it is cancelled when a
-	// rebalance is blocked (OnPartitionsCallbackBlocked) so in-flight work aborts
-	// promptly and does not wedge the group.
+	// procCtx is the context handed to worker processing. It lives across poll
+	// iterations (workers process asynchronously after route returns) and is only
+	// cancelled when a rebalance is blocked (OnPartitionsCallbackBlocked) or when
+	// poll exits — never at the end of each route call.
 	procMu  sync.Mutex
 	procCtx context.Context
 }
@@ -159,9 +160,10 @@ func runPartitionConsumerOnce(ctx context.Context, cfg partitionConsumerConfig) 
 // commits marks explicitly in revoked()/lost() before releasing partitions.
 func newPartitionConsumerClient(cfg partitionConsumerConfig, e *partitionEngine) (*consumerClient, error) {
 	cc := &consumerClient{
-		topics:      append([]string(nil), cfg.topics...),
-		topicPaused: map[string]bool{},
-		partPaused:  map[string][]int32{},
+		topics:         append([]string(nil), cfg.topics...),
+		topicPaused:    map[string]bool{},
+		partPaused:     map[string][]int32{},
+		deferredPaused: map[string]map[int32]int64{},
 	}
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.brokers...),
@@ -324,6 +326,31 @@ func (e *partitionEngine) poll(ctx context.Context) error {
 	defer stopGuard()
 	defer e.drainAllWorkers()
 
+	// Processing context must outlive each route() call: workers handle batches
+	// asynchronously. Cancelling after route (as the serial group poll loop does)
+	// raced workers and made event.ProcessBatch fail with context.Canceled.
+	var endProc func()
+	defer func() {
+		if endProc != nil {
+			endProc()
+		}
+	}()
+	refreshProcCtx := func() {
+		e.procMu.Lock()
+		alive := e.procCtx != nil && e.procCtx.Err() == nil
+		e.procMu.Unlock()
+		if alive {
+			return
+		}
+		if endProc != nil {
+			endProc()
+		}
+		var procCtx context.Context
+		procCtx, endProc = e.cl.abort.begin(loopCtx)
+		e.setProcCtx(procCtx)
+	}
+	refreshProcCtx()
+
 	maxRecords := effectivePartitionPoll(e.cfg.maxRecords)
 	healthKey := e.cfg.group
 
@@ -339,7 +366,9 @@ func (e *partitionEngine) poll(ctx context.Context) error {
 		e.cl.syncConsumptionFetchPause(loopCtx, e.cfg.pauseCtl, e.cfg.group)
 
 		touch()
-		fetches := e.cl.PollRecords(loopCtx, maxRecords)
+		pollCtx, endPollWait := e.cl.pollWaitCtx(loopCtx)
+		fetches := e.cl.PollRecords(pollCtx, maxRecords)
+		endPollWait()
 		if err := checkFetchErrs(loopCtx, e.cl, fetches, e.cfg.group); err != nil {
 			return err
 		}
@@ -352,10 +381,8 @@ func (e *partitionEngine) poll(ctx context.Context) error {
 		}
 		touch()
 
-		procCtx, endProc := e.cl.abort.begin(loopCtx)
-		e.setProcCtx(procCtx)
+		refreshProcCtx()
 		e.route(loopCtx, fetches)
-		endProc()
 
 		e.cl.AllowRebalance()
 	}

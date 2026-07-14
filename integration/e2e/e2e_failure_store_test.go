@@ -11,7 +11,11 @@ import (
 )
 
 func TestE2E_RetryFailureStoreLifecycle_Redis(t *testing.T) {
-	s := NewStack(t, baseHandlersStack, nil)
+	// A non-zero short delay keeps status="retrying" observable; with zero-delay
+	// tiers the fail→retry→success→clear window can fall between WaitFailureStatus polls.
+	s := NewStack(t, baseHandlersStack, func(_ *Stack, cfg *daemonYAML) {
+		cfg.RetryTiers = map[string]int{"short": 2, "medium": 2, "large": 2}
+	})
 	s.Start()
 	defer s.Stop()
 
@@ -51,6 +55,7 @@ func TestE2E_RetryFailureStoreLifecycle_MySQL(t *testing.T) {
 	s := NewStack(t, baseHandlersStack, func(_ *Stack, cfg *daemonYAML) {
 		cfg.Store = "mysql"
 		cfg.StoreMySQLDSN = mysqlDSN
+		cfg.RetryTiers = map[string]int{"short": 2, "medium": 2, "large": 2}
 	})
 	s.Start()
 	defer s.Stop()

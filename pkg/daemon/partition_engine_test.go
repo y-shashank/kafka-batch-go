@@ -127,6 +127,46 @@ func TestPartitionWorkerMarksOnSuccess(t *testing.T) {
 	}
 }
 
+// Regression: the poll loop must not cancel procCtx as soon as route returns.
+// Workers process asynchronously; a cancelled context made event handling fail
+// and left batches stuck (e2e BatchCompletion / EventsTopicJobSuccess).
+func TestPartitionWorkerSeesAliveProcCtx(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	e, m, _, _ := newTestEngine(func(ctx context.Context, _ []*kgo.Record) error {
+		close(started)
+		<-release
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return nil
+	})
+	e.assigned(context.Background(), nil, map[string][]int32{"t": {0}})
+	defer e.drainAllWorkers()
+
+	// Simulate a long-lived processing context (what poll now keeps across route).
+	procCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e.setProcCtx(procCtx)
+
+	w := e.workerFor("t", 0)
+	w.recs <- ftp("t", 0, 1)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never started")
+	}
+	// Cancelling only after the worker has the live ctx (rebalance abort) should
+	// still be possible; here we leave it alive through completion.
+	close(release)
+
+	select {
+	case <-m.markedCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("records never marked with surviving procCtx")
+	}
+}
+
 // A handler error must leave the batch unmarked so it redelivers (at-least-once).
 func TestPartitionWorkerNoMarkOnError(t *testing.T) {
 	e, m, _, _ := newTestEngine(func(context.Context, []*kgo.Record) error { return errors.New("boom") })

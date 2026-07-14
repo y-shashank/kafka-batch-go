@@ -15,8 +15,9 @@ func (c Daemon) ValidateRetryConsumers() error {
 		return fmt.Errorf("retry_tiers must define at least one tier (e.g. short/medium/large)")
 	}
 	for tier, delay := range c.RetryTiers {
-		if delay <= 0 {
-			return fmt.Errorf("retry_tiers.%s must be a positive delay in seconds", tier)
+		// 0 is valid: immediate retry (used by e2e / itest stacks).
+		if delay < 0 {
+			return fmt.Errorf("retry_tiers.%s must be a non-negative delay in seconds", tier)
 		}
 	}
 	return nil

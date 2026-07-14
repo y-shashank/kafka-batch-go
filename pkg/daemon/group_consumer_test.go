@@ -60,6 +60,7 @@ type recordingFetchPauser struct {
 	topicPaused  []string
 	topicResumed []string
 	partPaused   map[string][]int32
+	partResumed  map[string][]int32
 }
 
 func (r *recordingFetchPauser) PauseFetchTopics(topics ...string) []string {
@@ -81,7 +82,14 @@ func (r *recordingFetchPauser) PauseFetchPartitions(parts map[string][]int32) ma
 	return parts
 }
 
-func (r *recordingFetchPauser) ResumeFetchPartitions(map[string][]int32) {}
+func (r *recordingFetchPauser) ResumeFetchPartitions(parts map[string][]int32) {
+	if r.partResumed == nil {
+		r.partResumed = map[string][]int32{}
+	}
+	for t, ps := range parts {
+		r.partResumed[t] = append(r.partResumed[t], ps...)
+	}
+}
 
 func TestSyncConsumptionFetchPauseTopic(t *testing.T) {
 	pause := &mockPauseChecker{paused: map[string]bool{"g\x1fjobs": true}}
@@ -97,11 +105,33 @@ func TestSyncConsumptionFetchPauseTopic(t *testing.T) {
 	if len(fp.topicPaused) != 1 || fp.topicPaused[0] != "jobs" {
 		t.Fatalf("topicPaused=%v", fp.topicPaused)
 	}
+	if !cc.anyTopicPaused() {
+		t.Fatal("expected anyTopicPaused after pause")
+	}
 
 	pause.paused["g\x1fjobs"] = false
 	cc.syncConsumptionFetchPause(context.Background(), pause, "g")
 	if len(fp.topicResumed) != 1 || fp.topicResumed[0] != "jobs" {
 		t.Fatalf("topicResumed=%v", fp.topicResumed)
+	}
+	if cc.anyTopicPaused() {
+		t.Fatal("expected no paused topics after resume")
+	}
+}
+
+func TestPollWaitCtxBoundsWhenPaused(t *testing.T) {
+	cc := &consumerClient{topicPaused: map[string]bool{"jobs": true}}
+	parent := context.Background()
+	ctx, cancel := cc.pollWaitCtx(parent)
+	defer cancel()
+	if ctx == parent {
+		t.Fatal("expected bounded poll ctx while paused")
+	}
+	cc.topicPaused["jobs"] = false
+	ctx2, cancel2 := cc.pollWaitCtx(parent)
+	defer cancel2()
+	if ctx2 != parent {
+		t.Fatal("expected parent poll ctx when nothing paused")
 	}
 }
 
@@ -115,6 +145,36 @@ func TestPauseConsumptionPartitionTracks(t *testing.T) {
 	cc.pauseConsumptionPartition("jobs", 2)
 	if len(fp.partPaused["jobs"]) != 1 || fp.partPaused["jobs"][0] != 2 {
 		t.Fatalf("partPaused=%v", fp.partPaused)
+	}
+}
+
+func TestDeferredPauseNotClearedByConsumptionSync(t *testing.T) {
+	pause := &mockPauseChecker{paused: map[string]bool{}}
+	fp := &recordingFetchPauser{partResumed: map[string][]int32{}}
+	cc := &consumerClient{
+		topics:         []string{"retry.short"},
+		topicPaused:    map[string]bool{},
+		partPaused:     map[string][]int32{},
+		deferredPaused: map[string]map[int32]int64{},
+		pauseOps:       fp,
+	}
+	cc.pauseDeferredPartition("retry.short", 0, 7)
+	if !cc.anyTopicPaused() {
+		t.Fatal("expected deferred pause to count as paused")
+	}
+	cc.syncConsumptionFetchPause(context.Background(), pause, "g")
+	if _, ok := cc.deferredPaused["retry.short"][0]; !ok {
+		t.Fatal("syncConsumptionFetchPause cleared deferred pause")
+	}
+	if len(fp.partResumed["retry.short"]) != 0 {
+		t.Fatalf("unexpected resume of deferred partition: %v", fp.partResumed)
+	}
+	cc.clearDeferredPartitionPause("retry.short", 0)
+	if cc.anyTopicPaused() {
+		t.Fatal("expected deferred pause cleared")
+	}
+	if len(fp.partResumed["retry.short"]) != 1 || fp.partResumed["retry.short"][0] != 0 {
+		t.Fatalf("partResumed=%v", fp.partResumed)
 	}
 }
 

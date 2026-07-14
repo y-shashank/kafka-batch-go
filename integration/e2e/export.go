@@ -91,6 +91,7 @@ func (s *Stack) SetTopicPaused(group, topic string, paused bool) {
 // pause/resume take effect within ~1s instead of the 30s default.
 func ApplyFastConsumptionRefresh(s *Stack, cfg *daemonYAML) {
 	cfg.ConsumptionRefreshInterval = 1
+	cfg.JobsConsumerConcurrency = 1
 }
 
 // MySQLFailuresDSN returns the integration MySQL DSN when configured.
