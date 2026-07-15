@@ -1,56 +1,148 @@
 package store
 
 // Lua scripts mirror lib/kafka_batch/stores/redis_store.rb (wire-compatible).
+//
+// Sidekiq-style batch completion:
+//   - Touch bitmap (KEYS[2]) + touched_count: set on first execution (success|executed|failed)
+//   - Success bitmap (KEYS[6]) + completed_count: set on success (may follow an earlier touch)
+//   - Fail bitmap (KEYS[7]) + failed_count: terminal failures only
+//   - on_complete when touched_count >= total (may fire while retries still run)
+//   - on_success when completed_count >= total
+//   - Terminal status when completed+failed >= total
 
 const batchDoneJobLua = `
 local seq = tonumber(ARGV[1])
+local op = ARGV[2]
 if not seq or seq < 1 then return {0, 'invalid'} end
-
+if op ~= 'success' and op ~= 'failed' and op ~= 'executed' then return {0, 'invalid'} end
 if redis.call('EXISTS', KEYS[1]) == 0 then return {0, 'not_found'} end
 
-local bit = seq - 1
-if redis.call('GETBIT', KEYS[2], bit) == 1 then return {0, 'duplicate'} end
-redis.call('SETBIT', KEYS[2], bit, 1)
-redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
-
 local status = redis.call('HGET', KEYS[1], 'status')
-if status == 'success' or status == 'complete' or status == 'cancelled' then
+if status == 'cancelled' then return {0, 'duplicate'} end
+
+local bit = seq - 1
+local ttl = tonumber(ARGV[3])
+local now = ARGV[4]
+local score = tonumber(ARGV[5])
+local touched_new = 0
+local success_new = 0
+local failed_new = 0
+
+if redis.call('GETBIT', KEYS[2], bit) == 0 then
+  redis.call('SETBIT', KEYS[2], bit, 1)
+  redis.call('EXPIRE', KEYS[2], ttl)
+  redis.call('HINCRBY', KEYS[1], 'touched_count', 1)
+  touched_new = 1
+elseif op == 'executed' then
   return {0, 'duplicate'}
 end
 
-redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
-redis.call('HINCRBY', KEYS[1], ARGV[2], 1)
+if op == 'success' then
+  if redis.call('GETBIT', KEYS[6], bit) == 0 then
+    redis.call('SETBIT', KEYS[6], bit, 1)
+    redis.call('EXPIRE', KEYS[6], ttl)
+    redis.call('HINCRBY', KEYS[1], 'completed_count', 1)
+    success_new = 1
+  elseif touched_new == 0 then
+    return {0, 'duplicate'}
+  end
+elseif op == 'failed' then
+  if redis.call('GETBIT', KEYS[7], bit) == 0 and redis.call('GETBIT', KEYS[6], bit) == 0 then
+    redis.call('SETBIT', KEYS[7], bit, 1)
+    redis.call('EXPIRE', KEYS[7], ttl)
+    redis.call('HINCRBY', KEYS[1], 'failed_count', 1)
+    failed_new = 1
+  elseif touched_new == 0 then
+    return {0, 'duplicate'}
+  end
+end
+
+if status == 'success' or status == 'complete' then
+  if touched_new == 0 and success_new == 0 and failed_new == 0 then
+    return {0, 'duplicate'}
+  end
+end
+
+redis.call('EXPIRE', KEYS[1], ttl)
 
 local total     = tonumber(redis.call('HGET', KEYS[1], 'total_jobs'))      or 0
+local touched   = tonumber(redis.call('HGET', KEYS[1], 'touched_count'))   or 0
 local completed = tonumber(redis.call('HGET', KEYS[1], 'completed_count')) or 0
 local failed    = tonumber(redis.call('HGET', KEYS[1], 'failed_count'))    or 0
 local sealed    = redis.call('HGET', KEYS[1], 'locked_at')
-
-if (completed + failed) >= total and sealed and sealed ~= '' then
-  local outcome = (failed > 0) and 'complete' or 'success'
-  redis.call('HSET', KEYS[1], 'status',      outcome)
-  redis.call('HSET', KEYS[1], 'finished_at', ARGV[4])
-  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
-  local batch_id = redis.call('HGET', KEYS[1], 'id')
-  if batch_id then
-    redis.call('ZREM', KEYS[3], batch_id)
-    redis.call('ZADD', KEYS[4], tonumber(ARGV[5]), batch_id)
-  end
-  redis.call('HINCRBY', KEYS[5], 'running', -1)
-  redis.call('HINCRBY', KEYS[5], outcome, 1)
-  return {1, outcome}
+if not sealed or sealed == '' or total < 1 then
+  return {2, 'continue'}
 end
 
+local fire_complete = 0
+local fire_success = 0
+local terminal = nil
+
+if completed >= total then
+  terminal = 'success'
+elseif (completed + failed) >= total then
+  terminal = 'complete'
+end
+
+if terminal then
+  local cur = redis.call('HGET', KEYS[1], 'status')
+  if cur == 'running' then
+    redis.call('HSET', KEYS[1], 'status', terminal)
+    redis.call('HSET', KEYS[1], 'finished_at', now)
+    redis.call('EXPIRE', KEYS[1], ttl)
+    local batch_id = redis.call('HGET', KEYS[1], 'id')
+    if batch_id then
+      redis.call('ZREM', KEYS[3], batch_id)
+      redis.call('ZADD', KEYS[4], score, batch_id)
+    end
+    redis.call('HINCRBY', KEYS[5], 'running', -1)
+    redis.call('HINCRBY', KEYS[5], terminal, 1)
+  end
+  if redis.call('HSETNX', KEYS[1], 'complete_callback_dispatched_at', now) == 1 then
+    redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', now)
+    fire_complete = 1
+  end
+  if terminal == 'success' and redis.call('HSETNX', KEYS[1], 'success_callback_dispatched_at', now) == 1 then
+    fire_success = 1
+  end
+elseif touched >= total then
+  if redis.call('HSETNX', KEYS[1], 'complete_callback_dispatched_at', now) == 1 then
+    redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', now)
+    fire_complete = 1
+  end
+end
+
+if fire_success == 1 and fire_complete == 1 then
+  return {1, 'success'}
+end
+if fire_success == 1 then
+  return {1, 'success_only'}
+end
+if fire_complete == 1 and terminal then
+  return {1, 'complete'}
+end
+if fire_complete == 1 then
+  return {3, 'complete'}
+end
 return {2, 'continue'}
 `
 
 const claimCallbackLua = `
 if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
-local won = redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', ARGV[1])
+local kind = ARGV[4]
+if not kind or kind == '' then kind = 'any' end
+local field = 'callback_dispatched_at'
+if kind == 'complete' then
+  field = 'complete_callback_dispatched_at'
+elseif kind == 'success' then
+  field = 'success_callback_dispatched_at'
+end
+local won = redis.call('HSETNX', KEYS[1], field, ARGV[1])
 if won == 1 then
   if ARGV[2] ~= '' then
     redis.call('HSET', KEYS[1], 'callback_dispatched_by', ARGV[2])
   end
+  redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', ARGV[1])
   redis.call('ZREM', KEYS[2], ARGV[3])
 end
 return won
@@ -63,6 +155,7 @@ redis.call('HMSET', KEYS[1],
   'total_jobs',      ARGV[2],
   'completed_count', '0',
   'failed_count',    '0',
+  'touched_count',   '0',
   'status',          'running',
   'on_success',      ARGV[3],
   'on_complete',     ARGV[4],
@@ -109,24 +202,54 @@ local total = tonumber(redis.call('HGET', KEYS[1], 'total_jobs')) or 0
 if total > 0 then
   redis.call('SETBIT', KEYS[5], total, 0)
   redis.call('EXPIRE', KEYS[5], tonumber(ARGV[2]))
+  redis.call('SETBIT', KEYS[6], total, 0)
+  redis.call('EXPIRE', KEYS[6], tonumber(ARGV[2]))
+  redis.call('SETBIT', KEYS[7], total, 0)
+  redis.call('EXPIRE', KEYS[7], tonumber(ARGV[2]))
 end
 
 if status == 'running' then
   local total     = tonumber(redis.call('HGET', KEYS[1], 'total_jobs'))      or 0
+  local touched   = tonumber(redis.call('HGET', KEYS[1], 'touched_count'))   or 0
   local completed = tonumber(redis.call('HGET', KEYS[1], 'completed_count')) or 0
   local failed    = tonumber(redis.call('HGET', KEYS[1], 'failed_count'))    or 0
-  if (completed + failed) >= total then
-    local outcome = (failed > 0) and 'complete' or 'success'
-    redis.call('HSET', KEYS[1], 'status', outcome)
+  local fire_complete = 0
+  local fire_success = 0
+  local terminal = nil
+  -- Empty sealed batches are immediately successful (Sidekiq-style).
+  if total == 0 then
+    terminal = 'success'
+  elseif completed >= total then
+    terminal = 'success'
+  elseif (completed + failed) >= total then
+    terminal = 'complete'
+  end
+  if terminal then
+    redis.call('HSET', KEYS[1], 'status', terminal)
     redis.call('HSET', KEYS[1], 'finished_at', ARGV[1])
     redis.call('HINCRBY', KEYS[2], 'running', -1)
-    redis.call('HINCRBY', KEYS[2], outcome, 1)
+    redis.call('HINCRBY', KEYS[2], terminal, 1)
     local batch_id = redis.call('HGET', KEYS[1], 'id')
     if batch_id then
       redis.call('ZREM', KEYS[3], batch_id)
       redis.call('ZADD', KEYS[4], tonumber(ARGV[3]), batch_id)
     end
-    return {1, outcome}
+    if redis.call('HSETNX', KEYS[1], 'complete_callback_dispatched_at', ARGV[1]) == 1 then
+      redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', ARGV[1])
+      fire_complete = 1
+    end
+    if terminal == 'success' and redis.call('HSETNX', KEYS[1], 'success_callback_dispatched_at', ARGV[1]) == 1 then
+      fire_success = 1
+    end
+    if fire_success == 1 then return {1, 'success'} end
+    if fire_complete == 1 then return {1, terminal} end
+    return {1, terminal}
+  end
+  if touched >= total and total > 0 then
+    if redis.call('HSETNX', KEYS[1], 'complete_callback_dispatched_at', ARGV[1]) == 1 then
+      redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', ARGV[1])
+      return {3, 'complete'}
+    end
   end
 end
 return {2, 'sealed'}
@@ -164,6 +287,8 @@ redis.call('HINCRBY', KEYS[2], ARGV[1], 1)
 return 1
 `
 
-func batchKey(id string) string   { return keyPrefix + ":" + id }
-func bitmapKey(id string) string  { return keyPrefix + ":bitmap:" + id }
-func seqKey(id string) string     { return keyPrefix + ":seq:" + id }
+func batchKey(id string) string     { return keyPrefix + ":" + id }
+func bitmapKey(id string) string    { return keyPrefix + ":bitmap:" + id }
+func okBitmapKey(id string) string  { return keyPrefix + ":okbit:" + id }
+func failBitmapKey(id string) string { return keyPrefix + ":failbit:" + id }
+func seqKey(id string) string       { return keyPrefix + ":seq:" + id }

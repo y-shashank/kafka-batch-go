@@ -13,7 +13,7 @@ import (
 type CompletionEvent struct {
 	BatchID  string
 	JobID    string
-	Status   string // success | failed
+	Status   string // success | failed | executed
 	BatchSeq int64
 }
 
@@ -23,6 +23,7 @@ type Batch struct {
 	TotalJobs       int64
 	CompletedCount  int64
 	FailedCount     int64
+	TouchedCount    int64
 	Status          string
 	OnSuccess       string
 	OnComplete      string
@@ -36,10 +37,13 @@ type Batch struct {
 	CallbackClaimed     bool
 }
 
-// FinishedBatch is returned when a batch just completed.
+// FinishedBatch is returned when callbacks should fire.
+// Outcome: success | success_only | complete.
+// Early is true when on_complete fires while the batch is still running (retries outstanding).
 type FinishedBatch struct {
 	Batch   *Batch
 	Outcome string
+	Early   bool
 }
 
 // CompletionsResult aggregates record_completions_batch output.
@@ -67,7 +71,10 @@ func (s *RedisStore) RawClient() *redis.Client {
 }
 
 func (s *RedisStore) completionKeys(batchID string) []string {
-	return []string{batchKey(batchID), bitmapKey(batchID), runningIndex, doneIndex, countsKey}
+	return []string{
+		batchKey(batchID), bitmapKey(batchID), runningIndex, doneIndex, countsKey,
+		okBitmapKey(batchID), failBitmapKey(batchID),
+	}
 }
 
 func (s *RedisStore) RecordCompletionsBatch(ctx context.Context, events []CompletionEvent) (CompletionsResult, error) {
@@ -82,18 +89,23 @@ func (s *RedisStore) RecordCompletionsBatch(ctx context.Context, events []Comple
 	pipe := s.client.Pipeline()
 	cmds := make([]*redis.Cmd, len(events))
 	for i, e := range events {
-		field := "failed_count"
-		if e.Status == "success" {
-			field = "completed_count"
+		op := e.Status
+		if op != "success" && op != "failed" && op != "executed" {
+			op = "failed"
 		}
 		cmds[i] = pipe.Eval(ctx, batchDoneJobLua, s.completionKeys(e.BatchID),
-			e.BatchSeq, field, ttlSec, now, nowFloat)
+			e.BatchSeq, op, ttlSec, now, nowFloat)
 	}
 	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
 		return out, err
 	}
 
-	finalized := []int{}
+	type fire struct {
+		idx   int
+		code  int64
+		outcome string
+	}
+	var fires []fire
 	for i, cmd := range cmds {
 		res, err := cmd.Slice()
 		if err != nil {
@@ -102,8 +114,8 @@ func (s *RedisStore) RecordCompletionsBatch(ctx context.Context, events []Comple
 		code, _ := res[0].(int64)
 		payload, _ := res[1].(string)
 		switch code {
-		case 1:
-			finalized = append(finalized, i)
+		case 1, 3:
+			fires = append(fires, fire{idx: i, code: code, outcome: payload})
 		case 0:
 			if payload == "duplicate" {
 				out.Replays = append(out.Replays, events[i].BatchID)
@@ -111,14 +123,14 @@ func (s *RedisStore) RecordCompletionsBatch(ctx context.Context, events []Comple
 		}
 	}
 
-	for _, idx := range finalized {
-		res, _ := cmds[idx].Slice()
-		outcome, _ := res[1].(string)
-		batch, err := s.FindBatch(ctx, events[idx].BatchID)
+	for _, f := range fires {
+		batch, err := s.FindBatch(ctx, events[f.idx].BatchID)
 		if err != nil {
 			return out, err
 		}
-		out.Finished = append(out.Finished, FinishedBatch{Batch: batch, Outcome: outcome})
+		out.Finished = append(out.Finished, FinishedBatch{
+			Batch: batch, Outcome: f.outcome, Early: f.code == 3,
+		})
 	}
 	return out, nil
 }
@@ -150,11 +162,17 @@ func (s *RedisStore) CompletionRecorded(ctx context.Context, batchID string, seq
 	return bit == 1, nil
 }
 
-func (s *RedisStore) ClaimCallback(ctx context.Context, batchID, nodeID string) (bool, error) {
+// ClaimCallback claims callback dispatch rights.
+// kind is "complete", "success", or "" / "any" (legacy single claim).
+func (s *RedisStore) ClaimCallback(ctx context.Context, batchID, nodeID string, kind ...string) (bool, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
+	k := "any"
+	if len(kind) > 0 && kind[0] != "" {
+		k = kind[0]
+	}
 	res, err := s.client.Eval(ctx, claimCallbackLua,
 		[]string{batchKey(batchID), doneIndex},
-		now, nodeID, batchID,
+		now, nodeID, batchID, k,
 	).Int()
 	return res == 1, err
 }
@@ -187,7 +205,7 @@ func (s *RedisStore) FindReplayCallbackBatches(ctx context.Context, ids []string
 		if err != nil {
 			return nil, err
 		}
-		if len(h) == 0 || h["callback_dispatched_at"] != "" {
+		if len(h) == 0 {
 			continue
 		}
 		b := hashToBatch(h)
@@ -195,6 +213,12 @@ func (s *RedisStore) FindReplayCallbackBatches(ctx context.Context, ids []string
 			continue
 		}
 		if b.Status != "success" && b.Status != "complete" {
+			continue
+		}
+		// Replay if a required callback claim is still missing.
+		needComplete := h["complete_callback_dispatched_at"] == "" && h["callback_dispatched_at"] == ""
+		needSuccess := b.Status == "success" && h["success_callback_dispatched_at"] == ""
+		if !needComplete && !needSuccess {
 			continue
 		}
 		out = append(out, b)

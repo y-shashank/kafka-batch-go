@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"sync"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -53,90 +52,46 @@ func RunConsumer(ctx context.Context, brokers []string, group string, topics []s
 	})
 }
 
-// RunConsumerGroupMembers starts N supervised consumers in the same process that
-// join the same consumer group. Kafka assigns partitions across them as if they
-// were separate pods.
-func RunConsumerGroupMembers(ctx context.Context, members int, brokers []string, group string, topics []string, fetch config.ConsumerFetchSettings, handle func(*kgo.Record) error, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter) {
-	RunConcurrentConsumerGroupMembers(ctx, members, 1, brokers, group, topics, fetch, handle, health, pauseCtl, live)
-}
-
-// RunConcurrentConsumerGroupMembers starts N group members and runs up to
-// processWorkers job handlers in parallel per poll (Karafka concurrency).
-func RunConcurrentConsumerGroupMembers(ctx context.Context, members, processWorkers int, brokers []string, group string, topics []string, fetch config.ConsumerFetchSettings, handle func(*kgo.Record) error, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter) {
-	RunSuperFetchConsumerGroupMembers(ctx, members, processWorkers, brokers, group, topics, fetch, handle, nil, health, pauseCtl, live)
-}
-
-// RunSuperFetchConsumerGroupMembers is like RunConcurrentConsumerGroupMembers but
-// when newSF is non-nil each member claims Redis ownership, Kafka-acks immediately,
-// and runs #perform on a bounded pool without blocking the poll loop.
+// RunSuperFetchConsumerGroupMembers starts N supervised job consumers. Each
+// member claims Redis ownership, Kafka-acks immediately, then runs #perform on
+// a bounded pool (SuperFetch — the only supported job execution mode).
 func RunSuperFetchConsumerGroupMembers(
-	ctx context.Context, members, processWorkers int,
+	ctx context.Context, members int,
 	brokers []string, group string, topics []string, fetch config.ConsumerFetchSettings,
-	handle func(*kgo.Record) error,
 	newSF func(consumerID string) *SuperFetchExecutor,
 	health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter,
 ) {
 	if members < 1 {
 		members = 1
 	}
-	if processWorkers < 1 {
-		processWorkers = 1
+	if newSF == nil {
+		log.Printf("[kbatch-worker] RunSuperFetchConsumerGroupMembers requires SuperFetch factory group=%s", group)
+		return
 	}
 	for member := 1; member <= members; member++ {
 		label := memberLabel(member, members)
 		hk := healthMemberKey(group, member, members)
-		var sf *SuperFetchExecutor
-		if newSF != nil {
-			cid := group + ":" + label
-			if live != nil && live.ConsumerID != "" {
-				cid = live.ConsumerID + ":" + label
-			}
-			sf = newSF(cid)
+		cid := group + ":" + label
+		if live != nil && live.ConsumerID != "" {
+			cid = live.ConsumerID + ":" + label
 		}
-		if sf != nil {
-			go runConcurrentConsumerSupervised(ctx, concurrentConsumerSpec{
-				brokers:        brokers,
-				group:          group,
-				topics:         topics,
-				fetch:          fetch,
-				handle:         handle,
-				processWorkers: processWorkers,
-				superFetch:     sf,
-				health:         health,
-				pauseCtl:       pauseCtl,
-				live:           live,
-				memberLabel:    label,
-				healthKey:      hk,
-			})
+		sf := newSF(cid)
+		if sf == nil {
+			log.Printf("[kbatch-worker] SuperFetch factory returned nil group=%s member=%s", group, label)
 			continue
 		}
-		if processWorkers == 1 {
-			go runConsumerSupervised(ctx, consumerSpec{
-				brokers:     brokers,
-				group:       group,
-				topics:      topics,
-				fetch:       fetch,
-				handle:      handle,
-				health:      health,
-				pauseCtl:    pauseCtl,
-				live:        live,
-				memberLabel: label,
-				healthKey:   hk,
-			})
-			continue
-		}
+		sf.BindLife(ctx)
 		go runConcurrentConsumerSupervised(ctx, concurrentConsumerSpec{
-			brokers:        brokers,
-			group:          group,
-			topics:         topics,
-			fetch:          fetch,
-			handle:         handle,
-			processWorkers: processWorkers,
-			health:         health,
-			pauseCtl:       pauseCtl,
-			live:           live,
-			memberLabel:    label,
-			healthKey:      hk,
+			brokers:     brokers,
+			group:       group,
+			topics:      topics,
+			fetch:       fetch,
+			superFetch:  sf,
+			health:      health,
+			pauseCtl:    pauseCtl,
+			live:        live,
+			memberLabel: label,
+			healthKey:   hk,
 		})
 	}
 }
@@ -178,18 +133,16 @@ func collectPollRecords(ctx context.Context, cl *consumerClient, group string, f
 }
 
 type concurrentConsumerSpec struct {
-	brokers        []string
-	group          string
-	topics         []string
-	fetch          config.ConsumerFetchSettings
-	handle         func(*kgo.Record) error
-	processWorkers int
-	superFetch     *SuperFetchExecutor
-	health         *ConsumerHealth
-	pauseCtl       pauseChecker
-	live           *liveness.Reporter
-	memberLabel    string
-	healthKey      string
+	brokers     []string
+	group       string
+	topics      []string
+	fetch       config.ConsumerFetchSettings
+	superFetch  *SuperFetchExecutor
+	health      *ConsumerHealth
+	pauseCtl    pauseChecker
+	live        *liveness.Reporter
+	memberLabel string
+	healthKey   string
 }
 
 func runConcurrentConsumerSupervised(ctx context.Context, spec concurrentConsumerSpec) {
@@ -239,36 +192,9 @@ func runConcurrentConsumerLoop(ctx context.Context, spec concurrentConsumerSpec)
 		pauseCtl:    spec.pauseCtl,
 		live:        spec.live,
 	}, func(ctx context.Context, recs []*kgo.Record) error {
-		if spec.superFetch != nil {
-			spec.superFetch.DispatchClaimsAndAcks(ctx, cl.Client, recs, spec.group)
-			return nil
-		}
-		processRecordsConcurrent(ctx, cl.Client, spec.handle, recs, spec.processWorkers, spec.group)
+		spec.superFetch.DispatchClaimsAndAcks(ctx, cl.Client, recs, spec.group)
 		return nil
 	})
-}
-
-func processRecordsConcurrent(ctx context.Context, cl *kgo.Client, handle func(*kgo.Record) error, recs []*kgo.Record, workers int, group string) {
-	if workers < 1 {
-		workers = 1
-	}
-	sem := make(chan struct{}, workers)
-	var wg sync.WaitGroup
-	for _, rec := range recs {
-		wg.Add(1)
-		go func(rec *kgo.Record) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			if err := safeHandle(handle, rec); err != nil {
-				log.Printf("[kbatch-worker] handler error group=%s topic=%s offset=%d: %v",
-					group, rec.Topic, rec.Offset, err)
-				return
-			}
-			cl.MarkCommitRecords(rec)
-		}(rec)
-	}
-	wg.Wait()
 }
 
 func safeBatchHandle(ctx context.Context, handle BatchHandler, recs []*kgo.Record) (err error) {
@@ -352,47 +278,40 @@ func runConsumerLoop(ctx context.Context, spec consumerSpec) error {
 	})
 }
 
-// RunPriorityGroup starts a supervised priority consumer with lag gating.
-func RunPriorityGroup(ctx context.Context, cfg config.Daemon, pc priority.Config, gate *priority.Gate, handle func(*kgo.Record) error, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter) {
-	RunPriorityGroupMembers(ctx, 1, 1, cfg, pc, gate, handle, health, pauseCtl, live)
-}
-
-// RunPriorityGroupMembers starts N in-process priority consumers for the same group.
-func RunPriorityGroupMembers(ctx context.Context, members, processWorkers int, cfg config.Daemon, pc priority.Config, gate *priority.Gate, handle func(*kgo.Record) error, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter) {
-	RunPriorityGroupMembersSuperFetch(ctx, members, processWorkers, cfg, pc, gate, handle, nil, health, pauseCtl, live)
-}
-
-// RunPriorityGroupMembersSuperFetch is RunPriorityGroupMembers with optional SuperFetch.
+// RunPriorityGroupMembersSuperFetch starts N priority consumers with SuperFetch
+// (claim → ack → pool perform) and lag gating.
 func RunPriorityGroupMembersSuperFetch(
-	ctx context.Context, members, processWorkers int, cfg config.Daemon, pc priority.Config, gate *priority.Gate,
-	handle func(*kgo.Record) error, newSF func(consumerID string) *SuperFetchExecutor,
+	ctx context.Context, members int, cfg config.Daemon, pc priority.Config, gate *priority.Gate,
+	newSF func(consumerID string) *SuperFetchExecutor,
 	health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter,
 ) {
 	if members < 1 {
 		members = 1
 	}
-	if processWorkers < 1 {
-		processWorkers = 1
+	if newSF == nil {
+		log.Printf("[kbatch-worker] RunPriorityGroupMembersSuperFetch requires SuperFetch factory group=%s", pc.ConsumerGroup)
+		return
 	}
 	group := pc.ConsumerGroup
 	log.Printf("[kbatch-daemon] starting priority consumers group=%s members=%d topics=%v", group, members, pc.Topics)
 	for member := 1; member <= members; member++ {
 		label := memberLabel(member, members)
 		hk := healthMemberKey(group, member, members)
-		var sf *SuperFetchExecutor
-		if newSF != nil {
-			cid := group + ":" + label
-			if live != nil && live.ConsumerID != "" {
-				cid = live.ConsumerID + ":" + label
-			}
-			sf = newSF(cid)
+		cid := group + ":" + label
+		if live != nil && live.ConsumerID != "" {
+			cid = live.ConsumerID + ":" + label
 		}
-		go runPrioritySupervised(ctx, cfg, pc, gate, handle, health, pauseCtl, live, processWorkers, sf,
-			label, hk)
+		sf := newSF(cid)
+		if sf == nil {
+			log.Printf("[kbatch-worker] SuperFetch factory returned nil group=%s member=%s", group, label)
+			continue
+		}
+		sf.BindLife(ctx)
+		go runPrioritySupervised(ctx, cfg, pc, gate, health, pauseCtl, live, sf, label, hk)
 	}
 }
 
-func runPrioritySupervised(ctx context.Context, cfg config.Daemon, pc priority.Config, gate *priority.Gate, handle func(*kgo.Record) error, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter, processWorkers int, sf *SuperFetchExecutor, memberLabel, healthKey string) {
+func runPrioritySupervised(ctx context.Context, cfg config.Daemon, pc priority.Config, gate *priority.Gate, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter, sf *SuperFetchExecutor, memberLabel, healthKey string) {
 	group := pc.ConsumerGroup
 	if health != nil {
 		health.Register(healthKey)
@@ -413,7 +332,7 @@ func runPrioritySupervised(ctx context.Context, cfg config.Daemon, pc priority.C
 		if ctx.Err() != nil {
 			return
 		}
-		err := runPriorityOnce(ctx, cfg, pc, gate, handle, health, pauseCtl, live, specByTopic, yieldSleep, weightedTicks, processWorkers, sf, memberLabel, healthKey)
+		err := runPriorityOnce(ctx, cfg, pc, gate, health, pauseCtl, live, specByTopic, yieldSleep, weightedTicks, sf, memberLabel, healthKey)
 		if ctx.Err() != nil || err == nil {
 			return
 		}
@@ -437,14 +356,12 @@ func runPriorityOnce(
 	cfg config.Daemon,
 	pc priority.Config,
 	gate *priority.Gate,
-	handle func(*kgo.Record) error,
 	health *ConsumerHealth,
 	pauseCtl pauseChecker,
 	live *liveness.Reporter,
 	specByTopic map[string]priority.TopicSpec,
 	yieldSleep time.Duration,
 	weightedTicks map[string]int,
-	processWorkers int,
 	sf *SuperFetchExecutor,
 	memberLabel string,
 	healthKey string,
@@ -470,22 +387,7 @@ func runPriorityOnce(
 		if len(ready) == 0 {
 			return nil
 		}
-		if sf != nil {
-			sf.DispatchClaimsAndAcks(ctx, cl.Client, ready, pc.ConsumerGroup)
-			return nil
-		}
-		if processWorkers <= 1 {
-			for _, rec := range ready {
-				if err := safeHandle(handle, rec); err != nil {
-					log.Printf("[kbatch-priority] handler error group=%s topic=%s offset=%d: %v",
-						pc.ConsumerGroup, rec.Topic, rec.Offset, err)
-					continue
-				}
-				cl.MarkCommitRecords(rec)
-			}
-			return nil
-		}
-		processRecordsConcurrent(ctx, cl.Client, handle, ready, processWorkers, pc.ConsumerGroup)
+		sf.DispatchClaimsAndAcks(ctx, cl.Client, ready, pc.ConsumerGroup)
 		return nil
 	})
 }

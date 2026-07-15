@@ -98,7 +98,6 @@ RSpec.describe "Go produce client (integration)", :integration do
       "handler_manifest" => @manifest_path,
       "schedule_poller_enabled" => true,
       "max_retries" => 1,
-      "complete_after_retries" => 1,
       "retry_tiers" => { "short" => 0, "medium" => 0, "large" => 0 }
     }.to_yaml)
   end

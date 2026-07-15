@@ -77,7 +77,9 @@ func TestProcessSkipsWhenAlreadyDispatched(t *testing.T) {
 	batchID := "cb-dup"
 	now := time.Now().UTC().Format(time.RFC3339)
 	mr.HSet("kafka_batch:b:"+batchID,
-		"id", batchID, "status", "success", "callback_dispatched_at", now,
+		"id", batchID, "status", "success",
+		"callback_dispatched_at", now,
+		"success_callback_dispatched_at", now,
 	)
 
 	inv := &spyInvoker{}

@@ -137,7 +137,7 @@ func (s *RedisStore) SealBatch(ctx context.Context, id string) (SealBatchResult,
 	ttlSec := strconv.Itoa(int(s.ttl.Seconds()))
 	score := fmt.Sprintf("%f", float64(now.UnixNano())/1e9)
 	raw, err := s.client.Eval(ctx, sealBatchLua,
-		[]string{batchKey(id), countsKey, runningIndex, doneIndex, bitmapKey(id)},
+		[]string{batchKey(id), countsKey, runningIndex, doneIndex, bitmapKey(id), okBitmapKey(id), failBitmapKey(id)},
 		now.Format(time.RFC3339), ttlSec, score,
 	).Slice()
 	if err != nil {
@@ -148,7 +148,7 @@ func (s *RedisStore) SealBatch(ctx context.Context, id string) (SealBatchResult,
 	switch code {
 	case 0:
 		out.Status = "not_found"
-	case 1:
+	case 1, 3:
 		out.Status = "done"
 		out.Outcome = payload
 		b, err := s.FindBatch(ctx, id)

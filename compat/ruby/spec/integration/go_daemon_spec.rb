@@ -53,7 +53,6 @@ RSpec.describe "Go daemon (integration)", :integration do
         "topic" => @worker_topic,
         "apply_topic_prefix" => false,
         "max_retries" => 1,
-        "complete_after_retries" => 1
       },
       "integration.go_multi" => {
         "runtime" => "go",
@@ -115,7 +114,6 @@ RSpec.describe "Go daemon (integration)", :integration do
       "redis_url" => KafkaBatchSpec::RedisHelper::TEST_URL,
       "handler_manifest" => @manifest_path,
       "max_retries" => 2,
-      "complete_after_retries" => 1,
       "retry_tiers" => { "short" => 0, "medium" => 0, "large" => 0 }
     }.to_yaml)
   end

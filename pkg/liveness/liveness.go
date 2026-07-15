@@ -15,6 +15,8 @@ import (
 const (
 	consumerPrefix = "kafka_batch:live:consumer:"
 	jobPrefix      = "kafka_batch:live:job:"
+	defaultTTL     = 180 * time.Second
+	defaultInterval = 20 * time.Second
 )
 
 // JobMeta is written when a job starts executing.
@@ -26,27 +28,60 @@ type JobMeta struct {
 	Partition   int32
 }
 
-// Reporter writes Redis consumer heartbeats for the Ruby /live dashboard.
+// Reporter writes Redis consumer heartbeats for the Ruby /live dashboard and
+// SuperFetch reclaim (EXISTS on live:consumer:*).
 type Reporter struct {
-	Client            *redis.Client
-	TTL               time.Duration
-	ConsumerID        string
-	TrackRunningJobs  bool
+	Client           *redis.Client
+	TTL              time.Duration
+	HeartbeatEvery   time.Duration
+	ConsumerID       string
+	TrackRunningJobs bool
 
-	mu sync.Mutex
+	mu        sync.Mutex
+	lastTopic string
 }
 
 func NewReporter(client *redis.Client, ttl time.Duration) *Reporter {
 	if ttl <= 0 {
-		ttl = 30 * time.Second
+		ttl = defaultTTL
 	}
 	host, _ := os.Hostname()
 	return &Reporter{
 		Client:           client,
 		TTL:              ttl,
+		HeartbeatEvery:   defaultInterval,
 		ConsumerID:       fmt.Sprintf("%s:%d:%s", host, os.Getpid(), uuid.NewString()[:6]),
 		TrackRunningJobs: true,
 	}
+}
+
+// StartHeartbeatLoop refreshes the Redis heartbeat on a fixed interval so
+// CPU-heavy #perform work that starves the poll path cannot miss enough cycles
+// to look dead (default: every 20s with TTL 180s ≈ 9 misses).
+func (r *Reporter) StartHeartbeatLoop(ctx context.Context) {
+	if r == nil || r.Client == nil {
+		return
+	}
+	interval := r.HeartbeatEvery
+	if interval <= 0 {
+		interval = defaultInterval
+	}
+	go func() {
+		r.Heartbeat(ctx, "")
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				r.mu.Lock()
+				topic := r.lastTopic
+				r.mu.Unlock()
+				r.Heartbeat(ctx, topic)
+			}
+		}
+	}()
 }
 
 // JobStarted records a running job (Ruby Liveness.job_started).
@@ -79,6 +114,16 @@ func (r *Reporter) Heartbeat(ctx context.Context, topic string) {
 	if r == nil || r.Client == nil {
 		return
 	}
+	if topic != "" {
+		r.mu.Lock()
+		r.lastTopic = topic
+		r.mu.Unlock()
+	}
+	r.mu.Lock()
+	if topic == "" {
+		topic = r.lastTopic
+	}
+	r.mu.Unlock()
 	payload, _ := json.Marshal(map[string]interface{}{
 		"consumer_id": r.ConsumerID,
 		"hostname":    hostname(),

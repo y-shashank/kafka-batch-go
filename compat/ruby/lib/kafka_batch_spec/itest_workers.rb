@@ -60,7 +60,6 @@ class RubyAlwaysFailWorker
 
   job_type "integration.ruby_always_fail"
   max_retries 1
-  complete_after_retries 1
 
   def perform(_payload)
     raise "always fails"

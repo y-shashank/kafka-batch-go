@@ -27,7 +27,6 @@ type Daemon struct {
 	// not-yet-due message (mirrors Ruby retry_max_pause_seconds).
 	RetryMaxPause             time.Duration
 	MaxRetries                int
-	CompleteAfter             int
 	EventEmitRetries          int
 	EventEmitBackoff          time.Duration
 	RedisURL                  string
@@ -43,14 +42,8 @@ type Daemon struct {
 	FairReadyConsumerConcurrency int
 	// PriorityConsumerConcurrency is in-process group members per priority group.
 	PriorityConsumerConcurrency int
-	// JobProcessConcurrency is parallel job executions per poll per consumer member
-	// when SuperFetch is disabled (Karafka concurrency). 1 = serial; >1 is unsafe
-	// for mark-commit gaps — prefer SuperFetch instead.
-	JobProcessConcurrency int
-	// SuperFetchEnabled claims Redis ownership then Kafka-acks before #perform so
-	// a process can run many long jobs (seconds–30m) from one partition.
-	SuperFetchEnabled bool
-	// SuperFetchConcurrency is the per-member goroutine pool size when SuperFetch is on.
+	// SuperFetchConcurrency is the per-member goroutine pool size for in-flight
+	// #perform after Redis claim + Kafka ack (always-on SuperFetch).
 	SuperFetchConcurrency int
 	// SuperFetchLeaseTTL is the Redis working-set TTL renewed during #perform.
 	SuperFetchLeaseTTL time.Duration
@@ -58,6 +51,9 @@ type Daemon struct {
 	SuperFetchReclaimEvery time.Duration
 	// SuperFetchReclaimLimit caps orphans processed per reclaim sweep.
 	SuperFetchReclaimLimit int
+	// SuperFetchOrphanGrace is how long after claim before a missing heartbeat
+	// counts as death (default 40s ≈ 2× liveness heartbeat interval).
+	SuperFetchOrphanGrace time.Duration
 	// ConsumerFetchMaxBytes caps total bytes per broker fetch (default 1 MiB).
 	ConsumerFetchMaxBytes int32
 	// ConsumerFetchMaxPartitionBytes caps bytes per partition in a fetch (default 128 KiB).
@@ -103,10 +99,15 @@ type Daemon struct {
 	FairnessTenantPartitionCacheTTL   time.Duration
 	Store                             string
 	StoreMySQLDSN                     string
-	LivenessEnabled                   bool
-	LivenessTTL                       time.Duration
-	LivenessHTTPAddr                  string
-	TrackRunningJobs                  bool
+	LivenessEnabled bool
+	// LivenessTTL is Redis EX on kafka_batch:live:consumer:* — pod considered
+	// dead once the key expires without refresh. Default 180s (~9×20s heartbeats).
+	LivenessTTL time.Duration
+	// LivenessHeartbeatInterval is how often processes refresh the heartbeat key.
+	// Default 20s. With TTL 180s, up to ~9 missed cycles before reclaim.
+	LivenessHeartbeatInterval time.Duration
+	LivenessHTTPAddr          string
+	TrackRunningJobs          bool
 	MetricsEnabled                    bool
 	MetricsPrefix                     string
 	MetricsStatsDAddr                 string
@@ -128,7 +129,6 @@ func DefaultDaemon() Daemon {
 		RetryJitter:                       0.1,
 		RetryMaxPause:                     30 * time.Second,
 		MaxRetries:                        7,
-		CompleteAfter:                     7,
 		EventEmitRetries:                  3,
 		EventEmitBackoff:                  time.Second,
 		RedisURL:                          "redis://localhost:6379/0",
@@ -160,7 +160,8 @@ func DefaultDaemon() Daemon {
 		FairnessActiveCountTTL:            5 * time.Second,
 		FairnessActiveCountSource:         "inflight_plus_ready",
 		FairnessTenantPartitionCacheTTL:   30 * time.Second,
-		LivenessTTL:                       30 * time.Second,
+		LivenessTTL:                       180 * time.Second,
+		LivenessHeartbeatInterval:         20 * time.Second,
 		LivenessHTTPAddr:                  ":8080",
 		TrackRunningJobs:                  true,
 		MetricsPrefix:                     "kafka_batch",
@@ -171,12 +172,11 @@ func DefaultDaemon() Daemon {
 		JobsConsumerConcurrency:           8,
 		FairReadyConsumerConcurrency:      8,
 		PriorityConsumerConcurrency:       4,
-		JobProcessConcurrency:             1,
-		SuperFetchEnabled:                 true,
 		SuperFetchConcurrency:             32,
 		SuperFetchLeaseTTL:                2 * time.Minute,
 		SuperFetchReclaimEvery:            30 * time.Second,
 		SuperFetchReclaimLimit:            100,
+		SuperFetchOrphanGrace:             40 * time.Second,
 		ConsumerFetchMaxBytes:             DefaultConsumerFetchMaxBytes,
 		ConsumerFetchMaxPartitionBytes:    DefaultConsumerFetchMaxPartitionBytes,
 		ConsumerFetchMaxWait:              DefaultConsumerFetchMaxWait,
@@ -216,20 +216,30 @@ func (c Daemon) PriorityConsumerMembers() int {
 	return c.PriorityConsumerConcurrency
 }
 
-// JobProcessWorkers returns parallel job executions per poll (min 1).
-func (c Daemon) JobProcessWorkers() int {
-	if c.JobProcessConcurrency < 1 {
-		return 1
-	}
-	return c.JobProcessConcurrency
-}
-
 // SuperFetchWorkers returns the SuperFetch goroutine pool size (min 1).
 func (c Daemon) SuperFetchWorkers() int {
 	if c.SuperFetchConcurrency < 1 {
 		return 32
 	}
 	return c.SuperFetchConcurrency
+}
+
+// LivenessTTLDuration is the Redis EX TTL for kafka_batch:live:consumer:* heartbeats
+// (pod-alive signal for /live and SuperFetch reclaim). Default 180s.
+func (c Daemon) LivenessTTLDuration() time.Duration {
+	if c.LivenessTTL <= 0 {
+		return 180 * time.Second
+	}
+	return c.LivenessTTL
+}
+
+// LivenessHeartbeatIntervalDuration is how often to refresh the heartbeat key.
+// Default 20s (≈9 misses fit inside the 180s TTL).
+func (c Daemon) LivenessHeartbeatIntervalDuration() time.Duration {
+	if c.LivenessHeartbeatInterval <= 0 {
+		return 20 * time.Second
+	}
+	return c.LivenessHeartbeatInterval
 }
 
 // ConsumerStallTimeoutDuration returns the configured consumer stall watchdog duration.
@@ -266,18 +276,16 @@ func LoadDaemon(path string) (Daemon, error) {
 		RedisURL                             string           `yaml:"redis_url"`
 		HandlerManifest                      string           `yaml:"handler_manifest"`
 		MaxRetries                           int              `yaml:"max_retries"`
-		CompleteAfter                        int              `yaml:"complete_after_retries"`
 		RetryMaxPauseSec                     float64          `yaml:"retry_max_pause"`
 		ProducerRequiredAcks                 string           `yaml:"producer_required_acks"`
 		JobsConsumerConcurrency              int              `yaml:"jobs_consumer_concurrency"`
 		FairReadyConsumerConcurrency         int              `yaml:"fair_ready_consumer_concurrency"`
 		PriorityConsumerConcurrency          int              `yaml:"priority_consumer_concurrency"`
-		JobProcessConcurrency                int              `yaml:"job_process_concurrency"`
-		SuperFetchEnabled                    *bool            `yaml:"super_fetch_enabled"`
 		SuperFetchConcurrency                int              `yaml:"super_fetch_concurrency"`
 		SuperFetchLeaseTTLSec                float64          `yaml:"super_fetch_lease_ttl"`
 		SuperFetchReclaimIntervalSec         float64          `yaml:"super_fetch_reclaim_interval"`
 		SuperFetchReclaimLimit               int              `yaml:"super_fetch_reclaim_limit"`
+		SuperFetchOrphanGraceSec             float64          `yaml:"super_fetch_orphan_grace"`
 		ConsumerFetchMaxBytes                int32            `yaml:"consumer_fetch_max_bytes"`
 		ConsumerFetchMaxPartitionBytes       int32            `yaml:"consumer_fetch_max_partition_bytes"`
 		ConsumerFetchMaxWaitMs               float64          `yaml:"consumer_fetch_max_wait_ms"`
@@ -320,6 +328,7 @@ func LoadDaemon(path string) (Daemon, error) {
 		StoreMySQLDSN                        string           `yaml:"store_mysql_dsn"`
 		LivenessEnabled                      bool             `yaml:"liveness_enabled"`
 		LivenessTTLSec                       float64          `yaml:"liveness_ttl"`
+		LivenessHeartbeatIntervalSec         float64          `yaml:"liveness_heartbeat_interval"`
 		LivenessHTTPAddr                     string           `yaml:"liveness_http_addr"`
 		TrackRunningJobs                     *bool            `yaml:"track_running_jobs"`
 		MetricsEnabled                       bool             `yaml:"metrics_enabled"`
@@ -368,9 +377,6 @@ func LoadDaemon(path string) (Daemon, error) {
 	if doc.MaxRetries > 0 {
 		cfg.MaxRetries = doc.MaxRetries
 	}
-	if doc.CompleteAfter > 0 {
-		cfg.CompleteAfter = doc.CompleteAfter
-	}
 	if doc.RetryMaxPauseSec > 0 {
 		cfg.RetryMaxPause = time.Duration(doc.RetryMaxPauseSec * float64(time.Second))
 	}
@@ -386,12 +392,6 @@ func LoadDaemon(path string) (Daemon, error) {
 	if doc.PriorityConsumerConcurrency > 0 {
 		cfg.PriorityConsumerConcurrency = doc.PriorityConsumerConcurrency
 	}
-	if doc.JobProcessConcurrency > 0 {
-		cfg.JobProcessConcurrency = doc.JobProcessConcurrency
-	}
-	if doc.SuperFetchEnabled != nil {
-		cfg.SuperFetchEnabled = *doc.SuperFetchEnabled
-	}
 	if doc.SuperFetchConcurrency > 0 {
 		cfg.SuperFetchConcurrency = doc.SuperFetchConcurrency
 	}
@@ -403,6 +403,9 @@ func LoadDaemon(path string) (Daemon, error) {
 	}
 	if doc.SuperFetchReclaimLimit > 0 {
 		cfg.SuperFetchReclaimLimit = doc.SuperFetchReclaimLimit
+	}
+	if doc.SuperFetchOrphanGraceSec > 0 {
+		cfg.SuperFetchOrphanGrace = time.Duration(doc.SuperFetchOrphanGraceSec * float64(time.Second))
 	}
 	if doc.ConsumerFetchMaxBytes > 0 {
 		cfg.ConsumerFetchMaxBytes = doc.ConsumerFetchMaxBytes
@@ -530,6 +533,9 @@ func LoadDaemon(path string) (Daemon, error) {
 	if doc.LivenessTTLSec > 0 {
 		cfg.LivenessTTL = time.Duration(doc.LivenessTTLSec * float64(time.Second))
 	}
+	if doc.LivenessHeartbeatIntervalSec > 0 {
+		cfg.LivenessHeartbeatInterval = time.Duration(doc.LivenessHeartbeatIntervalSec * float64(time.Second))
+	}
 	if doc.LivenessHTTPAddr != "" {
 		cfg.LivenessHTTPAddr = doc.LivenessHTTPAddr
 	}
@@ -600,6 +606,16 @@ func applyEnv(cfg *Daemon) {
 	if v := os.Getenv("KAFKA_BATCH_LIVENESS_ENABLED"); v == "1" || strings.EqualFold(v, "true") {
 		cfg.LivenessEnabled = true
 	}
+	if v := os.Getenv("KAFKA_BATCH_LIVENESS_TTL"); v != "" {
+		if n, err := parsePositiveFloat(v); err == nil {
+			cfg.LivenessTTL = time.Duration(n * float64(time.Second))
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_LIVENESS_HEARTBEAT_INTERVAL"); v != "" {
+		if n, err := parsePositiveFloat(v); err == nil {
+			cfg.LivenessHeartbeatInterval = time.Duration(n * float64(time.Second))
+		}
+	}
 	if v := os.Getenv("KAFKA_BATCH_METRICS_STATSD_ADDR"); v != "" {
 		cfg.MetricsStatsDAddr = strings.TrimSpace(v)
 	}
@@ -625,14 +641,6 @@ func applyEnv(cfg *Daemon) {
 		if n, err := parsePositiveInt(v); err == nil {
 			cfg.PriorityConsumerConcurrency = n
 		}
-	}
-	if v := os.Getenv("KAFKA_BATCH_JOB_PROCESS_CONCURRENCY"); v != "" {
-		if n, err := parsePositiveInt(v); err == nil {
-			cfg.JobProcessConcurrency = n
-		}
-	}
-	if v := os.Getenv("KAFKA_BATCH_SUPER_FETCH_ENABLED"); v != "" {
-		cfg.SuperFetchEnabled = v == "1" || strings.EqualFold(v, "true")
 	}
 	if v := os.Getenv("KAFKA_BATCH_SUPER_FETCH_CONCURRENCY"); v != "" {
 		if n, err := parsePositiveInt(v); err == nil {
@@ -760,9 +768,8 @@ type HandlerEntry struct {
 	WorkerClass          string `yaml:"worker_class"`
 	Topic                string `yaml:"topic"`
 	ApplyTopicPrefix     bool   `yaml:"apply_topic_prefix"`
-	MaxRetries           int    `yaml:"max_retries"`
-	CompleteAfterRetries int    `yaml:"complete_after_retries"`
-	RetryTier            string `yaml:"retry_tier"`
+	MaxRetries   int    `yaml:"max_retries"`
+	RetryTier    string `yaml:"retry_tier"`
 	FairnessType         string `yaml:"fairness_type"`
 	Uniq                 bool   `yaml:"uniq"`
 }

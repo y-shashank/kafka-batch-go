@@ -22,7 +22,7 @@
 #   KAFKA_BATCH_JOBS_CONSUMER_CONCURRENCY      worker only
 #   KAFKA_BATCH_FAIR_READY_CONSUMER_CONCURRENCY worker only
 #   KAFKA_BATCH_PRIORITY_CONSUMER_CONCURRENCY  worker only
-#   KAFKA_BATCH_JOB_PROCESS_CONCURRENCY        worker only
+#   KAFKA_BATCH_SUPER_FETCH_CONCURRENCY        worker only
 #   KAFKA_BATCH_CONSUMER_FETCH_MAX_BYTES
 #   KAFKA_BATCH_CONSUMER_FETCH_MAX_PARTITION_BYTES
 #   KAFKA_BATCH_CONSUMER_FETCH_MAX_WAIT_MS
@@ -65,8 +65,6 @@ retry_topic: kafka_batch.jobs.retry
 # ── Job retry policy (used when Go job processor schedules failures) ────────────
 
 max_retries: 7
-# complete_after_retries: 7          # count job toward batch after N retries
-
 retry_tiers:                         # tier => delay seconds (topics: retry.{tier})
   short: 30
   medium: 420
@@ -93,7 +91,7 @@ retry_tiers:                         # tier => delay seconds (topics: retry.{tie
 jobs_consumer_concurrency: 8
 # fair_ready_consumer_concurrency: 8
 # priority_consumer_concurrency: 4
-job_process_concurrency: 4                  # parallel jobs per poll per member
+# super_fetch_concurrency: 32               # in-flight #perform pool per member
 
 # ── Delayed jobs — perform_in / perform_at (daemon only) ─────────────────────
 
@@ -171,7 +169,9 @@ fairness_enabled: true
 
 # liveness_enabled: true
 # liveness_http_addr: ":8080"
-# liveness_ttl: 30                     # sec — consumer heartbeat TTL for /health
+# liveness_ttl: 180                    # sec — Redis TTL on live:consumer:* (≈9× heartbeat interval)
+# liveness_heartbeat_interval: 20      # sec — background heartbeat refresh interval
+# super_fetch_orphan_grace: 40         # sec — missing heartbeat must outlive this before reclaim/steal
 # track_running_jobs: true             # per-job /live writes (false = heartbeats only)
 
 # ── Metrics (daemon + worker) ─────────────────────────────────────────────────

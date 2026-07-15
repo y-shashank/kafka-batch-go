@@ -526,6 +526,8 @@ Daemon and worker load `config/daemon.example.yml` (or your app copy), then **en
 | `KAFKA_BATCH_STORE_MYSQL_DSN` | MySQL failures / pause store (daemon + worker) |
 | `KAFKA_BATCH_METRICS_ENABLED` / `KAFKA_BATCH_METRICS_PREFIX` / `KAFKA_BATCH_METRICS_STATSD_ADDR` | StatsD metrics export |
 | `KAFKA_BATCH_LIVENESS_ENABLED` / `KAFKA_BATCH_LIVENESS_HTTP_ADDR` | HTTP `/health` probes |
+| `KAFKA_BATCH_LIVENESS_TTL` / `liveness_ttl` | Redis EX TTL (seconds) on `kafka_batch:live:consumer:*` heartbeats — default **180**. Pod is considered dead when the key expires. Also used by SuperFetch reclaim. |
+| `KAFKA_BATCH_LIVENESS_HEARTBEAT_INTERVAL` / `liveness_heartbeat_interval` | How often (seconds) processes refresh the heartbeat key — default **20** (≈9 misses before TTL expiry). |
 
 Client: `client.DefaultConfig()` + `client.New(cfg)` applies env automatically.  
 CLI: `config.LoadDaemon` applies env after YAML parse.
@@ -620,17 +622,17 @@ schedule_batch_size: 100       # due jobs claimed per poll
 Go daemon and worker scale **inside one pod** with:
 
 1. **In-process consumer members** — N franz-go clients join the same Kafka consumer group; the broker assigns partitions across them (same as N pods, one OS process).
-2. **SuperFetch (worker, default on)** — Redis working-set claim → Kafka offset ack → `#perform` on a goroutine pool. Offsets advance at delivery rate, not perform latency, so **one partition can feed many long jobs** (seconds–30m). On pod death the daemon reclaim loop re-produces orphaned payloads (`_reclaim: true`).
+2. **SuperFetch (worker, always on)** — Redis working-set claim → Kafka offset ack → `#perform` on a goroutine pool. Offsets advance at delivery rate, not perform latency, so **one partition can feed many long jobs** (seconds–30m). On pod death (heartbeat missing past `super_fetch_orphan_grace`) the daemon reclaim loop re-produces orphaned payloads once (`_reclaim: true`); a Redis `work:produced:` marker makes reclaim produce idempotent if Finish fails. Reclaimed messages still claim → mark offset → `#perform` (at-least-once perform is OK).
 3. **Consumer fetch limits** — `consumer_fetch_*` caps how much data each poll prefetches from the broker.
 
-**Max concurrent job executions** (worker, SuperFetch on):
+**Max concurrent job executions** (worker):
 
 ```text
 jobs_consumer_members × super_fetch_concurrency
   (+ same formula per fair-ready lane and priority group)
 ```
 
-Set **member count ≈ topic partition count** for balanced lag. Raise **`super_fetch_concurrency`** (default `32`) when jobs are slow and you want more in-flight performs per member. Disable with `super_fetch_enabled: false` only if you need legacy commit-after-perform (then keep `job_process_concurrency: 1`).
+Set **member count ≈ topic partition count** for balanced lag. Raise **`super_fetch_concurrency`** (default `32`) when jobs are slow and you want more in-flight performs per member.
 
 #### Control plane (`kbatch daemon`)
 
@@ -660,9 +662,8 @@ Raise these when messages are large or brokers are far away and polls return too
 | `KAFKA_BATCH_JOBS_CONSUMER_CONCURRENCY` | `jobs_consumer_concurrency` | `8` | In-process members for `{group}-go-worker-jobs` (plain go topics). |
 | `KAFKA_BATCH_FAIR_READY_CONSUMER_CONCURRENCY` | `fair_ready_consumer_concurrency` | `8` | In-process members **per** fair-ready lane (`time`, `throughput`). |
 | `KAFKA_BATCH_PRIORITY_CONSUMER_CONCURRENCY` | `priority_consumer_concurrency` | `4` | In-process members **per** priority YAML group. |
-| `KAFKA_BATCH_SUPER_FETCH_ENABLED` | `super_fetch_enabled` | `true` | Claim Redis ownership then Kafka-ack before `#perform`; daemon reclaims orphans. |
-| `KAFKA_BATCH_SUPER_FETCH_CONCURRENCY` | `super_fetch_concurrency` | `32` | Goroutine pool size **per member** for in-flight performs. |
-| `KAFKA_BATCH_JOB_PROCESS_CONCURRENCY` | `job_process_concurrency` | `1` | Legacy only (SuperFetch off). Keep `1` — values &gt;1 risk mark-commit gaps. |
+| `KAFKA_BATCH_SUPER_FETCH_CONCURRENCY` | `super_fetch_concurrency` | `32` | Goroutine pool size **per member** for in-flight performs (claim → ack → pool). |
+| — | `super_fetch_orphan_grace` | `40` | Seconds after claim before a missing heartbeat counts as death (reclaim/steal). |
 | `KAFKA_BATCH_PRODUCER_REQUIRED_ACKS` | `producer_required_acks` | `all_isr` | Same as daemon — event emission after job completion. |
 
 Fairness admission is capped by control-plane `fairness_global_concurrency` (YAML). Raising worker concurrency above what control admits will backlog **ready** topics, not speed up end-to-end.
@@ -696,7 +697,7 @@ producer_required_acks: all_isr
 
 **CPU-heavy short jobs**:
 
-- Keep SuperFetch on; size `super_fetch_concurrency` near logical CPUs per member.
+- Size `super_fetch_concurrency` near logical CPUs per member.
 - Example on 8-core pod: `jobs_consumer_concurrency: 8`, `super_fetch_concurrency: 8`.
 
 **Mixed fleets** — separate handler topics / worker deployments with different `super_fetch_concurrency` rather than one global pool size.
@@ -722,12 +723,13 @@ producer_required_acks: all_isr
 
 **Consumer resilience:** Each Kafka consumer runs in a supervised loop — broker blips restart that consumer with exponential backoff (1s → 30s) instead of killing the whole process. Handler errors and panics log and skip commit (offset redelivered); panics no longer crash the pod.
 
-**Health probes:** Enable `liveness_enabled: true` (or `KAFKA_BATCH_LIVENESS_ENABLED=true`). `liveness_http_addr` (default `:8080`, or `KAFKA_BATCH_LIVENESS_HTTP_ADDR`) is the address the probe HTTP server binds to; point your Kubernetes probe port at it. `GET /health` and `GET /live` return **503** when any registered consumer group has not polled Kafka within `2 × liveness_ttl` (min 60s). Wire Kubernetes liveness/readiness probes to `/health` with `restartPolicy: Always` so stale consumers trigger a pod restart.
+**Health probes:** Enable `liveness_enabled: true` (or `KAFKA_BATCH_LIVENESS_ENABLED=true`). `liveness_http_addr` (default `:8080`, or `KAFKA_BATCH_LIVENESS_HTTP_ADDR`) is the address the probe HTTP server binds to; point your Kubernetes probe port at it. `GET /health` and `GET /live` return **503** when any registered consumer group has not polled Kafka within `3 × liveness_heartbeat_interval` (default 60s). A background loop refreshes Redis heartbeats every `liveness_heartbeat_interval` (default 20s) with TTL `liveness_ttl` (default 180s) so CPU-heavy jobs can miss several cycles before SuperFetch reclaim treats the pod as dead. Wire Kubernetes liveness/readiness probes to `/health` with `restartPolicy: Always` so stale consumers trigger a pod restart.
 
 ```yaml
 liveness_enabled: true
 liveness_http_addr: ":8080"
-liveness_ttl: 30s
+liveness_ttl: 180                    # seconds; Redis TTL on live:consumer:* (env: KAFKA_BATCH_LIVENESS_TTL)
+liveness_heartbeat_interval: 20      # seconds between heartbeat refreshes
 ```
 
 ## Wire protocol

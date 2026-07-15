@@ -193,14 +193,29 @@ func TestDefaultDaemonConsumerConcurrency(t *testing.T) {
 	if cfg.PriorityConsumerMembers() != 4 {
 		t.Fatalf("priority members=%d", cfg.PriorityConsumerMembers())
 	}
-	if cfg.JobProcessWorkers() != 1 {
-		t.Fatalf("job process workers=%d", cfg.JobProcessWorkers())
-	}
-	if !cfg.SuperFetchEnabled {
-		t.Fatal("expected SuperFetchEnabled default true")
-	}
 	if cfg.SuperFetchWorkers() != 32 {
 		t.Fatalf("superfetch workers=%d", cfg.SuperFetchWorkers())
+	}
+	if cfg.LivenessTTLDuration() != 180*time.Second {
+		t.Fatalf("liveness ttl=%s", cfg.LivenessTTLDuration())
+	}
+	if cfg.LivenessHeartbeatIntervalDuration() != 20*time.Second {
+		t.Fatalf("liveness heartbeat interval=%s", cfg.LivenessHeartbeatIntervalDuration())
+	}
+}
+
+func TestLivenessTTLEnv(t *testing.T) {
+	t.Setenv("KAFKA_BATCH_LIVENESS_TTL", "90")
+	t.Setenv("KAFKA_BATCH_LIVENESS_HEARTBEAT_INTERVAL", "15")
+	cfg, err := LoadDaemon("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LivenessTTLDuration() != 90*time.Second {
+		t.Fatalf("liveness ttl=%s want 90s", cfg.LivenessTTLDuration())
+	}
+	if cfg.LivenessHeartbeatIntervalDuration() != 15*time.Second {
+		t.Fatalf("liveness heartbeat interval=%s want 15s", cfg.LivenessHeartbeatIntervalDuration())
 	}
 }
 

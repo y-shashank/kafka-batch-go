@@ -124,6 +124,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	StartLivenessHeartbeatLoop(ctx, live)
 
 	lagClient, err := kgo.NewClient(kgo.SeedBrokers(cfg.Brokers...))
 	if err != nil {
@@ -158,12 +159,10 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	reconciler.RunScheduler(ctx, cfg, st, prod, func() {
 		loopHealth.RecordTick("reconciler")
 	})
-	if cfg.SuperFetchEnabled {
-		workset.RunReclaimScheduler(ctx, workset.NewStore(rdb), prod, cfg.SuperFetchReclaimEvery, cfg.SuperFetchReclaimLimit, func() {
-			loopHealth.RecordTick("workset-reclaim")
-		})
-		log.Printf("kbatch workset reclaim enabled every=%s limit=%d", cfg.SuperFetchReclaimEvery, cfg.SuperFetchReclaimLimit)
-	}
+	workset.RunReclaimScheduler(ctx, workset.NewStore(rdb), prod, cfg.SuperFetchReclaimEvery, cfg.SuperFetchReclaimLimit, cfg.SuperFetchOrphanGrace, func() {
+		loopHealth.RecordTick("workset-reclaim")
+	})
+	log.Printf("kbatch workset reclaim enabled every=%s limit=%d grace=%s", cfg.SuperFetchReclaimEvery, cfg.SuperFetchReclaimLimit, cfg.SuperFetchOrphanGrace)
 	log.Printf("kbatch events consumer group=%s topic=%s acks=%s fetch_max_bytes=%d fetch_max_partition_bytes=%d fetch_max_wait=%s (one client, goroutine-per-partition)",
 		eventsGroup, cfg.EventsTopic, cfg.RequiredAcks(),
 		fetch.MaxBytes, fetch.MaxPartitionBytes, fetch.MaxWait)

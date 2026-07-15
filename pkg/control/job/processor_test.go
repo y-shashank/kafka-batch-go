@@ -45,8 +45,7 @@ func TestProcessSuccessEmitsEvent(t *testing.T) {
 	seq := int64(1)
 	raw, _ := json.Marshal(protocol.JobMessage{
 		JobID: "j1", BatchID: &batchID, JobType: "test.echo", WorkerClass: "go:test.echo",
-		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3, CompleteAfterRetries: 3,
-		BatchSeq: &seq,
+		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3, BatchSeq: &seq,
 	})
 
 	p := &Processor{Cfg: config.DefaultDaemon(), Store: st, Producer: &memProducer{}}
@@ -88,6 +87,42 @@ func TestProcessHandlerErrorSchedulesRetry(t *testing.T) {
 	}
 	if out.RetryPayload == nil {
 		t.Fatal("expected retry payload")
+	}
+}
+
+func TestProcessHandlerErrorEmitsExecutedForBatch(t *testing.T) {
+	kbatch.Reset()
+	kbatch.Register("test.fail2", func(ctx *kbatch.Context) error {
+		return &kbatch.HandlerError{Class: "Boom", Message: "boom"}
+	})
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := store.NewRedisStore(rdb, time.Hour)
+
+	batchID := "b-exec"
+	seq := int64(1)
+	raw, _ := json.Marshal(protocol.JobMessage{
+		JobID: "j1", BatchID: &batchID, JobType: "test.fail2", WorkerClass: "go:test.fail2",
+		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3, BatchSeq: &seq,
+	})
+
+	cfg := config.DefaultDaemon()
+	p := &Processor{Cfg: cfg, Store: st, Producer: &memProducer{}, Now: func() time.Time { return time.Unix(0, 0) }}
+	out, err := p.Process(context.Background(), raw, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Event == nil || out.Event.Status != "executed" {
+		t.Fatalf("expected executed event, got %+v", out.Event)
+	}
+	if out.RetryPayload == nil {
+		t.Fatal("expected retry payload")
+	}
+	var retry map[string]interface{}
+	_ = json.Unmarshal(out.RetryPayload, &retry)
+	if retry["batch_counted"] != true {
+		t.Fatalf("expected batch_counted on retry payload, got %#v", retry["batch_counted"])
 	}
 }
 
@@ -198,8 +233,7 @@ func TestProcessRecordsRetryFailureAndClearsOnSuccess(t *testing.T) {
 	rawFail, _ := json.Marshal(protocol.JobMessage{
 		JobID: "j1", BatchID: &batchID, JobType: "test.flip", WorkerClass: "go:test.flip",
 		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3,
-		BatchSeq: &seq, CompleteAfterRetries: 3,
-	})
+		BatchSeq: &seq, 	})
 	p := &Processor{Cfg: config.DefaultDaemon(), Store: st, Failures: &store.CompositeFailures{Redis: st}, Producer: &memProducer{},
 		Now: func() time.Time { return time.Unix(0, 0) }}
 	out, err := p.Process(context.Background(), rawFail, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 10})
@@ -220,8 +254,7 @@ func TestProcessRecordsRetryFailureAndClearsOnSuccess(t *testing.T) {
 	rawOK, _ := json.Marshal(protocol.JobMessage{
 		JobID: "j1", BatchID: &batchID, JobType: "test.flip", WorkerClass: "go:test.flip",
 		Payload: map[string]interface{}{}, Attempt: 1, MaxRetries: 3,
-		BatchSeq: &seq, CompleteAfterRetries: 3,
-	})
+		BatchSeq: &seq, 	})
 	out, err = p.Process(context.Background(), rawOK, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 11})
 	if err != nil || out.Event == nil {
 		t.Fatalf("success out=%+v err=%v", out, err)

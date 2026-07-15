@@ -7,7 +7,7 @@ import (
 )
 
 // RunReclaimScheduler periodically reclaims orphans until ctx is cancelled.
-func RunReclaimScheduler(ctx context.Context, store *Store, prod Producer, every time.Duration, limit int, onTick func()) {
+func RunReclaimScheduler(ctx context.Context, store *Store, prod Producer, every time.Duration, limit int, grace time.Duration, onTick func()) {
 	if store == nil || prod == nil {
 		return
 	}
@@ -17,10 +17,11 @@ func RunReclaimScheduler(ctx context.Context, store *Store, prod Producer, every
 	if limit < 1 {
 		limit = 100
 	}
+	grace = resolveGrace(grace)
 	go func() {
 		ticker := time.NewTicker(every)
 		defer ticker.Stop()
-		log.Printf("[kbatch-workset] reclaim scheduler started every=%s limit=%d", every, limit)
+		log.Printf("[kbatch-workset] reclaim scheduler started every=%s limit=%d grace=%s", every, limit, grace)
 		for {
 			select {
 			case <-ctx.Done():
@@ -30,7 +31,7 @@ func RunReclaimScheduler(ctx context.Context, store *Store, prod Producer, every
 				if onTick != nil {
 					onTick()
 				}
-				res, err := store.ReclaimOrphans(ctx, prod, limit, 30*time.Second)
+				res, err := store.ReclaimOrphans(ctx, prod, limit, 30*time.Second, grace)
 				if err != nil {
 					log.Printf("[kbatch-workset] reclaim sweep error: %v", err)
 					continue

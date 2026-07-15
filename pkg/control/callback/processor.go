@@ -49,14 +49,13 @@ func (p *Processor) Process(ctx context.Context, raw []byte) (Outcome, error) {
 		instrument.CallbackFailed("", "", "", "json.SyntaxError", err.Error())
 		if p.DLT != nil {
 			dlt := map[string]interface{}{
-				"dlt_type":        "malformed_callback",
-				"dlt_raw_payload": string(raw),
-				"dlt_error_class": "json.SyntaxError",
+				"dlt_type":          "malformed_callback",
+				"dlt_raw_payload":   string(raw),
+				"dlt_error_class":   "json.SyntaxError",
 				"dlt_error_message": err.Error(),
 			}
 			rawDLT, _ := json.Marshal(dlt)
-			key := "malformed_callback"
-			_ = p.DLT.ProduceDLT(ctx, key, rawDLT)
+			_ = p.DLT.ProduceDLT(ctx, "malformed_callback", rawDLT)
 			instrument.DLTPublished("", "", "malformed_callback", "callbacks")
 		}
 		return out, nil
@@ -64,24 +63,16 @@ func (p *Processor) Process(ctx context.Context, raw []byte) (Outcome, error) {
 	if cb.BatchID == "" {
 		return out, nil
 	}
-	// Fast path: skip Redis claim when another consumer already won.
-	dispatched, err := p.Store.CallbackDispatched(ctx, cb.BatchID)
-	if err != nil {
-		out.CommitOffset = false
-		return out, err
-	}
-	if dispatched {
-		return out, nil
-	}
-	// Claim BEFORE invoke so two consumers cannot both fire side effects.
-	// HSETNX on callback_dispatched_at is the single-winner fence.
-	won, err := p.Store.ClaimCallback(ctx, cb.BatchID, p.NodeID)
-	if err != nil {
-		out.CommitOffset = false
-		return out, err
-	}
-	if !won {
-		return out, nil
+	if !cb.Preclaimed {
+		kind := claimKind(cb.Outcome)
+		won, err := p.Store.ClaimCallback(ctx, cb.BatchID, p.NodeID, kind)
+		if err != nil {
+			out.CommitOffset = false
+			return out, err
+		}
+		if !won {
+			return out, nil
+		}
 	}
 	if p.Invoker == nil {
 		return out, nil
@@ -112,8 +103,17 @@ func (p *Processor) Process(ctx context.Context, raw []byte) (Outcome, error) {
 	return out, nil
 }
 
+func claimKind(outcome string) string {
+	switch outcome {
+	case "success", "success_only":
+		return "success"
+	default:
+		return "complete"
+	}
+}
+
 func callbackMethod(cb protocol.CallbackMessage) string {
-	if cb.Outcome == "success" && cb.OnSuccess != "" {
+	if (cb.Outcome == "success" || cb.Outcome == "success_only") && cb.OnSuccess != "" {
 		return "on_success"
 	}
 	return "on_complete"

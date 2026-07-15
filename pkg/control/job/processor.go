@@ -140,7 +140,8 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 		return p.handleFailure(ctx, job, raw, src, err)
 	}
 
-	if job.BatchID != nil && job.BatchSeq != nil && !job.BatchCounted {
+	// Always emit success so a prior executed-touch can still count toward on_success.
+	if job.BatchID != nil && job.BatchSeq != nil {
 		ev := p.buildEvent(job, "success", src)
 		out.Event = &ev
 	}
@@ -240,13 +241,9 @@ func (p *Processor) handleFailure(ctx context.Context, job protocol.JobMessage, 
 	if maxRetries == 0 {
 		maxRetries = p.Cfg.MaxRetries
 	}
-	completeAfter := job.CompleteAfterRetries
-	if completeAfter == 0 {
-		completeAfter = p.Cfg.CompleteAfter
-	}
 
 	if nonRetryable(execErr) {
-		if job.BatchID != nil && !job.BatchCounted && job.BatchSeq != nil {
+		if job.BatchID != nil && job.BatchSeq != nil {
 			ev := p.buildEvent(job, "failed", src)
 			out.Event = &ev
 		}
@@ -267,8 +264,9 @@ func (p *Processor) handleFailure(ctx context.Context, job protocol.JobMessage, 
 
 		p.recordExecutionFailure(ctx, job, execErr, "retrying", retryAt.UTC().Format(time.RFC3339))
 
-		if job.BatchID != nil && !job.BatchCounted && job.Attempt >= completeAfter && job.BatchSeq != nil {
-			ev := p.buildEvent(job, "failed", src)
+		// Sidekiq-style: first finish touches the batch for on_complete; job keeps retrying.
+		if job.BatchID != nil && job.BatchSeq != nil && !job.BatchCounted {
+			ev := p.buildEvent(job, "executed", src)
 			out.Event = &ev
 			job.BatchCounted = true
 		}
@@ -284,7 +282,8 @@ func (p *Processor) handleFailure(ctx context.Context, job protocol.JobMessage, 
 		return out, nil
 	}
 
-	if job.BatchID != nil && !job.BatchCounted && job.BatchSeq != nil {
+	// Terminal failure — counts toward failed_count (and touches if not already).
+	if job.BatchID != nil && job.BatchSeq != nil {
 		ev := p.buildEvent(job, "failed", src)
 		out.Event = &ev
 	}

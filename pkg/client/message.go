@@ -21,10 +21,9 @@ func (c *Client) buildMessage(entry config.HandlerEntry, jobType string, payload
 		JobType:              jobType,
 		WorkerClass:          workerName,
 		Payload:              payload,
-		Attempt:              0,
-		MaxRetries:           c.maxRetries(entry),
-		CompleteAfterRetries: c.completeAfter(entry),
-		EnqueuedAt:           protocol.NowISO(),
+		Attempt:    0,
+		MaxRetries: c.maxRetries(entry),
+		EnqueuedAt: protocol.NowISO(),
 	}
 	if tid := opts.tenantID(""); tid != "" {
 		msg.TenantID = &tid
@@ -60,16 +59,6 @@ func (c *Client) maxRetries(entry config.HandlerEntry) int {
 	}
 	if c.cfg.MaxRetries > 0 {
 		return c.cfg.MaxRetries
-	}
-	return 7
-}
-
-func (c *Client) completeAfter(entry config.HandlerEntry) int {
-	if entry.CompleteAfterRetries > 0 {
-		return entry.CompleteAfterRetries
-	}
-	if c.cfg.CompleteAfterRetries > 0 {
-		return c.cfg.CompleteAfterRetries
 	}
 	return 7
 }

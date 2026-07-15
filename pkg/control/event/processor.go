@@ -79,16 +79,22 @@ func (p *Processor) ProcessBatch(ctx context.Context, rawEvents [][]byte) (Outco
 			fin.Batch.ID, fin.Outcome,
 			fin.Batch.TotalJobs, fin.Batch.CompletedCount, fin.Batch.FailedCount,
 		)
+		finishedAt := fin.Batch.FinishedAt
+		if finishedAt == "" {
+			finishedAt = protocol.NowISO()
+		}
 		cb := protocol.CallbackMessage{
 			BatchID:        fin.Batch.ID,
 			Outcome:        fin.Outcome,
 			TotalJobs:      fin.Batch.TotalJobs,
 			CompletedCount: fin.Batch.CompletedCount,
 			FailedCount:    fin.Batch.FailedCount,
+			TouchedCount:   fin.Batch.TouchedCount,
 			OnSuccess:      fin.Batch.OnSuccess,
 			OnComplete:     fin.Batch.OnComplete,
-			FinishedAt:     fin.Batch.FinishedAt,
+			FinishedAt:     finishedAt,
 			CallbackArgs:   protocol.DecodeJSONMap(fin.Batch.CallbackArgs),
+			Preclaimed:     true,
 		}
 		out.Callbacks = append(out.Callbacks, cb)
 	}
@@ -104,6 +110,7 @@ func (p *Processor) ProcessBatch(ctx context.Context, rawEvents [][]byte) (Outco
 			TotalJobs:      batch.TotalJobs,
 			CompletedCount: batch.CompletedCount,
 			FailedCount:    batch.FailedCount,
+			TouchedCount:   batch.TouchedCount,
 			OnSuccess:      batch.OnSuccess,
 			OnComplete:     batch.OnComplete,
 			FinishedAt:     batch.FinishedAt,

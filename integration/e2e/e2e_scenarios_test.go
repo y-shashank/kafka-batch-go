@@ -196,7 +196,7 @@ func TestE2E_EventsTopicJobSuccess(t *testing.T) {
 	s.WaitBatch(ctx, batch.ID(), "success")
 }
 
-func TestE2E_PartialBatchCompleteAfterRetries(t *testing.T) {
+func TestE2E_PartialBatchComplete(t *testing.T) {
 	s := NewStack(t, baseHandlersStack, nil)
 	s.Start()
 	defer s.Stop()

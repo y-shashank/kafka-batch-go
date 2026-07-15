@@ -68,7 +68,6 @@ KafkaBatch.configure do |c|
     c.retry_tiers = tiers.transform_keys(&:to_sym).transform_values(&:to_i)
   end
   c.max_retries = cfg.fetch("max_retries", 2)
-  c.complete_after_retries = cfg.fetch("complete_after_retries", 1)
   c.handler_manifest_path = options[:manifest]
   c.skip_cancelled_jobs = cfg.fetch("skip_cancelled_jobs", true)
   c.fair_time_ready_ruby_topic = cfg["fairness_time_ready_ruby"]

@@ -21,7 +21,7 @@ type LoopHealth struct {
 
 // NewLoopHealth builds tick tracking for non-Kafka background loops.
 func NewLoopHealth(cfg config.Daemon) *LoopHealth {
-	maxStale := cfg.LivenessTTL * 2
+	maxStale := cfg.LivenessHeartbeatIntervalDuration() * 3
 	if maxStale < 60*time.Second {
 		maxStale = 60 * time.Second
 	}

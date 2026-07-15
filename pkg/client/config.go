@@ -17,8 +17,7 @@ type Config struct {
 
 	BatchTTL time.Duration
 
-	MaxRetries           int
-	CompleteAfterRetries int
+	MaxRetries int
 
 	UniqEnabled     bool
 	UniqLockTTL     time.Duration
@@ -63,11 +62,10 @@ type WorkerClassConfig struct {
 	JobType              string
 	Topic                string
 	ApplyTopicPrefix     bool
-	MaxRetries           int
-	CompleteAfterRetries int
-	RetryTier            string
-	FairnessType         string
-	Uniq                 bool
+	MaxRetries   int
+	RetryTier    string
+	FairnessType string
+	Uniq         bool
 }
 
 // DefaultConfig returns sensible local defaults.
@@ -82,7 +80,6 @@ func DefaultConfig() Config {
 		DeadLetterTopic:                 "kafka_batch.dead_letter",
 		BatchTTL:                        7 * 24 * time.Hour,
 		MaxRetries:                      7,
-		CompleteAfterRetries:            7,
 		UniqEnabled:                     true,
 		UniqLockTTL:                     7 * 24 * time.Hour,
 		UniqOnDuplicate:                 "skip",

@@ -114,7 +114,6 @@ RSpec.describe "Go daemon priority + consumption pause (integration)", :integrat
       "redis_url" => KafkaBatchSpec::RedisHelper::TEST_URL,
       "handler_manifest" => @manifest_path,
       "max_retries" => 2,
-      "complete_after_retries" => 1,
       "retry_tiers" => { "short" => 0, "medium" => 0, "large" => 0 },
       "priority_config_paths" => [@priority_path],
       "priority_lag_check_interval" => 1,

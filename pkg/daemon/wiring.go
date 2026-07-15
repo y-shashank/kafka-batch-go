@@ -78,9 +78,11 @@ func StartHealthServer(ctx context.Context, cfg config.Daemon, process string, c
 	}()
 }
 
-// NewConsumerHealth builds poll tracking for HTTP probes from daemon liveness settings.
+// NewConsumerHealth builds poll tracking for HTTP probes.
+// Uses heartbeat interval (not Redis TTL) so a 180s liveness_ttl does not make
+// Kafka poll probes wait many minutes.
 func NewConsumerHealth(cfg config.Daemon) *ConsumerHealth {
-	maxStale := cfg.LivenessTTL * 2
+	maxStale := cfg.LivenessHeartbeatIntervalDuration() * 3
 	if maxStale < 60*time.Second {
 		maxStale = 60 * time.Second
 	}
@@ -91,9 +93,18 @@ func NewLivenessReporter(cfg config.Daemon, rdb *redis.Client) *liveness.Reporte
 	if !cfg.LivenessEnabled || rdb == nil {
 		return nil
 	}
-	r := liveness.NewReporter(rdb, cfg.LivenessTTL)
+	r := liveness.NewReporter(rdb, cfg.LivenessTTLDuration())
+	r.HeartbeatEvery = cfg.LivenessHeartbeatIntervalDuration()
 	r.TrackRunningJobs = cfg.TrackRunningJobs
 	return r
+}
+
+// StartLivenessHeartbeatLoop starts the fixed-interval Redis heartbeat goroutine.
+func StartLivenessHeartbeatLoop(ctx context.Context, live *liveness.Reporter) {
+	if live == nil {
+		return
+	}
+	live.StartHeartbeatLoop(ctx)
 }
 
 func attachIngestLag(settings fairness.Settings, lag fairness.IngestLagCounter) fairness.Settings {

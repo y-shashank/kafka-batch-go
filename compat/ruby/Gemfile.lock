@@ -1,5 +1,5 @@
 PATH
-  remote: ../kafka-batch
+  remote: /Users/shashankyadav/Documents/punchh/kafka-batch
   specs:
     kafka-batch (0.0.3)
       connection_pool (>= 2.2)

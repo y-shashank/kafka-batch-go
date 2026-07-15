@@ -28,6 +28,7 @@ func TestRecordCompletionsBatchFinalizes(t *testing.T) {
 		"total_jobs", "2",
 		"completed_count", "0",
 		"failed_count", "0",
+		"touched_count", "0",
 		"status", "running",
 		"locked_at", now,
 		"on_success", "Cb",
@@ -60,6 +61,54 @@ func TestRecordCompletionsBatchFinalizes(t *testing.T) {
 	}
 }
 
+func TestRecordCompletionsExecutedThenSuccess(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mr.Close()
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := NewRedisStore(rdb, time.Hour)
+	ctx := context.Background()
+
+	batchID := "batch-touch"
+	now := time.Now().UTC().Format(time.RFC3339)
+	mr.HSet("kafka_batch:b:"+batchID,
+		"id", batchID, "total_jobs", "1", "completed_count", "0", "failed_count", "0",
+		"touched_count", "0", "status", "running", "locked_at", now,
+		"on_success", "Cb", "on_complete", "Cb",
+	)
+	mr.ZAdd("kafka_batch:index:running", 1, batchID)
+
+	res, err := st.RecordCompletionsBatch(ctx, []CompletionEvent{
+		{BatchID: batchID, JobID: "j1", Status: "executed", BatchSeq: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Finished) != 1 || res.Finished[0].Outcome != "complete" || !res.Finished[0].Early {
+		t.Fatalf("expected early complete, got %+v", res.Finished)
+	}
+	batch, _ := st.FindBatch(ctx, batchID)
+	if batch.Status != "running" || batch.TouchedCount != 1 || batch.CompletedCount != 0 {
+		t.Fatalf("after executed: %+v", batch)
+	}
+
+	res2, err := st.RecordCompletionsBatch(ctx, []CompletionEvent{
+		{BatchID: batchID, JobID: "j1", Status: "success", BatchSeq: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res2.Finished) != 1 || (res2.Finished[0].Outcome != "success" && res2.Finished[0].Outcome != "success_only") {
+		t.Fatalf("expected success callback, got %+v", res2.Finished)
+	}
+	batch, _ = st.FindBatch(ctx, batchID)
+	if batch.Status != "success" || batch.CompletedCount != 1 {
+		t.Fatalf("after success: %+v", batch)
+	}
+}
+
 func TestRecordCompletionsBatchDedup(t *testing.T) {
 	mr, err := miniredis.Run()
 	if err != nil {
@@ -71,7 +120,7 @@ func TestRecordCompletionsBatchDedup(t *testing.T) {
 	ctx := context.Background()
 
 	batchID := "batch-dedup"
-	mr.HSet("kafka_batch:b:"+batchID, "id", batchID, "total_jobs", "1", "completed_count", "0", "failed_count", "0", "status", "running", "locked_at", time.Now().UTC().Format(time.RFC3339))
+	mr.HSet("kafka_batch:b:"+batchID, "id", batchID, "total_jobs", "1", "completed_count", "0", "failed_count", "0", "touched_count", "0", "status", "running", "locked_at", time.Now().UTC().Format(time.RFC3339))
 	mr.ZAdd("kafka_batch:index:running", 1, batchID)
 
 	ev := CompletionEvent{BatchID: batchID, JobID: "j1", Status: "success", BatchSeq: 1}

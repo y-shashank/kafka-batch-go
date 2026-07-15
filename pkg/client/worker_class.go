@@ -52,15 +52,14 @@ func (wc WorkerClassConfig) toEntry(className string, cfg Config) config.Handler
 		applyPrefix = false
 	}
 	return config.HandlerEntry{
-		Runtime:              config.RuntimeRuby,
-		WorkerClass:          className,
-		Topic:                topic,
-		ApplyTopicPrefix:     applyPrefix,
-		MaxRetries:           wc.MaxRetries,
-		CompleteAfterRetries: wc.CompleteAfterRetries,
-		RetryTier:            wc.RetryTier,
-		FairnessType:         wc.FairnessType,
-		Uniq:                 wc.Uniq,
+		Runtime:          config.RuntimeRuby,
+		WorkerClass:      className,
+		Topic:            topic,
+		ApplyTopicPrefix: applyPrefix,
+		MaxRetries:       wc.MaxRetries,
+		RetryTier:        wc.RetryTier,
+		FairnessType:     wc.FairnessType,
+		Uniq:             wc.Uniq,
 	}
 }
 
@@ -92,15 +91,14 @@ func (c *Client) buildWorkerMessage(entry config.HandlerEntry, jobType, workerCl
 		payload = map[string]interface{}{}
 	}
 	msg := protocol.JobMessage{
-		JobID:                jobID,
-		BatchID:              batchID,
-		JobType:              jobType,
-		WorkerClass:          workerClass,
-		Payload:              payload,
-		Attempt:              0,
-		MaxRetries:           c.maxRetries(entry),
-		CompleteAfterRetries: c.completeAfter(entry),
-		EnqueuedAt:           protocol.NowISO(),
+		JobID:       jobID,
+		BatchID:     batchID,
+		JobType:     jobType,
+		WorkerClass: workerClass,
+		Payload:     payload,
+		Attempt:     0,
+		MaxRetries:  c.maxRetries(entry),
+		EnqueuedAt:  protocol.NowISO(),
 	}
 	if tid := opts.tenantID(""); tid != "" {
 		msg.TenantID = &tid

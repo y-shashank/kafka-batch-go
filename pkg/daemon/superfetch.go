@@ -18,12 +18,21 @@ import (
 // SuperFetchExecutor claims Redis ownership, Kafka-acks immediately, then runs
 // #perform on a bounded goroutine pool without blocking the poll loop.
 type SuperFetchExecutor struct {
-	Work       *workset.Store
-	ConsumerID string
-	LeaseTTL   time.Duration
-	Sem        chan struct{}
-	Process    func(ctx context.Context, raw []byte, src protocol.SourceCoords) (job.Outcome, error)
-	Apply      func(ctx context.Context, out job.Outcome) error
+	Work             *workset.Store
+	ConsumerID       string
+	LeaseTTL         time.Duration // working-set job key TTL (renewed during perform)
+	HeartbeatTTL     time.Duration // live:consumer:* TTL used for pod-alive checks
+	HeartbeatEvery   time.Duration // how often to refresh the heartbeat key
+	OrphanGrace      time.Duration // steal grace aligned with daemon reclaim
+	Sem              chan struct{}
+	Process          func(ctx context.Context, raw []byte, src protocol.SourceCoords) (job.Outcome, error)
+	Apply            func(ctx context.Context, out job.Outcome) error
+	heartbeatStarted sync.Once
+
+	// lifeCtx is the process/member lifetime (not the poll-scoped procCtx).
+	// #perform must outlive DispatchClaimsAndAcks — endProc cancels procCtx.
+	lifeMu  sync.Mutex
+	lifeCtx context.Context
 
 	inFlight sync.Map // job_id → struct{} while perform runs locally
 }
@@ -37,25 +46,90 @@ func NewSuperFetchExecutor(cfg config.Daemon, work *workset.Store, consumerID st
 	if lease <= 0 {
 		lease = 2 * time.Minute
 	}
-	return &SuperFetchExecutor{
-		Work:       work,
-		ConsumerID: consumerID,
-		LeaseTTL:   lease,
-		Sem:        make(chan struct{}, n),
-		Process:    process,
-		Apply:      apply,
+	grace := cfg.SuperFetchOrphanGrace
+	if grace <= 0 {
+		grace = workset.DefaultOrphanGrace
 	}
+	return &SuperFetchExecutor{
+		Work:           work,
+		ConsumerID:     consumerID,
+		LeaseTTL:       lease,
+		HeartbeatTTL:   cfg.LivenessTTLDuration(),
+		HeartbeatEvery: cfg.LivenessHeartbeatIntervalDuration(),
+		OrphanGrace:    grace,
+		Sem:            make(chan struct{}, n),
+		Process:        process,
+		Apply:          apply,
+	}
+}
+
+// BindLife pins the member lifetime context used by #perform / renew / heartbeat.
+// Must be called with the supervised consumer ctx (not a poll-scoped procCtx).
+func (e *SuperFetchExecutor) BindLife(ctx context.Context) {
+	if e == nil || ctx == nil {
+		return
+	}
+	e.lifeMu.Lock()
+	if e.lifeCtx == nil {
+		e.lifeCtx = ctx
+	}
+	life := e.lifeCtx
+	e.lifeMu.Unlock()
+	e.StartHeartbeatLoop(life)
+}
+
+func (e *SuperFetchExecutor) life() context.Context {
+	e.lifeMu.Lock()
+	defer e.lifeMu.Unlock()
+	if e.lifeCtx != nil {
+		return e.lifeCtx
+	}
+	return context.Background()
+}
+
+// StartHeartbeatLoop keeps the SuperFetch member id alive even when idle or
+// during long performs (independent of the Kafka poll path).
+func (e *SuperFetchExecutor) StartHeartbeatLoop(ctx context.Context) {
+	if e == nil || e.Work == nil {
+		return
+	}
+	e.heartbeatStarted.Do(func() {
+		interval := e.HeartbeatEvery
+		if interval <= 0 {
+			interval = 20 * time.Second
+		}
+		go func() {
+			if err := e.Work.TouchConsumer(ctx, e.ConsumerID, e.HeartbeatTTL); err != nil {
+				log.Printf("[kbatch-superfetch] heartbeat touch consumer=%s: %v", e.ConsumerID, err)
+			}
+			t := time.NewTicker(interval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					if err := e.Work.TouchConsumer(ctx, e.ConsumerID, e.HeartbeatTTL); err != nil {
+						log.Printf("[kbatch-superfetch] heartbeat touch consumer=%s: %v", e.ConsumerID, err)
+					}
+				}
+			}
+		}()
+	})
 }
 
 // DispatchClaimsAndAcks claims each record, marks the Kafka offset, and starts
 // perform in the background. Returns when all records in the batch are claimed
 // (or skipped) — does not wait for #perform to finish.
+//
+// ctx may be the poll-scoped procCtx (canceled when this function returns).
+// #perform uses BindLife's context so it is not canceled by endProc.
 func (e *SuperFetchExecutor) DispatchClaimsAndAcks(ctx context.Context, cl *kgo.Client, recs []*kgo.Record, group string) {
 	if e == nil || e.Work == nil {
 		return
 	}
-	// Heartbeat the workset consumer id (may differ from the shared liveness reporter id).
-	_ = e.Work.TouchConsumer(ctx, e.ConsumerID, e.LeaseTTL)
+	life := e.life()
+	e.StartHeartbeatLoop(life)
 	for _, rec := range recs {
 		select {
 		case <-ctx.Done():
@@ -64,8 +138,8 @@ func (e *SuperFetchExecutor) DispatchClaimsAndAcks(ctx context.Context, cl *kgo.
 		}
 		jobID := extractJobID(rec.Value)
 		if jobID == "" {
-			// Malformed — process synchronously for DLT then ack.
-			e.runLegacy(ctx, cl, rec, group)
+			// Malformed — process synchronously for DLT then ack (no Redis claim).
+			e.processMissingJobID(ctx, cl, rec, group)
 			<-e.Sem
 			continue
 		}
@@ -75,10 +149,11 @@ func (e *SuperFetchExecutor) DispatchClaimsAndAcks(ctx context.Context, cl *kgo.
 			<-e.Sem
 			continue
 		}
-		claim, err := e.Work.Claim(ctx, workset.ClaimParams{
+		claim, err := e.Work.Claim(life, workset.ClaimParams{
 			JobID: jobID, Payload: rec.Value, Topic: rec.Topic,
 			Partition: rec.Partition, Offset: rec.Offset,
 			ConsumerID: e.ConsumerID, LeaseTTL: e.LeaseTTL,
+			HeartbeatTTL: e.HeartbeatTTL, StealGrace: e.OrphanGrace,
 		})
 		if err != nil {
 			log.Printf("[kbatch-superfetch] claim error group=%s job_id=%s: %v — leaving unacked",
@@ -97,7 +172,7 @@ func (e *SuperFetchExecutor) DispatchClaimsAndAcks(ctx context.Context, cl *kgo.
 		}
 		// Durability: Redis owns the job before Kafka forgets it.
 		cl.MarkCommitRecords(rec)
-		go e.perform(ctx, rec, jobID, claim.Fence, group)
+		go e.perform(life, rec, jobID, claim.Fence, group)
 	}
 }
 
@@ -127,13 +202,20 @@ func (e *SuperFetchExecutor) perform(ctx context.Context, rec *kgo.Record, jobID
 			group, jobID, err)
 		return
 	}
-	if err := e.Work.Complete(ctx, jobID, e.ConsumerID, fence); err != nil {
-		log.Printf("[kbatch-superfetch] complete error group=%s job_id=%s: %v", group, jobID, err)
+	for i := 0; i < 5; i++ {
+		if err := e.Work.Complete(ctx, jobID, e.ConsumerID, fence); err != nil {
+			log.Printf("[kbatch-superfetch] complete error group=%s job_id=%s attempt=%d: %v",
+				group, jobID, i+1, err)
+			time.Sleep(time.Duration(i+1) * 50 * time.Millisecond)
+			continue
+		}
+		return
 	}
 }
 
 func (e *SuperFetchExecutor) startRenew(ctx context.Context, jobID, fence string) func() {
 	stop := make(chan struct{})
+	// Job-lease renew; member heartbeat is owned by StartHeartbeatLoop (every 20s).
 	interval := e.LeaseTTL / 3
 	if interval < 5*time.Second {
 		interval = 5 * time.Second
@@ -148,9 +230,15 @@ func (e *SuperFetchExecutor) startRenew(ctx context.Context, jobID, fence string
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				_ = e.Work.TouchConsumer(ctx, e.ConsumerID, e.LeaseTTL)
 				ok, err := e.Work.Renew(ctx, jobID, e.ConsumerID, fence, e.LeaseTTL)
-				if err != nil || !ok {
+				if err != nil {
+					// Transient Redis errors must not stop renew — lease expiry
+					// after Kafka ack would drop the job with no reclaim path.
+					log.Printf("[kbatch-superfetch] renew error job_id=%s: %v — will retry", jobID, err)
+					continue
+				}
+				if !ok {
+					log.Printf("[kbatch-superfetch] renew lost fence job_id=%s — stop renew", jobID)
 					return
 				}
 			}
@@ -159,15 +247,15 @@ func (e *SuperFetchExecutor) startRenew(ctx context.Context, jobID, fence string
 	return func() { close(stop) }
 }
 
-func (e *SuperFetchExecutor) runLegacy(ctx context.Context, cl *kgo.Client, rec *kgo.Record, group string) {
+func (e *SuperFetchExecutor) processMissingJobID(ctx context.Context, cl *kgo.Client, rec *kgo.Record, group string) {
 	src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
 	out, err := e.Process(ctx, rec.Value, src)
 	if err != nil {
-		log.Printf("[kbatch-superfetch] legacy process error group=%s: %v", group, err)
+		log.Printf("[kbatch-superfetch] missing job_id process error group=%s: %v", group, err)
 		return
 	}
 	if err := e.Apply(ctx, out); err != nil {
-		log.Printf("[kbatch-superfetch] legacy apply error group=%s: %v", group, err)
+		log.Printf("[kbatch-superfetch] missing job_id apply error group=%s: %v", group, err)
 		return
 	}
 	cl.MarkCommitRecords(rec)

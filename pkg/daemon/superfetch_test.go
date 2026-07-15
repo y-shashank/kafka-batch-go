@@ -112,6 +112,75 @@ func TestSuperFetchClaimAckBeforePerform(t *testing.T) {
 	t.Fatal("expected complete to clear ownership")
 }
 
+func TestSuperFetchPerformSurvivesPollCtxCancel(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	work := workset.NewStore(rdb)
+
+	var started sync.WaitGroup
+	started.Add(1)
+	release := make(chan struct{})
+	var performed int32
+
+	cfg := config.DefaultDaemon()
+	cfg.SuperFetchConcurrency = 2
+	cfg.SuperFetchLeaseTTL = time.Minute
+
+	life := context.Background()
+	exec := NewSuperFetchExecutor(cfg, work, "c-life",
+		func(ctx context.Context, raw []byte, src protocol.SourceCoords) (job.Outcome, error) {
+			if err := ctx.Err(); err != nil {
+				return job.Outcome{}, err
+			}
+			atomic.AddInt32(&performed, 1)
+			started.Done()
+			<-release
+			if err := ctx.Err(); err != nil {
+				return job.Outcome{}, err
+			}
+			return job.Outcome{CommitOffset: true}, nil
+		},
+		func(ctx context.Context, out job.Outcome) error { return nil },
+	)
+	exec.BindLife(life)
+
+	pollCtx, endProc := context.WithCancel(life)
+	rec := &kgo.Record{
+		Topic: "jobs", Partition: 0, Offset: 1,
+		Value: []byte(`{"job_id":"sf-life","job_type":"x"}`),
+	}
+	marker := &sfMarker{}
+	// Claim + mark + perform using poll ctx (as runGroupPollLoop does), then cancel.
+	exec.Sem <- struct{}{}
+	claim, err := work.Claim(life, workset.ClaimParams{
+		JobID: "sf-life", Payload: rec.Value, Topic: rec.Topic,
+		Partition: 0, Offset: 1, ConsumerID: "c-life", LeaseTTL: time.Minute, StealGrace: -1,
+	})
+	if err != nil || !claim.Won {
+		t.Fatalf("claim=%+v err=%v", claim, err)
+	}
+	marker.MarkCommitRecords(rec)
+	exec.inFlight.Store("sf-life", struct{}{})
+	go exec.perform(exec.life(), rec, "sf-life", claim.Fence, "g")
+	endProc() // simulate endProc() after Dispatch returns
+
+	started.Wait()
+	if atomic.LoadInt32(&performed) != 1 {
+		t.Fatal("perform should start despite poll ctx cancel")
+	}
+	close(release)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		ok, _ := work.StillOwned(life, "sf-life", "c-life", claim.Fence)
+		if !ok {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("expected Complete after perform despite canceled poll ctx")
+	_ = pollCtx
+}
+
 func TestSuperFetchSkipsDuplicateInFlight(t *testing.T) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})

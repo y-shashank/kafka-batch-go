@@ -95,7 +95,6 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
       "redis_url" => KafkaBatchSpec::RedisHelper::TEST_URL,
       "handler_manifest" => @manifest_path,
       "max_retries" => 2,
-      "complete_after_retries" => 1,
       "retry_tiers" => { "short" => 0, "medium" => 0, "large" => 0 },
       "schedule_poller_enabled" => true,
       "scheduled_topic" => @scheduled_topic,

@@ -107,7 +107,6 @@ KafkaBatch.configure do |c|
   tiers = cfg["retry_tiers"] || {}
   c.retry_tiers = tiers.transform_keys(&:to_sym).transform_values(&:to_i) unless tiers.empty?
   c.max_retries = cfg.fetch("max_retries", 2)
-  c.complete_after_retries = cfg.fetch("complete_after_retries", 1)
   c.handler_manifest_path = options[:manifest]
   c.scheduled_topic = cfg["scheduled_topic"] if cfg["scheduled_topic"]
   c.schedule_poller_enabled = cfg.fetch("schedule_poller_enabled", false)

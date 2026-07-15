@@ -75,8 +75,7 @@ func TestFairSlotSkipAfterCrashStillAdvancesBatch(t *testing.T) {
 		"payload":                map[string]interface{}{},
 		"attempt":                0,
 		"max_retries":            3,
-		"complete_after_retries": 3,
-		"batch_seq":              seq,
+		"batch_seq": seq,
 		// fair-slot metadata as stamped by the forwarder (markSlot).
 		"_fair_slot":    true,
 		"_fair_slot_id": slotID,
@@ -145,7 +144,7 @@ func TestFairSlotSkipDefersWhileHolderLeaseIsLive(t *testing.T) {
 	raw, _ := json.Marshal(map[string]interface{}{
 		"job_id": "j-dup", "batch_id": batchID, "job_type": "test.fairskip",
 		"worker_class": "go:test.fairskip", "payload": map[string]interface{}{},
-		"attempt": 0, "max_retries": 3, "complete_after_retries": 3, "batch_seq": seq,
+		"attempt": 0, "max_retries": 3, "batch_seq": seq,
 		"_fair_slot": true, "_fair_slot_id": slotID, "_fair_type": "time", "tenant_id": "acme",
 	})
 

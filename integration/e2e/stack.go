@@ -124,9 +124,8 @@ type handlerYAML struct {
 	Runtime              string `yaml:"runtime"`
 	Topic                string `yaml:"topic,omitempty"`
 	ApplyTopicPrefix     bool   `yaml:"apply_topic_prefix,omitempty"`
-	MaxRetries           int    `yaml:"max_retries,omitempty"`
-	CompleteAfterRetries int    `yaml:"complete_after_retries,omitempty"`
-	FairnessType         string `yaml:"fairness_type,omitempty"`
+	MaxRetries   int    `yaml:"max_retries,omitempty"`
+	FairnessType string `yaml:"fairness_type,omitempty"`
 	WorkerClass          string `yaml:"worker_class,omitempty"`
 	Uniq                 bool   `yaml:"uniq,omitempty"`
 }
@@ -147,7 +146,6 @@ type daemonYAML struct {
 	RedisURL                    string         `yaml:"redis_url"`
 	HandlerManifest             string         `yaml:"handler_manifest"`
 	MaxRetries                  int            `yaml:"max_retries"`
-	CompleteAfterRetries        int            `yaml:"complete_after_retries"`
 	RetryTiers                  map[string]int `yaml:"retry_tiers"`
 	SchedulePollerEnabled       bool           `yaml:"schedule_poller_enabled,omitempty"`
 	FairnessEnabled             bool           `yaml:"fairness_enabled,omitempty"`
@@ -191,9 +189,8 @@ func (s *Stack) writeConfig(extra func(*Stack, *daemonYAML)) {
 		RetryTopic:           s.RetryBase,
 		RedisURL:             s.Redis,
 		HandlerManifest:      s.ManifestPath,
-		MaxRetries:           2,
-		CompleteAfterRetries: 1,
-		RetryTiers:           map[string]int{"short": 0, "medium": 0, "large": 0},
+		MaxRetries: 2,
+		RetryTiers: map[string]int{"short": 0, "medium": 0, "large": 0},
 	}
 	if extra != nil {
 		extra(s, &cfg)
@@ -300,6 +297,8 @@ func (s *Stack) startGoControl(mode ExecMode) {
 	s.daemonPID = exec.Command(daemonBin, "--config", s.ConfigPath, "--manifest", s.ManifestPath)
 	s.daemonPID.Env = env
 	s.daemonPID.Dir = repoRoot()
+	s.daemonPID.Stdout = os.Stderr
+	s.daemonPID.Stderr = os.Stderr
 	if err := s.daemonPID.Start(); err != nil {
 		s.T.Fatalf("start daemon: %v", err)
 	}
@@ -310,6 +309,8 @@ func (s *Stack) startGoControl(mode ExecMode) {
 		s.workerPID = exec.Command(workerBin, "--config", s.ConfigPath, "--manifest", s.ManifestPath)
 		s.workerPID.Env = env
 		s.workerPID.Dir = repoRoot()
+		s.workerPID.Stdout = os.Stderr
+		s.workerPID.Stderr = os.Stderr
 		if err := s.workerPID.Start(); err != nil {
 			s.stopDaemon()
 			s.T.Fatalf("start go worker: %v", err)
@@ -679,7 +680,7 @@ func baseHandlers(workerTopic string) map[string]handlerYAML {
 			Runtime: "go", Topic: workerTopic, MaxRetries: 2,
 		},
 		"integration.go_always_fail": {
-			Runtime: "go", Topic: workerTopic, MaxRetries: 1, CompleteAfterRetries: 1,
+			Runtime: "go", Topic: workerTopic, MaxRetries: 1,
 		},
 		"integration.go_multi": {
 			Runtime: "go", Topic: workerTopic, MaxRetries: 1,
@@ -724,7 +725,7 @@ func baseHandlers(workerTopic string) map[string]handlerYAML {
 		},
 		"integration.ruby_always_fail": {
 			Runtime: "ruby", Topic: workerTopic + ".ruby", WorkerClass: "RubyAlwaysFailWorker", ApplyTopicPrefix: false,
-			MaxRetries: 1, CompleteAfterRetries: 1,
+			MaxRetries: 1,
 		},
 	}
 }
