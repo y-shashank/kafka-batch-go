@@ -43,7 +43,8 @@ type Daemon struct {
 	// PriorityConsumerConcurrency is in-process group members per priority group.
 	PriorityConsumerConcurrency int
 	// SuperFetchConcurrency is the per-member goroutine pool size for in-flight
-	// #perform after Redis claim + Kafka ack (always-on SuperFetch).
+	// #perform after Redis claim + Kafka ack (always-on SuperFetch). Default 10;
+	// raise for IO-bound work (true Go parallelism). See README tuning profiles.
 	SuperFetchConcurrency int
 	// SuperFetchLeaseTTL is the Redis working-set TTL renewed during #perform.
 	SuperFetchLeaseTTL time.Duration
@@ -172,7 +173,7 @@ func DefaultDaemon() Daemon {
 		JobsConsumerConcurrency:           8,
 		FairReadyConsumerConcurrency:      8,
 		PriorityConsumerConcurrency:       4,
-		SuperFetchConcurrency:             32,
+		SuperFetchConcurrency:             10,
 		SuperFetchLeaseTTL:                2 * time.Minute,
 		SuperFetchReclaimEvery:            30 * time.Second,
 		SuperFetchReclaimLimit:            100,

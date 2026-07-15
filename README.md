@@ -632,7 +632,7 @@ jobs_consumer_members × super_fetch_concurrency
   (+ same formula per fair-ready lane and priority group)
 ```
 
-Set **member count ≈ topic partition count** for balanced lag. Raise **`super_fetch_concurrency`** (default `32`) when jobs are slow and you want more in-flight performs per member.
+Set **member count ≈ topic partition count** for balanced lag. Default **`super_fetch_concurrency` is `10`**; raise it for IO-bound work (Go has true parallelism — see [tuning profiles](#tuning-profiles) below).
 
 #### Control plane (`kbatch daemon`)
 
@@ -662,7 +662,7 @@ Raise these when messages are large or brokers are far away and polls return too
 | `KAFKA_BATCH_JOBS_CONSUMER_CONCURRENCY` | `jobs_consumer_concurrency` | `8` | In-process members for `{group}-go-worker-jobs` (plain go topics). |
 | `KAFKA_BATCH_FAIR_READY_CONSUMER_CONCURRENCY` | `fair_ready_consumer_concurrency` | `8` | In-process members **per** fair-ready lane (`time`, `throughput`). |
 | `KAFKA_BATCH_PRIORITY_CONSUMER_CONCURRENCY` | `priority_consumer_concurrency` | `4` | In-process members **per** priority YAML group. |
-| `KAFKA_BATCH_SUPER_FETCH_CONCURRENCY` | `super_fetch_concurrency` | `32` | Goroutine pool size **per member** for in-flight performs (claim → ack → pool). |
+| `KAFKA_BATCH_SUPER_FETCH_CONCURRENCY` | `super_fetch_concurrency` | `10` | Goroutine pool size **per member** for in-flight performs (claim → ack → pool). Try higher for IO — see [tuning profiles](#tuning-profiles). |
 | — | `super_fetch_orphan_grace` | `40` | Seconds after claim before a missing heartbeat counts as death (reclaim/steal). |
 | `KAFKA_BATCH_PRODUCER_REQUIRED_ACKS` | `producer_required_acks` | `all_isr` | Same as daemon — event emission after job completion. |
 
@@ -689,16 +689,26 @@ priority_consumer_concurrency: 8
 producer_required_acks: all_isr
 ```
 
-**Long / I/O-heavy jobs** (seconds–30m, HTTP, DB, object storage):
+**`super_fetch_concurrency` guidance (Go has true parallelism)**
 
-- SuperFetch is the right model: Kafka delivers; Redis owns completion.
-- Example: `jobs_consumer_concurrency: 8`, `super_fetch_concurrency: 64` → up to **512** in-flight performs across members (bounded by pool + lag).
-- Handlers should stay idempotent — reclaim after death can re-run a job.
+Defaults start at **`10`**. Because goroutines run in parallel across cores, scale the pool with **CPU cores × per-core target**, then validate under load.
 
-**CPU-heavy short jobs**:
+Per **1 CPU core** (multiply by `N` on an `N`-core pod → `N × per-core value`):
 
-- Size `super_fetch_concurrency` near logical CPUs per member.
-- Example on 8-core pod: `jobs_consumer_concurrency: 8`, `super_fetch_concurrency: 8`.
+| Workload | Per-core `super_fetch_concurrency` | Notes |
+|----------|-------------------------------------|--------|
+| I/O-bound (HTTP, DB, object storage, seconds–30m) | try **~50** | SuperFetch shines here; Redis owns completion while Kafka offsets advance |
+| Light CPU + some waiting | **5–10** (default band) | Good starting point for mixed handlers |
+| Very CPU-intensive | **1–2** | Avoid oversubscription; prefer more members/pods if lag grows |
+
+Examples:
+
+- 1-core pod, IO jobs: `super_fetch_concurrency: 50`
+- 4-core pod, IO jobs: `super_fetch_concurrency: 200` (`4 × 50`)
+- 8-core pod, light CPU: `jobs_consumer_concurrency: 8`, `super_fetch_concurrency: 10` → up to **80** in-flight across members
+- 8-core pod, heavy CPU: `super_fetch_concurrency: 8`–`16` (`1`–`2` × cores), not hundreds
+
+Handlers should stay idempotent — reclaim after death can re-run a job.
 
 **Mixed fleets** — separate handler topics / worker deployments with different `super_fetch_concurrency` rather than one global pool size.
 

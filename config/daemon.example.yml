@@ -91,7 +91,7 @@ retry_tiers:                         # tier => delay seconds (topics: retry.{tie
 jobs_consumer_concurrency: 8
 # fair_ready_consumer_concurrency: 8
 # priority_consumer_concurrency: 4
-# super_fetch_concurrency: 32               # in-flight #perform pool per member
+# super_fetch_concurrency: 10               # in-flight #perform pool per member (try higher for IO)
 
 # ── Delayed jobs — perform_in / perform_at (daemon only) ─────────────────────
 

@@ -193,7 +193,7 @@ func TestDefaultDaemonConsumerConcurrency(t *testing.T) {
 	if cfg.PriorityConsumerMembers() != 4 {
 		t.Fatalf("priority members=%d", cfg.PriorityConsumerMembers())
 	}
-	if cfg.SuperFetchWorkers() != 32 {
+	if cfg.SuperFetchWorkers() != 10 {
 		t.Fatalf("superfetch workers=%d", cfg.SuperFetchWorkers())
 	}
 	if cfg.LivenessTTLDuration() != 180*time.Second {
