@@ -3,6 +3,7 @@ package callback
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -88,6 +89,56 @@ func TestProcessSkipsWhenAlreadyDispatched(t *testing.T) {
 	}
 	if len(inv.calls) != 0 {
 		t.Fatalf("expected no invoke, got %+v", inv.calls)
+	}
+}
+
+type countingInvoker struct {
+	n int32
+}
+
+func (c *countingInvoker) Invoke(_ context.Context, _ protocol.CallbackMessage) error {
+	atomic.AddInt32(&c.n, 1)
+	return nil
+}
+
+func TestProcessClaimBeforeInvokeSingleWinner(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := store.NewRedisStore(rdb, time.Hour)
+
+	batchID := "cb-race"
+	now := time.Now().UTC().Format(time.RFC3339)
+	mr.HSet("kafka_batch:b:"+batchID,
+		"id", batchID, "status", "success", "total_jobs", "1",
+		"completed_count", "1", "failed_count", "0", "locked_at", now,
+	)
+	mr.ZAdd("kafka_batch:index:done", 1, batchID)
+
+	inv := &countingInvoker{}
+	raw, _ := json.Marshal(protocol.CallbackMessage{
+		BatchID: batchID, Outcome: "success", TotalJobs: 1, CompletedCount: 1,
+	})
+
+	const n = 8
+	done := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			p := &Processor{Store: st, Invoker: inv, NodeID: fmt.Sprintf("node-%d", i)}
+			_, err := p.Process(context.Background(), raw)
+			done <- err
+		}(i)
+	}
+	for i := 0; i < n; i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := atomic.LoadInt32(&inv.n); got != 1 {
+		t.Fatalf("expected exactly one invoke, got %d", got)
+	}
+	dispatched, err := st.CallbackDispatched(context.Background(), batchID)
+	if err != nil || !dispatched {
+		t.Fatalf("dispatched=%v err=%v", dispatched, err)
 	}
 }
 

@@ -142,8 +142,11 @@ func (p *Poller) produceDue(ctx context.Context, raw []byte, jobID string) bool 
 	}
 	route, err := p.Router.Route(data)
 	if err != nil {
+		// Permanent misconfig (unknown job_type / fairness lane). Do not silent-drop:
+		// park on DLT then ACK. If DLT is unset or produce fails, leave the lease so
+		// reclaim retries after ops fix the route (or DLT recovers).
 		log.Printf("[kbatch-schedule] route job_id=%s: %v", jobID, err)
-		return true
+		return p.parkRouteError(ctx, jobID, raw, data, err)
 	}
 	key := route.Key
 	if key == "" {
@@ -173,6 +176,41 @@ func (p *Poller) produceDue(ctx context.Context, raw []byte, jobID string) bool 
 		}
 	}
 	instrument.ScheduledDispatched(jobID, batchID, workerClass, route.Topic)
+	return true
+}
+
+// parkRouteError publishes an unroutable scheduled job to the dead-letter topic
+// and returns true (ACK) on success. Returns false to keep the inflight lease
+// when DLT is unavailable so the job is not silently deleted from the index.
+func (p *Poller) parkRouteError(ctx context.Context, jobID string, raw []byte, data map[string]interface{}, routeErr error) bool {
+	if p.Cfg.DeadLetterTopic == "" || p.Producer == nil {
+		log.Printf("[kbatch-schedule] route error job_id=%s — leaving leased (no dead_letter_topic)", jobID)
+		return false
+	}
+	batchID, _ := data["batch_id"].(string)
+	workerClass, _ := data["worker_class"].(string)
+	if workerClass == "" {
+		if jt, ok := data["job_type"].(string); ok {
+			workerClass = jt
+		}
+	}
+	dlt := map[string]interface{}{
+		"job_id":            jobID,
+		"batch_id":          batchID,
+		"worker_class":      workerClass,
+		"dlt_type":          "schedule_route_error",
+		"dlt_error_message": routeErr.Error(),
+		"dlt_raw_payload":   string(raw),
+	}
+	rawDLT, err := json.Marshal(dlt)
+	if err != nil {
+		return false
+	}
+	if err := p.Producer.Produce(ctx, p.Cfg.DeadLetterTopic, jobID, rawDLT); err != nil {
+		log.Printf("[kbatch-schedule] DLT produce failed job_id=%s: %v — leaving leased", jobID, err)
+		return false
+	}
+	instrument.DLTPublished(jobID, batchID, "schedule_route_error", p.Cfg.ScheduledTopic)
 	return true
 }
 

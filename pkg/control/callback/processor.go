@@ -64,39 +64,51 @@ func (p *Processor) Process(ctx context.Context, raw []byte) (Outcome, error) {
 	if cb.BatchID == "" {
 		return out, nil
 	}
+	// Fast path: skip Redis claim when another consumer already won.
 	dispatched, err := p.Store.CallbackDispatched(ctx, cb.BatchID)
 	if err != nil {
+		out.CommitOffset = false
 		return out, err
 	}
 	if dispatched {
 		return out, nil
 	}
-	if p.Invoker != nil {
-		if err := p.Invoker.Invoke(ctx, cb); err != nil {
-			log.Printf("[kbatch-daemon] callback invoke batch_id=%s: %v", cb.BatchID, err)
-			method := callbackMethod(cb)
-			class := callbackClass(cb, method)
-			instrument.CallbackFailed(cb.BatchID, class, method, err.Error(), err.Error())
-			if p.DLT != nil {
-				dlt := map[string]interface{}{
-					"batch_id":          cb.BatchID,
-					"dlt_type":          "callback_error",
-					"dlt_error_message": err.Error(),
-					"on_success":        cb.OnSuccess,
-					"on_complete":       cb.OnComplete,
-					"outcome":           cb.Outcome,
-				}
-				rawDLT, _ := json.Marshal(dlt)
-				_ = p.DLT.ProduceDLT(ctx, cb.BatchID, rawDLT)
-				instrument.DLTPublished("", cb.BatchID, "callback_error", "callbacks")
-			}
-		} else {
-			method := callbackMethod(cb)
-			class := callbackClass(cb, method)
-			instrument.CallbackInvoked(cb.BatchID, class, method)
-		}
+	// Claim BEFORE invoke so two consumers cannot both fire side effects.
+	// HSETNX on callback_dispatched_at is the single-winner fence.
+	won, err := p.Store.ClaimCallback(ctx, cb.BatchID, p.NodeID)
+	if err != nil {
+		out.CommitOffset = false
+		return out, err
 	}
-	_, _ = p.Store.ClaimCallback(ctx, cb.BatchID, p.NodeID)
+	if !won {
+		return out, nil
+	}
+	if p.Invoker == nil {
+		return out, nil
+	}
+	if err := p.Invoker.Invoke(ctx, cb); err != nil {
+		log.Printf("[kbatch-daemon] callback invoke batch_id=%s: %v", cb.BatchID, err)
+		method := callbackMethod(cb)
+		class := callbackClass(cb, method)
+		instrument.CallbackFailed(cb.BatchID, class, method, err.Error(), err.Error())
+		if p.DLT != nil {
+			dlt := map[string]interface{}{
+				"batch_id":          cb.BatchID,
+				"dlt_type":          "callback_error",
+				"dlt_error_message": err.Error(),
+				"on_success":        cb.OnSuccess,
+				"on_complete":       cb.OnComplete,
+				"outcome":           cb.Outcome,
+			}
+			rawDLT, _ := json.Marshal(dlt)
+			_ = p.DLT.ProduceDLT(ctx, cb.BatchID, rawDLT)
+			instrument.DLTPublished("", cb.BatchID, "callback_error", "callbacks")
+		}
+		return out, nil
+	}
+	method := callbackMethod(cb)
+	class := callbackClass(cb, method)
+	instrument.CallbackInvoked(cb.BatchID, class, method)
 	return out, nil
 }
 

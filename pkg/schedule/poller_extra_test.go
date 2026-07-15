@@ -3,6 +3,7 @@ package schedule
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -151,6 +152,100 @@ func TestPollerProduceDuePartitioned(t *testing.T) {
 type staticRouter struct{ route Route }
 
 func (s staticRouter) Route(map[string]interface{}) (Route, error) { return s.route, nil }
+
+type errRouter struct{ err error }
+
+func (e errRouter) Route(map[string]interface{}) (Route, error) { return Route{}, e.err }
+
+func TestPollerTickRouteErrorParksOnDLT(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	redisStore := NewRedisStore(rdb, 100)
+	ctx := context.Background()
+	now := time.Unix(800, 0)
+	if err := redisStore.Schedule(ctx, "j-route", now.Add(-time.Second), 3, 1); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"job_id":"j-route","job_type":"missing","worker_class":"go:missing"}`)
+	reader := &stubReader{found: map[string][]byte{"3:1": payload}}
+
+	var dltTopic, dltKey string
+	var dltBody []byte
+	poller := &Poller{
+		Cfg: config.Daemon{
+			ScheduleLeaseSeconds: 60,
+			ScheduleBatchSize:    10,
+			DeadLetterTopic:      "kafka_batch.dead_letter",
+			ScheduledTopic:       "kafka_batch.scheduled",
+		},
+		Store:  redisStore,
+		Reader: reader,
+		Producer: producerFunc(func(_ context.Context, topic, key string, body []byte) error {
+			dltTopic, dltKey, dltBody = topic, key, append([]byte(nil), body...)
+			return nil
+		}),
+		Router: errRouter{err: errors.New("no route for job_type=\"missing\"")},
+		Now:    func() time.Time { return now },
+	}
+	n, err := poller.Tick(ctx)
+	if err != nil || n != 1 {
+		t.Fatalf("tick n=%d err=%v", n, err)
+	}
+	if dltTopic != "kafka_batch.dead_letter" || dltKey != "j-route" {
+		t.Fatalf("dlt topic=%q key=%q", dltTopic, dltKey)
+	}
+	if !containsAll(string(dltBody), "schedule_route_error", "j-route") {
+		t.Fatalf("dlt body=%s", dltBody)
+	}
+	inflight, err := rdb.ZCard(ctx, inflightKey).Result()
+	if err != nil || inflight != 0 {
+		t.Fatalf("expected ACK after DLT, inflight=%d err=%v", inflight, err)
+	}
+}
+
+func TestPollerTickRouteErrorLeavesLeaseWhenDLTFails(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	redisStore := NewRedisStore(rdb, 100)
+	ctx := context.Background()
+	now := time.Unix(900, 0)
+	if err := redisStore.Schedule(ctx, "j-route2", now.Add(-time.Second), 4, 2); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"job_id":"j-route2","job_type":"missing"}`)
+	reader := &stubReader{found: map[string][]byte{"4:2": payload}}
+	poller := &Poller{
+		Cfg: config.Daemon{
+			ScheduleLeaseSeconds: 60,
+			ScheduleBatchSize:    10,
+			DeadLetterTopic:      "kafka_batch.dead_letter",
+		},
+		Store:  redisStore,
+		Reader: reader,
+		Producer: producerFunc(func(context.Context, string, string, []byte) error {
+			return errors.New("broker down")
+		}),
+		Router: errRouter{err: errors.New("no route")},
+		Now:    func() time.Time { return now },
+	}
+	n, err := poller.Tick(ctx)
+	if err != nil || n != 0 {
+		t.Fatalf("tick n=%d err=%v", n, err)
+	}
+	inflight, err := rdb.ZCard(ctx, inflightKey).Result()
+	if err != nil || inflight != 1 {
+		t.Fatalf("expected inflight lease retained, zcard=%d err=%v", inflight, err)
+	}
+}
+
+func containsAll(s string, parts ...string) bool {
+	for _, p := range parts {
+		if !strings.Contains(s, p) {
+			return false
+		}
+	}
+	return true
+}
 
 type partitionedProducerFunc func(context.Context, string, string, []byte, int32) error
 
