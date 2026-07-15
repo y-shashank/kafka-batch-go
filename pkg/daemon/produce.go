@@ -48,6 +48,22 @@ func produceEventWithRetry(ctx context.Context, cfg config.Daemon, prod kafkaPro
 }
 
 func applyJobOutcome(ctx context.Context, cfg config.Daemon, prod kafkaProducer, out job.Outcome) error {
+	if err := applyJobSideEffects(ctx, cfg, prod, out); err != nil {
+		return err
+	}
+	if !out.CommitOffset {
+		return fmt.Errorf("job not committed")
+	}
+	return nil
+}
+
+// ApplyJobSideEffects publishes event/retry/DLT without gating on CommitOffset.
+// Used by SuperFetch after the Kafka offset is already acked.
+func ApplyJobSideEffects(ctx context.Context, cfg config.Daemon, prod kafkaProducer, out job.Outcome) error {
+	return applyJobSideEffects(ctx, cfg, prod, out)
+}
+
+func applyJobSideEffects(ctx context.Context, cfg config.Daemon, prod kafkaProducer, out job.Outcome) error {
 	if out.Event != nil {
 		if err := produceEventWithRetry(ctx, cfg, prod, out.Event); err != nil {
 			return err
@@ -62,9 +78,6 @@ func applyJobOutcome(ctx context.Context, cfg config.Daemon, prod kafkaProducer,
 		if err := prod.Produce(ctx, cfg.DeadLetterTopic, out.DLTKey, out.DLTPayload); err != nil {
 			return err
 		}
-	}
-	if !out.CommitOffset {
-		return fmt.Errorf("job not committed")
 	}
 	return nil
 }

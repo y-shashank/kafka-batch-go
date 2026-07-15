@@ -19,7 +19,9 @@ import (
 	"github.com/y-shashank/kafka-batch-go/pkg/kbatch"
 	"github.com/y-shashank/kafka-batch-go/pkg/metrics"
 	"github.com/y-shashank/kafka-batch-go/pkg/priority"
+	"github.com/y-shashank/kafka-batch-go/pkg/protocol"
 	"github.com/y-shashank/kafka-batch-go/pkg/store"
+	"github.com/y-shashank/kafka-batch-go/pkg/workset"
 )
 
 // Run starts the Go backend worker: plain go job topics + go fair ready topics.
@@ -124,7 +126,12 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	}
 	defer closeFailures()
 	jobProc.Failures = failures
-	live := daemon.NewLivenessReporter(cfg, rdb)
+	// SuperFetch reclaim requires consumer heartbeats; force a reporter when enabled.
+	liveCfg := cfg
+	if cfg.SuperFetchEnabled {
+		liveCfg.LivenessEnabled = true
+	}
+	live := daemon.NewLivenessReporter(liveCfg, rdb)
 	jobProc.Liveness = live
 	handleJob := daemon.BuildJobHandler(cfg, prod, jobProc)
 	pauseCtl, _, closePauseCtl, err := daemon.BuildPauseControl(cfg, rdb)
@@ -142,12 +149,30 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	processWorkers := cfg.JobProcessWorkers()
 	fetch := cfg.ConsumerFetchSettings()
 
+	var work *workset.Store
+	var newSF func(consumerID string) *daemon.SuperFetchExecutor
+	if cfg.SuperFetchEnabled {
+		work = workset.NewStore(rdb)
+		newSF = func(consumerID string) *daemon.SuperFetchExecutor {
+			return daemon.NewSuperFetchExecutor(cfg, work, consumerID,
+				func(ctx context.Context, raw []byte, src protocol.SourceCoords) (job.Outcome, error) {
+					return jobProc.Process(ctx, raw, src)
+				},
+				func(ctx context.Context, out job.Outcome) error {
+					return daemon.ApplyJobSideEffects(ctx, cfg, prod, out)
+				},
+			)
+		}
+		log.Printf("kbatch go-worker superfetch enabled concurrency=%d lease_ttl=%s",
+			cfg.SuperFetchWorkers(), cfg.SuperFetchLeaseTTL)
+	}
+
 	if len(jobTopics) > 0 {
 		jobsGroup := group + "-jobs"
-		daemon.RunConcurrentConsumerGroupMembers(ctx, cfg.JobsConsumerMembers(), processWorkers,
-			cfg.Brokers, jobsGroup, jobTopics, fetch, handleJob, consumerHealth, pauseCtl, live)
-		log.Printf("kbatch go-worker jobs group=%s members=%d process_workers=%d topics=%v",
-			jobsGroup, cfg.JobsConsumerMembers(), processWorkers, jobTopics)
+		daemon.RunSuperFetchConsumerGroupMembers(ctx, cfg.JobsConsumerMembers(), processWorkers,
+			cfg.Brokers, jobsGroup, jobTopics, fetch, handleJob, newSF, consumerHealth, pauseCtl, live)
+		log.Printf("kbatch go-worker jobs group=%s members=%d process_workers=%d superfetch=%v topics=%v",
+			jobsGroup, cfg.JobsConsumerMembers(), processWorkers, cfg.SuperFetchEnabled, jobTopics)
 	}
 
 	lagClient, err := kgo.NewClient(kgo.SeedBrokers(cfg.Brokers...))
@@ -159,22 +184,22 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	for _, pc := range goPrio {
 		gate := priority.NewGate(priorityLag, cfg.PriorityLagCheckInterval)
 		gate.Consumption = pauseCtl
-		daemon.RunPriorityGroupMembers(ctx, cfg.PriorityConsumerMembers(), processWorkers,
-			cfg, pc, gate, handleJob, consumerHealth, pauseCtl, live)
+		daemon.RunPriorityGroupMembersSuperFetch(ctx, cfg.PriorityConsumerMembers(), processWorkers,
+			cfg, pc, gate, handleJob, newSF, consumerHealth, pauseCtl, live)
 	}
 
 	for _, spec := range fairReadyTopics {
 		readyGroup := cfg.GoWorkerFairReadyGroup(spec.lane)
-		daemon.RunConcurrentConsumerGroupMembers(ctx, cfg.FairReadyConsumerMembers(), processWorkers,
-			cfg.Brokers, readyGroup, []string{spec.topic}, fetch, handleJob, consumerHealth, pauseCtl, live)
-		log.Printf("kbatch go-worker fair-ready group=%s members=%d process_workers=%d topic=%s",
-			readyGroup, cfg.FairReadyConsumerMembers(), processWorkers, spec.topic)
+		daemon.RunSuperFetchConsumerGroupMembers(ctx, cfg.FairReadyConsumerMembers(), processWorkers,
+			cfg.Brokers, readyGroup, []string{spec.topic}, fetch, handleJob, newSF, consumerHealth, pauseCtl, live)
+		log.Printf("kbatch go-worker fair-ready group=%s members=%d process_workers=%d superfetch=%v topic=%s",
+			readyGroup, cfg.FairReadyConsumerMembers(), processWorkers, cfg.SuperFetchEnabled, spec.topic)
 	}
 
-	log.Printf("kbatch go-worker running group=%s plain=%v priority_groups=%d fair_ready=%v members(jobs=%d fair=%d prio=%d) process_workers=%d fetch_max_bytes=%d fetch_max_partition_bytes=%d fetch_max_wait=%s",
+	log.Printf("kbatch go-worker running group=%s plain=%v priority_groups=%d fair_ready=%v members(jobs=%d fair=%d prio=%d) process_workers=%d superfetch=%v fetch_max_bytes=%d fetch_max_partition_bytes=%d fetch_max_wait=%s",
 		group, jobTopics, len(goPrio), fairReadyTopicNames(fairReadyTopics),
 		cfg.JobsConsumerMembers(), cfg.FairReadyConsumerMembers(), cfg.PriorityConsumerMembers(), processWorkers,
-		fetch.MaxBytes, fetch.MaxPartitionBytes, fetch.MaxWait)
+		cfg.SuperFetchEnabled, fetch.MaxBytes, fetch.MaxPartitionBytes, fetch.MaxWait)
 	if ready := os.Getenv("KBATCH_WORKER_READY_FILE"); ready != "" {
 		_ = os.WriteFile(ready, []byte("ok\n"), 0o644)
 	}

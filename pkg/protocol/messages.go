@@ -36,6 +36,8 @@ type JobMessage struct {
 	RetryAfter           string                 `json:"retry_after,omitempty"`
 	RetryTo              string                 `json:"retry_to,omitempty"`
 	UniqFP               string                 `json:"_uniq_fp,omitempty"`
+	// Reclaim is set when the working-set reconciler re-produces a dead consumer's job.
+	Reclaim bool `json:"_reclaim,omitempty"`
 }
 
 // EventMessage is produced to the events topic after job completion.

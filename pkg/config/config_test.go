@@ -196,6 +196,12 @@ func TestDefaultDaemonConsumerConcurrency(t *testing.T) {
 	if cfg.JobProcessWorkers() != 1 {
 		t.Fatalf("job process workers=%d", cfg.JobProcessWorkers())
 	}
+	if !cfg.SuperFetchEnabled {
+		t.Fatal("expected SuperFetchEnabled default true")
+	}
+	if cfg.SuperFetchWorkers() != 32 {
+		t.Fatalf("superfetch workers=%d", cfg.SuperFetchWorkers())
+	}
 }
 
 func TestDefaultDaemonConsumerFetchSettings(t *testing.T) {

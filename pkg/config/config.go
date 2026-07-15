@@ -44,8 +44,20 @@ type Daemon struct {
 	// PriorityConsumerConcurrency is in-process group members per priority group.
 	PriorityConsumerConcurrency int
 	// JobProcessConcurrency is parallel job executions per poll per consumer member
-	// (Karafka concurrency equivalent). 1 = serial within each poll loop.
+	// when SuperFetch is disabled (Karafka concurrency). 1 = serial; >1 is unsafe
+	// for mark-commit gaps — prefer SuperFetch instead.
 	JobProcessConcurrency int
+	// SuperFetchEnabled claims Redis ownership then Kafka-acks before #perform so
+	// a process can run many long jobs (seconds–30m) from one partition.
+	SuperFetchEnabled bool
+	// SuperFetchConcurrency is the per-member goroutine pool size when SuperFetch is on.
+	SuperFetchConcurrency int
+	// SuperFetchLeaseTTL is the Redis working-set TTL renewed during #perform.
+	SuperFetchLeaseTTL time.Duration
+	// SuperFetchReclaimEvery is how often the daemon scans for orphaned working-set jobs.
+	SuperFetchReclaimEvery time.Duration
+	// SuperFetchReclaimLimit caps orphans processed per reclaim sweep.
+	SuperFetchReclaimLimit int
 	// ConsumerFetchMaxBytes caps total bytes per broker fetch (default 1 MiB).
 	ConsumerFetchMaxBytes int32
 	// ConsumerFetchMaxPartitionBytes caps bytes per partition in a fetch (default 128 KiB).
@@ -160,6 +172,11 @@ func DefaultDaemon() Daemon {
 		FairReadyConsumerConcurrency:      8,
 		PriorityConsumerConcurrency:       4,
 		JobProcessConcurrency:             1,
+		SuperFetchEnabled:                 true,
+		SuperFetchConcurrency:             32,
+		SuperFetchLeaseTTL:                2 * time.Minute,
+		SuperFetchReclaimEvery:            30 * time.Second,
+		SuperFetchReclaimLimit:            100,
 		ConsumerFetchMaxBytes:             DefaultConsumerFetchMaxBytes,
 		ConsumerFetchMaxPartitionBytes:    DefaultConsumerFetchMaxPartitionBytes,
 		ConsumerFetchMaxWait:              DefaultConsumerFetchMaxWait,
@@ -207,6 +224,14 @@ func (c Daemon) JobProcessWorkers() int {
 	return c.JobProcessConcurrency
 }
 
+// SuperFetchWorkers returns the SuperFetch goroutine pool size (min 1).
+func (c Daemon) SuperFetchWorkers() int {
+	if c.SuperFetchConcurrency < 1 {
+		return 32
+	}
+	return c.SuperFetchConcurrency
+}
+
 // ConsumerStallTimeoutDuration returns the configured consumer stall watchdog duration.
 func (c Daemon) ConsumerStallTimeoutDuration() time.Duration {
 	if c.ConsumerStallTimeout <= 0 {
@@ -248,6 +273,11 @@ func LoadDaemon(path string) (Daemon, error) {
 		FairReadyConsumerConcurrency         int              `yaml:"fair_ready_consumer_concurrency"`
 		PriorityConsumerConcurrency          int              `yaml:"priority_consumer_concurrency"`
 		JobProcessConcurrency                int              `yaml:"job_process_concurrency"`
+		SuperFetchEnabled                    *bool            `yaml:"super_fetch_enabled"`
+		SuperFetchConcurrency                int              `yaml:"super_fetch_concurrency"`
+		SuperFetchLeaseTTLSec                float64          `yaml:"super_fetch_lease_ttl"`
+		SuperFetchReclaimIntervalSec         float64          `yaml:"super_fetch_reclaim_interval"`
+		SuperFetchReclaimLimit               int              `yaml:"super_fetch_reclaim_limit"`
 		ConsumerFetchMaxBytes                int32            `yaml:"consumer_fetch_max_bytes"`
 		ConsumerFetchMaxPartitionBytes       int32            `yaml:"consumer_fetch_max_partition_bytes"`
 		ConsumerFetchMaxWaitMs               float64          `yaml:"consumer_fetch_max_wait_ms"`
@@ -358,6 +388,21 @@ func LoadDaemon(path string) (Daemon, error) {
 	}
 	if doc.JobProcessConcurrency > 0 {
 		cfg.JobProcessConcurrency = doc.JobProcessConcurrency
+	}
+	if doc.SuperFetchEnabled != nil {
+		cfg.SuperFetchEnabled = *doc.SuperFetchEnabled
+	}
+	if doc.SuperFetchConcurrency > 0 {
+		cfg.SuperFetchConcurrency = doc.SuperFetchConcurrency
+	}
+	if doc.SuperFetchLeaseTTLSec > 0 {
+		cfg.SuperFetchLeaseTTL = time.Duration(doc.SuperFetchLeaseTTLSec * float64(time.Second))
+	}
+	if doc.SuperFetchReclaimIntervalSec > 0 {
+		cfg.SuperFetchReclaimEvery = time.Duration(doc.SuperFetchReclaimIntervalSec * float64(time.Second))
+	}
+	if doc.SuperFetchReclaimLimit > 0 {
+		cfg.SuperFetchReclaimLimit = doc.SuperFetchReclaimLimit
 	}
 	if doc.ConsumerFetchMaxBytes > 0 {
 		cfg.ConsumerFetchMaxBytes = doc.ConsumerFetchMaxBytes
@@ -584,6 +629,14 @@ func applyEnv(cfg *Daemon) {
 	if v := os.Getenv("KAFKA_BATCH_JOB_PROCESS_CONCURRENCY"); v != "" {
 		if n, err := parsePositiveInt(v); err == nil {
 			cfg.JobProcessConcurrency = n
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_SUPER_FETCH_ENABLED"); v != "" {
+		cfg.SuperFetchEnabled = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v := os.Getenv("KAFKA_BATCH_SUPER_FETCH_CONCURRENCY"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			cfg.SuperFetchConcurrency = n
 		}
 	}
 	if v := os.Getenv("KAFKA_BATCH_CONSUMER_FETCH_MAX_BYTES"); v != "" {

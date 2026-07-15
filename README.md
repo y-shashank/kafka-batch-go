@@ -617,20 +617,20 @@ schedule_batch_size: 100       # due jobs claimed per poll
 
 ### Throughput tuning — single Go pod
 
-Go daemon and worker scale **inside one pod** with two mechanisms:
+Go daemon and worker scale **inside one pod** with:
 
 1. **In-process consumer members** — N franz-go clients join the same Kafka consumer group; the broker assigns partitions across them (same as N pods, one OS process).
-2. **Per-poll parallelism (worker only)** — `job_process_concurrency` runs up to N jobs in parallel per poll per member (Karafka `config.concurrency` equivalent).
-3. **Consumer fetch limits** — `consumer_fetch_*` caps how much data each poll prefetches from the broker. Defaults are tighter than franz-go/librdkafka (50 MiB / 1 MiB per partition) so multi-partition assignments get fairer turns per poll.
+2. **SuperFetch (worker, default on)** — Redis working-set claim → Kafka offset ack → `#perform` on a goroutine pool. Offsets advance at delivery rate, not perform latency, so **one partition can feed many long jobs** (seconds–30m). On pod death the daemon reclaim loop re-produces orphaned payloads (`_reclaim: true`).
+3. **Consumer fetch limits** — `consumer_fetch_*` caps how much data each poll prefetches from the broker.
 
-**Max concurrent job executions** (worker):
+**Max concurrent job executions** (worker, SuperFetch on):
 
 ```text
-jobs_consumer_members × job_process_concurrency
+jobs_consumer_members × super_fetch_concurrency
   (+ same formula per fair-ready lane and priority group)
 ```
 
-Set **member count ≈ topic partition count** for partition-bound throughput. Raise **`job_process_concurrency`** when handlers are slow but partitions are scarce.
+Set **member count ≈ topic partition count** for balanced lag. Raise **`super_fetch_concurrency`** (default `32`) when jobs are slow and you want more in-flight performs per member. Disable with `super_fetch_enabled: false` only if you need legacy commit-after-perform (then keep `job_process_concurrency: 1`).
 
 #### Control plane (`kbatch daemon`)
 
@@ -660,7 +660,9 @@ Raise these when messages are large or brokers are far away and polls return too
 | `KAFKA_BATCH_JOBS_CONSUMER_CONCURRENCY` | `jobs_consumer_concurrency` | `8` | In-process members for `{group}-go-worker-jobs` (plain go topics). |
 | `KAFKA_BATCH_FAIR_READY_CONSUMER_CONCURRENCY` | `fair_ready_consumer_concurrency` | `8` | In-process members **per** fair-ready lane (`time`, `throughput`). |
 | `KAFKA_BATCH_PRIORITY_CONSUMER_CONCURRENCY` | `priority_consumer_concurrency` | `4` | In-process members **per** priority YAML group. |
-| `KAFKA_BATCH_JOB_PROCESS_CONCURRENCY` | `job_process_concurrency` | `1` | Parallel handler executions per poll **per member**. `1` = serial (safest). `4`–`8` for CPU-bound handlers. |
+| `KAFKA_BATCH_SUPER_FETCH_ENABLED` | `super_fetch_enabled` | `true` | Claim Redis ownership then Kafka-ack before `#perform`; daemon reclaims orphans. |
+| `KAFKA_BATCH_SUPER_FETCH_CONCURRENCY` | `super_fetch_concurrency` | `32` | Goroutine pool size **per member** for in-flight performs. |
+| `KAFKA_BATCH_JOB_PROCESS_CONCURRENCY` | `job_process_concurrency` | `1` | Legacy only (SuperFetch off). Keep `1` — values &gt;1 risk mark-commit gaps. |
 | `KAFKA_BATCH_PRODUCER_REQUIRED_ACKS` | `producer_required_acks` | `all_isr` | Same as daemon — event emission after job completion. |
 
 Fairness admission is capped by control-plane `fairness_global_concurrency` (YAML). Raising worker concurrency above what control admits will backlog **ready** topics, not speed up end-to-end.
@@ -686,21 +688,18 @@ priority_consumer_concurrency: 8
 producer_required_acks: all_isr
 ```
 
-**I/O-heavy jobs** (HTTP calls, DB queries, object storage — handler waits on external systems):
+**Long / I/O-heavy jobs** (seconds–30m, HTTP, DB, object storage):
 
-- Bottleneck is **waiting**, not CPU. Prefer **more partition members**, keep **`job_process_concurrency: 1`** per member.
-- Example: `jobs_consumer_concurrency: 32`, `job_process_concurrency: 1` → **32 concurrent jobs** on a 32-partition topic.
-- Size the pod for goroutine/memory overhead (many blocked I/O waits are cheap in Go).
-- If lag persists with members = partitions, add partitions (Kafka only allows increasing count).
+- SuperFetch is the right model: Kafka delivers; Redis owns completion.
+- Example: `jobs_consumer_concurrency: 8`, `super_fetch_concurrency: 64` → up to **512** in-flight performs across members (bounded by pool + lag).
+- Handlers should stay idempotent — reclaim after death can re-run a job.
 
-**CPU-heavy jobs** (encoding, aggregation, image/PDF work — handler saturates CPU):
+**CPU-heavy short jobs**:
 
-- Prefer **`job_process_concurrency`** up to **logical CPU count per member**, with fewer members if partition count is low.
-- Example on 8-core pod, 32 partitions: `jobs_consumer_concurrency: 8`, `job_process_concurrency: 4` → **32 concurrent jobs**.
-- Example on 16-core pod, 32 partitions: `jobs_consumer_concurrency: 16`, `job_process_concurrency: 2` → **32 concurrent jobs**.
-- Watch CPU throttling and Redis/Kafka produce latency; back off if event emission or fair slot release lags.
+- Keep SuperFetch on; size `super_fetch_concurrency` near logical CPUs per member.
+- Example on 8-core pod: `jobs_consumer_concurrency: 8`, `super_fetch_concurrency: 8`.
 
-**Mixed I/O + CPU fleet** — use separate handler topics (or fair lanes) with different worker deployments and tuning per fleet rather than one global `job_process_concurrency`.
+**Mixed fleets** — separate handler topics / worker deployments with different `super_fetch_concurrency` rather than one global pool size.
 
 #### Quick reference
 
@@ -708,8 +707,8 @@ producer_required_acks: all_isr
 |---------|------------|
 | Events topic lag (control) | Add events-topic partitions and/or daemon pods (one client fans out per-partition goroutines; more pods = more owned partitions) |
 | Retry topic lag (control) | Add retry-topic partitions and/or daemon pods |
-| Job topic lag, I/O-bound handlers | Raise `KAFKA_BATCH_JOBS_CONSUMER_CONCURRENCY` toward partition count |
-| Job topic lag, CPU-bound handlers | Raise `KAFKA_BATCH_JOB_PROCESS_CONCURRENCY` (and/or members) |
+| Job topic lag, long/I/O handlers | Raise `KAFKA_BATCH_SUPER_FETCH_CONCURRENCY` and/or members toward partition count |
+| Job topic lag, CPU-bound handlers | Raise `KAFKA_BATCH_SUPER_FETCH_CONCURRENCY` (near CPUs) and/or members |
 | Fair ready lag, admission OK | Raise `KAFKA_BATCH_FAIR_READY_CONSUMER_CONCURRENCY` |
 | Priority tier lag | Raise `KAFKA_BATCH_PRIORITY_CONSUMER_CONCURRENCY` |
 | Produce latency dominates | Try `KAFKA_BATCH_PRODUCER_REQUIRED_ACKS=leader` (trade durability) |

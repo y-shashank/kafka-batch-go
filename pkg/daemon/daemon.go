@@ -27,6 +27,7 @@ import (
 	"github.com/y-shashank/kafka-batch-go/pkg/protocol"
 	"github.com/y-shashank/kafka-batch-go/pkg/schedule"
 	"github.com/y-shashank/kafka-batch-go/pkg/store"
+	"github.com/y-shashank/kafka-batch-go/pkg/workset"
 )
 
 // Run starts the control plane (fair dispatch, events, retries, callbacks, schedule).
@@ -157,6 +158,12 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	reconciler.RunScheduler(ctx, cfg, st, prod, func() {
 		loopHealth.RecordTick("reconciler")
 	})
+	if cfg.SuperFetchEnabled {
+		workset.RunReclaimScheduler(ctx, workset.NewStore(rdb), prod, cfg.SuperFetchReclaimEvery, cfg.SuperFetchReclaimLimit, func() {
+			loopHealth.RecordTick("workset-reclaim")
+		})
+		log.Printf("kbatch workset reclaim enabled every=%s limit=%d", cfg.SuperFetchReclaimEvery, cfg.SuperFetchReclaimLimit)
+	}
 	log.Printf("kbatch events consumer group=%s topic=%s acks=%s fetch_max_bytes=%d fetch_max_partition_bytes=%d fetch_max_wait=%s (one client, goroutine-per-partition)",
 		eventsGroup, cfg.EventsTopic, cfg.RequiredAcks(),
 		fetch.MaxBytes, fetch.MaxPartitionBytes, fetch.MaxWait)

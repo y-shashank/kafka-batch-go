@@ -244,6 +244,14 @@ func (s *Scheduler) ClaimSlotExecution(ctx context.Context, slotID string) (bool
 	return ok, nil
 }
 
+// ClearSlotExecution removes the fair slot dedup key so a SuperFetch reclaim can re-run.
+func (s *Scheduler) ClearSlotExecution(ctx context.Context, slotID string) error {
+	if s == nil || s.Client == nil || slotID == "" {
+		return nil
+	}
+	return s.Client.Del(ctx, SlotDedupKey(s.Lane, slotID)).Err()
+}
+
 func (s *Scheduler) ListStaleForwards(ctx context.Context) ([]StaleForward, error) {
 	now := float64(time.Now().UnixNano()) / 1e9
 	grace := s.Settings.ForwardingRecoveryGrace

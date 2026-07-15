@@ -63,6 +63,19 @@ func RunConsumerGroupMembers(ctx context.Context, members int, brokers []string,
 // RunConcurrentConsumerGroupMembers starts N group members and runs up to
 // processWorkers job handlers in parallel per poll (Karafka concurrency).
 func RunConcurrentConsumerGroupMembers(ctx context.Context, members, processWorkers int, brokers []string, group string, topics []string, fetch config.ConsumerFetchSettings, handle func(*kgo.Record) error, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter) {
+	RunSuperFetchConsumerGroupMembers(ctx, members, processWorkers, brokers, group, topics, fetch, handle, nil, health, pauseCtl, live)
+}
+
+// RunSuperFetchConsumerGroupMembers is like RunConcurrentConsumerGroupMembers but
+// when newSF is non-nil each member claims Redis ownership, Kafka-acks immediately,
+// and runs #perform on a bounded pool without blocking the poll loop.
+func RunSuperFetchConsumerGroupMembers(
+	ctx context.Context, members, processWorkers int,
+	brokers []string, group string, topics []string, fetch config.ConsumerFetchSettings,
+	handle func(*kgo.Record) error,
+	newSF func(consumerID string) *SuperFetchExecutor,
+	health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter,
+) {
 	if members < 1 {
 		members = 1
 	}
@@ -70,18 +83,45 @@ func RunConcurrentConsumerGroupMembers(ctx context.Context, members, processWork
 		processWorkers = 1
 	}
 	for member := 1; member <= members; member++ {
-		if processWorkers == 1 {
-			go runConsumerSupervised(ctx, consumerSpec{
+		label := memberLabel(member, members)
+		hk := healthMemberKey(group, member, members)
+		var sf *SuperFetchExecutor
+		if newSF != nil {
+			cid := group + ":" + label
+			if live != nil && live.ConsumerID != "" {
+				cid = live.ConsumerID + ":" + label
+			}
+			sf = newSF(cid)
+		}
+		if sf != nil {
+			go runConcurrentConsumerSupervised(ctx, concurrentConsumerSpec{
 				brokers:        brokers,
 				group:          group,
 				topics:         topics,
 				fetch:          fetch,
 				handle:         handle,
+				processWorkers: processWorkers,
+				superFetch:     sf,
 				health:         health,
 				pauseCtl:       pauseCtl,
 				live:           live,
-				memberLabel:    memberLabel(member, members),
-				healthKey:      healthMemberKey(group, member, members),
+				memberLabel:    label,
+				healthKey:      hk,
+			})
+			continue
+		}
+		if processWorkers == 1 {
+			go runConsumerSupervised(ctx, consumerSpec{
+				brokers:     brokers,
+				group:       group,
+				topics:      topics,
+				fetch:       fetch,
+				handle:      handle,
+				health:      health,
+				pauseCtl:    pauseCtl,
+				live:        live,
+				memberLabel: label,
+				healthKey:   hk,
 			})
 			continue
 		}
@@ -95,8 +135,8 @@ func RunConcurrentConsumerGroupMembers(ctx context.Context, members, processWork
 			health:         health,
 			pauseCtl:       pauseCtl,
 			live:           live,
-			memberLabel:    memberLabel(member, members),
-			healthKey:      healthMemberKey(group, member, members),
+			memberLabel:    label,
+			healthKey:      hk,
 		})
 	}
 }
@@ -144,6 +184,7 @@ type concurrentConsumerSpec struct {
 	fetch          config.ConsumerFetchSettings
 	handle         func(*kgo.Record) error
 	processWorkers int
+	superFetch     *SuperFetchExecutor
 	health         *ConsumerHealth
 	pauseCtl       pauseChecker
 	live           *liveness.Reporter
@@ -198,6 +239,10 @@ func runConcurrentConsumerLoop(ctx context.Context, spec concurrentConsumerSpec)
 		pauseCtl:    spec.pauseCtl,
 		live:        spec.live,
 	}, func(ctx context.Context, recs []*kgo.Record) error {
+		if spec.superFetch != nil {
+			spec.superFetch.DispatchClaimsAndAcks(ctx, cl.Client, recs, spec.group)
+			return nil
+		}
 		processRecordsConcurrent(ctx, cl.Client, spec.handle, recs, spec.processWorkers, spec.group)
 		return nil
 	})
@@ -314,6 +359,15 @@ func RunPriorityGroup(ctx context.Context, cfg config.Daemon, pc priority.Config
 
 // RunPriorityGroupMembers starts N in-process priority consumers for the same group.
 func RunPriorityGroupMembers(ctx context.Context, members, processWorkers int, cfg config.Daemon, pc priority.Config, gate *priority.Gate, handle func(*kgo.Record) error, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter) {
+	RunPriorityGroupMembersSuperFetch(ctx, members, processWorkers, cfg, pc, gate, handle, nil, health, pauseCtl, live)
+}
+
+// RunPriorityGroupMembersSuperFetch is RunPriorityGroupMembers with optional SuperFetch.
+func RunPriorityGroupMembersSuperFetch(
+	ctx context.Context, members, processWorkers int, cfg config.Daemon, pc priority.Config, gate *priority.Gate,
+	handle func(*kgo.Record) error, newSF func(consumerID string) *SuperFetchExecutor,
+	health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter,
+) {
 	if members < 1 {
 		members = 1
 	}
@@ -323,12 +377,22 @@ func RunPriorityGroupMembers(ctx context.Context, members, processWorkers int, c
 	group := pc.ConsumerGroup
 	log.Printf("[kbatch-daemon] starting priority consumers group=%s members=%d topics=%v", group, members, pc.Topics)
 	for member := 1; member <= members; member++ {
-		go runPrioritySupervised(ctx, cfg, pc, gate, handle, health, pauseCtl, live, processWorkers,
-			memberLabel(member, members), healthMemberKey(group, member, members))
+		label := memberLabel(member, members)
+		hk := healthMemberKey(group, member, members)
+		var sf *SuperFetchExecutor
+		if newSF != nil {
+			cid := group + ":" + label
+			if live != nil && live.ConsumerID != "" {
+				cid = live.ConsumerID + ":" + label
+			}
+			sf = newSF(cid)
+		}
+		go runPrioritySupervised(ctx, cfg, pc, gate, handle, health, pauseCtl, live, processWorkers, sf,
+			label, hk)
 	}
 }
 
-func runPrioritySupervised(ctx context.Context, cfg config.Daemon, pc priority.Config, gate *priority.Gate, handle func(*kgo.Record) error, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter, processWorkers int, memberLabel, healthKey string) {
+func runPrioritySupervised(ctx context.Context, cfg config.Daemon, pc priority.Config, gate *priority.Gate, handle func(*kgo.Record) error, health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter, processWorkers int, sf *SuperFetchExecutor, memberLabel, healthKey string) {
 	group := pc.ConsumerGroup
 	if health != nil {
 		health.Register(healthKey)
@@ -349,7 +413,7 @@ func runPrioritySupervised(ctx context.Context, cfg config.Daemon, pc priority.C
 		if ctx.Err() != nil {
 			return
 		}
-		err := runPriorityOnce(ctx, cfg, pc, gate, handle, health, pauseCtl, live, specByTopic, yieldSleep, weightedTicks, processWorkers, memberLabel, healthKey)
+		err := runPriorityOnce(ctx, cfg, pc, gate, handle, health, pauseCtl, live, specByTopic, yieldSleep, weightedTicks, processWorkers, sf, memberLabel, healthKey)
 		if ctx.Err() != nil || err == nil {
 			return
 		}
@@ -381,6 +445,7 @@ func runPriorityOnce(
 	yieldSleep time.Duration,
 	weightedTicks map[string]int,
 	processWorkers int,
+	sf *SuperFetchExecutor,
 	memberLabel string,
 	healthKey string,
 ) error {
@@ -403,6 +468,10 @@ func runPriorityOnce(
 	}, func(ctx context.Context, recs []*kgo.Record) error {
 		ready := filterPriorityRecords(ctx, cl, pc, gate, pauseCtl, live, specByTopic, yieldSleep, weightedTicks, recs)
 		if len(ready) == 0 {
+			return nil
+		}
+		if sf != nil {
+			sf.DispatchClaimsAndAcks(ctx, cl.Client, ready, pc.ConsumerGroup)
 			return nil
 		}
 		if processWorkers <= 1 {

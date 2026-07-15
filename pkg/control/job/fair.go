@@ -18,6 +18,14 @@ type fairMeta struct {
 	lane     fairness.Lane
 }
 
+func isReclaimPayload(raw []byte) bool {
+	var m struct {
+		Reclaim bool `json:"_reclaim"`
+	}
+	_ = json.Unmarshal(raw, &m)
+	return m.Reclaim
+}
+
 func parseFairMeta(raw []byte) fairMeta {
 	var m map[string]interface{}
 	if err := json.Unmarshal(raw, &m); err != nil {
@@ -53,6 +61,9 @@ func (p *Processor) withFairSlot(ctx context.Context, raw []byte, perform func()
 	tenant := fm.tenantID
 	if tenant == "" {
 		tenant = "default"
+	}
+	if isReclaimPayload(raw) {
+		_ = sched.ClearSlotExecution(ctx, fm.slotID)
 	}
 	claimed, err := sched.ClaimSlotExecution(ctx, fm.slotID)
 	if err != nil {
