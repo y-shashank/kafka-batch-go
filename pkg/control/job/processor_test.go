@@ -9,6 +9,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/y-shashank/kafka-batch-go/pkg/cancellation"
 	"github.com/y-shashank/kafka-batch-go/pkg/config"
 	"github.com/y-shashank/kafka-batch-go/pkg/kbatch"
 	"github.com/y-shashank/kafka-batch-go/pkg/liveness"
@@ -175,6 +176,56 @@ func TestProcessRubyRuntimeJobDLTWithoutRetry(t *testing.T) {
 	}
 	if out.DLTPayload == nil {
 		t.Fatal("expected DLT")
+	}
+}
+
+func TestProcessCancelledBatchSkipsHandlerViaCache(t *testing.T) {
+	kbatch.Reset()
+	ran := false
+	kbatch.Register("test.cancel", func(ctx *kbatch.Context) error {
+		ran = true
+		return nil
+	})
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := store.NewRedisStore(rdb, time.Hour)
+	ctx := context.Background()
+	if _, err := st.CreateBatch(ctx, store.CreateBatchParams{ID: "b-cancel", Sealed: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CancelBatch(ctx, "b-cancel"); err != nil {
+		t.Fatal(err)
+	}
+
+	batchID := "b-cancel"
+	seq := int64(1)
+	raw, _ := json.Marshal(protocol.JobMessage{
+		JobID: "j1", BatchID: &batchID, JobType: "test.cancel", WorkerClass: "go:test.cancel",
+		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3, BatchSeq: &seq,
+	})
+
+	cache := cancellation.New(2*time.Minute, st.CancelledBatchIDs)
+	p := &Processor{
+		Cfg: config.DefaultDaemon(), Store: st, Producer: &memProducer{}, CancelCache: cache,
+	}
+	out, err := p.Process(ctx, raw, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran {
+		t.Fatal("handler should not run for cancelled batch")
+	}
+	if out.Event != nil || out.RetryPayload != nil || out.DLTPayload != nil {
+		t.Fatalf("expected silent skip, got %+v", out)
+	}
+	// Second job must hit cache, not require another Redis list (still correct).
+	out2, err := p.Process(ctx, raw, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out2.Event != nil {
+		t.Fatal("second cancelled job should also skip")
 	}
 }
 

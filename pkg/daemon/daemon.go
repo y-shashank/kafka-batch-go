@@ -13,6 +13,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/twmb/franz-go/pkg/kgo"
 
+	"github.com/y-shashank/kafka-batch-go/pkg/cancellation"
 	"github.com/y-shashank/kafka-batch-go/pkg/config"
 	"github.com/y-shashank/kafka-batch-go/pkg/control/event"
 	"github.com/y-shashank/kafka-batch-go/pkg/control/retry"
@@ -118,6 +119,10 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	defer closeFailures()
 	live := NewLivenessReporter(cfg, rdb)
 	tenants := BuildTenantPartitions(cfg, rdb, prod)
+	if tenants != nil {
+		_ = tenants.Warm(context.Background(), "time")
+		_ = tenants.Warm(context.Background(), "throughput")
+	}
 	consumerHealth := NewConsumerHealth(cfg)
 	loopHealth := NewLoopHealth(cfg)
 	StartHealthServer(ctx, cfg, "daemon", compositeHealth{checkers: []health.Checker{consumerHealth, loopHealth}})
@@ -162,6 +167,9 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	workset.RunReclaimScheduler(ctx, workset.NewStore(rdb), prod, cfg.SuperFetchReclaimEvery, cfg.SuperFetchReclaimLimit, cfg.SuperFetchOrphanGrace, func() {
 		loopHealth.RecordTick("workset-reclaim")
 	})
+	cancelCache := cancellation.New(cfg.CancellationCacheTTL, st.CancelledBatchIDs)
+	cancellation.SetProcessCache(cancelCache)
+	defer cancellation.SetProcessCache(nil)
 	log.Printf("kbatch workset reclaim enabled every=%s limit=%d grace=%s", cfg.SuperFetchReclaimEvery, cfg.SuperFetchReclaimLimit, cfg.SuperFetchOrphanGrace)
 	log.Printf("kbatch events consumer group=%s topic=%s acks=%s fetch_max_bytes=%d fetch_max_partition_bytes=%d fetch_max_wait=%s (one client, goroutine-per-partition)",
 		eventsGroup, cfg.EventsTopic, cfg.RequiredAcks(),
@@ -215,7 +223,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 				Default:  scheduleDefaultTopic,
 				Tenants:  tenants,
 			},
-			Cancelled: st.BatchCancelled,
+			Cancelled: cancelCache.Cancelled,
 			RecordActivity: func() {
 				loopHealth.RecordTick("schedule-poller")
 			},

@@ -87,9 +87,9 @@ func TestSuperFetchClaimAckBeforePerform(t *testing.T) {
 		t.Fatal("expected immediate mark")
 	}
 
-	exec.Sem <- struct{}{}
+	exec.ClaimWindow <- struct{}{}
 	exec.inFlight.Store("sf-1", struct{}{})
-	go exec.perform(ctx, rec, "sf-1", claim.Fence, "g")
+	go exec.perform(ctx, rec, "sf-1", claim.Fence, "g", func() {})
 
 	started.Wait()
 	if atomic.LoadInt32(&performs) != 1 {
@@ -151,7 +151,7 @@ func TestSuperFetchPerformSurvivesPollCtxCancel(t *testing.T) {
 	}
 	marker := &sfMarker{}
 	// Claim + mark + perform using poll ctx (as runGroupPollLoop does), then cancel.
-	exec.Sem <- struct{}{}
+	exec.ClaimWindow <- struct{}{}
 	claim, err := work.Claim(life, workset.ClaimParams{
 		JobID: "sf-life", Payload: rec.Value, Topic: rec.Topic,
 		Partition: 0, Offset: 1, ConsumerID: "c-life", LeaseTTL: time.Minute, StealGrace: -1,
@@ -161,7 +161,7 @@ func TestSuperFetchPerformSurvivesPollCtxCancel(t *testing.T) {
 	}
 	marker.MarkCommitRecords(rec)
 	exec.inFlight.Store("sf-life", struct{}{})
-	go exec.perform(exec.life(), rec, "sf-life", claim.Fence, "g")
+	go exec.perform(exec.life(), rec, "sf-life", claim.Fence, "g", func() {})
 	endProc() // simulate endProc() after Dispatch returns
 
 	started.Wait()

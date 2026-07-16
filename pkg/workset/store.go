@@ -34,7 +34,8 @@ const (
 // Entry is one in-flight job owned by a consumer.
 type Entry struct {
 	JobID         string `json:"job_id"`
-	Payload       []byte `json:"payload"` // raw Kafka value
+	Payload       []byte `json:"payload"` // Kafka value (raw, or gzip when Encoding=gzip)
+	Encoding      string `json:"encoding,omitempty"` // "" legacy raw; "gzip" compressed body
 	Topic         string `json:"topic"`
 	Partition     int32  `json:"partition"`
 	Offset        int64  `json:"offset"`
@@ -125,7 +126,7 @@ func (s *Store) Claim(ctx context.Context, p ClaimParams) (ClaimResult, error) {
 		ClaimedAtUnix: now.Unix(),
 		Runtime:       "go",
 	}
-	raw, err := json.Marshal(entry)
+	raw, err := marshalEntryJSON(entry)
 	if err != nil {
 		return ClaimResult{}, err
 	}

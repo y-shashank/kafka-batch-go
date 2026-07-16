@@ -53,3 +53,26 @@ func (s *RedisStore) UpdateBatchStatus(ctx context.Context, id, status string) e
 func (s *RedisStore) CancelBatch(ctx context.Context, id string) error {
 	return s.UpdateBatchStatus(ctx, id, "cancelled")
 }
+
+// CancelledBatchIDs returns batch IDs cancelled within the last 2× batch TTL
+// window (Ruby RedisStore#cancelled_batch_ids). Prunes older ZSET members.
+func (s *RedisStore) CancelledBatchIDs(ctx context.Context) ([]string, error) {
+	if s == nil || s.client == nil {
+		return nil, fmt.Errorf("redis store not configured")
+	}
+	ttl := s.ttl
+	if ttl <= 0 {
+		ttl = 7 * 24 * time.Hour
+	}
+	cutoff := float64(time.Now().Add(-2*ttl).UnixNano()) / 1e9
+	pipe := s.client.Pipeline()
+	pipe.ZRemRangeByScore(ctx, cancelledIndex, "-inf", fmt.Sprintf("%f", cutoff))
+	rangeCmd := pipe.ZRangeByScore(ctx, cancelledIndex, &redis.ZRangeBy{
+		Min: fmt.Sprintf("%f", cutoff),
+		Max: "+inf",
+	})
+	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+		return nil, err
+	}
+	return rangeCmd.Val(), nil
+}

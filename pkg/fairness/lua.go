@@ -57,12 +57,9 @@ if weighted == 1 and budget > 0 then
   if shint > 0 then
     sum_w = shint
   else
-    local all = redis.call('ZRANGE', ring, 0, -1)
-    for i = 1, #all do
-      local wi = tonumber(redis.call('HGET', wh, all[i]) or dw)
-      if wi == nil or wi <= 0 then wi = dw end
-      sum_w = sum_w + wi
-    end
+    -- Cheap approx instead of full-ring ZRANGE (O(tenants) Redis CPU).
+    -- Callers should pass shint; this is a safety net only.
+    sum_w = dw * active
     if sum_w <= 0 then sum_w = dw end
   end
 end
@@ -152,12 +149,9 @@ if weighted == 1 and budget > 0 then
   if shint > 0 then
     sum_w = shint
   else
-    local all = redis.call('ZRANGE', ring, 0, -1)
-    for i = 1, #all do
-      local wi = tonumber(redis.call('HGET', wh, all[i]) or dw)
-      if wi == nil or wi <= 0 then wi = dw end
-      sum_w = sum_w + wi
-    end
+    -- Cheap approx instead of full-ring ZRANGE (O(tenants) Redis CPU).
+    -- Callers should pass shint; this is a safety net only.
+    sum_w = dw * active
     if sum_w <= 0 then sum_w = dw end
   end
 end

@@ -32,8 +32,12 @@ type Daemon struct {
 	RedisURL                  string
 	BatchTTL                  time.Duration
 	HandlerManifest           string
-	SkipCancelledJobs         bool
-	NodeID                    string
+	SkipCancelledJobs bool
+	// CancellationCacheTTL is how long a process keeps the cancelled-batch
+	// index locally before refreshing from Redis (Ruby cancellation_cache_ttl).
+	// Default 120s. 0 forces a refresh on every check (tests).
+	CancellationCacheTTL time.Duration
+	NodeID               string
 	// ProducerRequiredAcks is "all_isr" (default, safest) or "leader".
 	ProducerRequiredAcks string
 	// JobsConsumerConcurrency is in-process group members for plain go job topics.
@@ -46,6 +50,10 @@ type Daemon struct {
 	// #perform after Redis claim + Kafka ack (always-on SuperFetch). Default 10;
 	// raise for IO-bound work (true Go parallelism). See README tuning profiles.
 	SuperFetchConcurrency int
+	// SuperFetchClaimWindow is max jobs per member in Claimed∨Queued∨Performing.
+	// Claim+ack is gated on this window (not perform Sem) so rebalance is not
+	// held for the full #perform. 0 → 2× SuperFetchConcurrency.
+	SuperFetchClaimWindow int
 	// SuperFetchLeaseTTL is the Redis working-set TTL renewed during #perform.
 	SuperFetchLeaseTTL time.Duration
 	// SuperFetchReclaimEvery is how often the daemon scans for orphaned working-set jobs.
@@ -135,6 +143,7 @@ func DefaultDaemon() Daemon {
 		RedisURL:                          "redis://localhost:6379/0",
 		BatchTTL:                          7 * 24 * time.Hour,
 		SkipCancelledJobs:                 true,
+		CancellationCacheTTL:              120 * time.Second,
 		NodeID:                            hostname(),
 		ScheduledTopic:                    "kafka_batch.scheduled",
 		SchedulePollInterval:              5 * time.Second,
@@ -160,6 +169,9 @@ func DefaultDaemon() Daemon {
 		FairnessWeightedConcurrency:       true,
 		FairnessActiveCountTTL:            5 * time.Second,
 		FairnessActiveCountSource:         "inflight_plus_ready",
+		// Exclusive ingest partitions for hot tenants (static map still wins).
+		// Default on — large tenant fleets rarely maintain a manual pin map.
+		FairnessDynamicTenantPartitions:   true,
 		FairnessTenantPartitionCacheTTL:   30 * time.Second,
 		LivenessTTL:                       180 * time.Second,
 		LivenessHeartbeatInterval:         20 * time.Second,
@@ -174,6 +186,7 @@ func DefaultDaemon() Daemon {
 		FairReadyConsumerConcurrency:      8,
 		PriorityConsumerConcurrency:       4,
 		SuperFetchConcurrency:             10,
+		SuperFetchClaimWindow:             0, // → 2× concurrency via SuperFetchClaimWindowSize()
 		SuperFetchLeaseTTL:                2 * time.Minute,
 		SuperFetchReclaimEvery:            30 * time.Second,
 		SuperFetchReclaimLimit:            100,
@@ -220,9 +233,19 @@ func (c Daemon) PriorityConsumerMembers() int {
 // SuperFetchWorkers returns the SuperFetch goroutine pool size (min 1).
 func (c Daemon) SuperFetchWorkers() int {
 	if c.SuperFetchConcurrency < 1 {
-		return 32
+		return 10
 	}
 	return c.SuperFetchConcurrency
+}
+
+// SuperFetchClaimWindowSize returns the claim/ack outstanding window (min workers).
+func (c Daemon) SuperFetchClaimWindowSize() int {
+	workers := c.SuperFetchWorkers()
+	if c.SuperFetchClaimWindow >= workers {
+		return c.SuperFetchClaimWindow
+	}
+	// Default: 2× perform concurrency so ack can run ahead of long #perform.
+	return workers * 2
 }
 
 // LivenessTTLDuration is the Redis EX TTL for kafka_batch:live:consumer:* heartbeats
@@ -276,6 +299,8 @@ func LoadDaemon(path string) (Daemon, error) {
 		RetryTiers                           map[string]int   `yaml:"retry_tiers"`
 		RedisURL                             string           `yaml:"redis_url"`
 		HandlerManifest                      string           `yaml:"handler_manifest"`
+		SkipCancelledJobs                    *bool            `yaml:"skip_cancelled_jobs"`
+		CancellationCacheTTLSec              float64          `yaml:"cancellation_cache_ttl"`
 		MaxRetries                           int              `yaml:"max_retries"`
 		RetryMaxPauseSec                     float64          `yaml:"retry_max_pause"`
 		ProducerRequiredAcks                 string           `yaml:"producer_required_acks"`
@@ -283,6 +308,7 @@ func LoadDaemon(path string) (Daemon, error) {
 		FairReadyConsumerConcurrency         int              `yaml:"fair_ready_consumer_concurrency"`
 		PriorityConsumerConcurrency          int              `yaml:"priority_consumer_concurrency"`
 		SuperFetchConcurrency                int              `yaml:"super_fetch_concurrency"`
+		SuperFetchClaimWindow                int              `yaml:"super_fetch_claim_window"`
 		SuperFetchLeaseTTLSec                float64          `yaml:"super_fetch_lease_ttl"`
 		SuperFetchReclaimIntervalSec         float64          `yaml:"super_fetch_reclaim_interval"`
 		SuperFetchReclaimLimit               int              `yaml:"super_fetch_reclaim_limit"`
@@ -323,7 +349,7 @@ func LoadDaemon(path string) (Daemon, error) {
 		FairnessActiveCountTTLSec            float64          `yaml:"fairness_active_count_ttl"`
 		FairnessActiveCountSource            string           `yaml:"fairness_active_count_source"`
 		FairnessTenantPartitions             map[string]int32 `yaml:"fairness_tenant_partitions"`
-		FairnessDynamicTenantPartitions      bool             `yaml:"fairness_dynamic_tenant_partitions"`
+		FairnessDynamicTenantPartitions      *bool            `yaml:"fairness_dynamic_tenant_partitions"`
 		FairnessTenantPartitionCacheTTLSec   float64          `yaml:"fairness_tenant_partition_cache_ttl"`
 		Store                                string           `yaml:"store"`
 		StoreMySQLDSN                        string           `yaml:"store_mysql_dsn"`
@@ -393,8 +419,17 @@ func LoadDaemon(path string) (Daemon, error) {
 	if doc.PriorityConsumerConcurrency > 0 {
 		cfg.PriorityConsumerConcurrency = doc.PriorityConsumerConcurrency
 	}
+	if doc.SkipCancelledJobs != nil {
+		cfg.SkipCancelledJobs = *doc.SkipCancelledJobs
+	}
+	if doc.CancellationCacheTTLSec > 0 {
+		cfg.CancellationCacheTTL = time.Duration(doc.CancellationCacheTTLSec * float64(time.Second))
+	}
 	if doc.SuperFetchConcurrency > 0 {
 		cfg.SuperFetchConcurrency = doc.SuperFetchConcurrency
+	}
+	if doc.SuperFetchClaimWindow > 0 {
+		cfg.SuperFetchClaimWindow = doc.SuperFetchClaimWindow
 	}
 	if doc.SuperFetchLeaseTTLSec > 0 {
 		cfg.SuperFetchLeaseTTL = time.Duration(doc.SuperFetchLeaseTTLSec * float64(time.Second))
@@ -516,8 +551,8 @@ func LoadDaemon(path string) (Daemon, error) {
 	if len(doc.FairnessTenantPartitions) > 0 {
 		cfg.FairnessTenantPartitions = doc.FairnessTenantPartitions
 	}
-	if doc.FairnessDynamicTenantPartitions {
-		cfg.FairnessDynamicTenantPartitions = true
+	if doc.FairnessDynamicTenantPartitions != nil {
+		cfg.FairnessDynamicTenantPartitions = *doc.FairnessDynamicTenantPartitions
 	}
 	if doc.FairnessTenantPartitionCacheTTLSec > 0 {
 		cfg.FairnessTenantPartitionCacheTTL = time.Duration(doc.FairnessTenantPartitionCacheTTLSec * float64(time.Second))
@@ -643,9 +678,25 @@ func applyEnv(cfg *Daemon) {
 			cfg.PriorityConsumerConcurrency = n
 		}
 	}
+	if v := os.Getenv("KAFKA_BATCH_SKIP_CANCELLED_JOBS"); v != "" {
+		cfg.SkipCancelledJobs = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v := os.Getenv("KAFKA_BATCH_FAIRNESS_DYNAMIC_TENANT_PARTITIONS"); v != "" {
+		cfg.FairnessDynamicTenantPartitions = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v := os.Getenv("KAFKA_BATCH_CANCELLATION_CACHE_TTL"); v != "" {
+		if n, err := parsePositiveFloat(v); err == nil {
+			cfg.CancellationCacheTTL = time.Duration(n * float64(time.Second))
+		}
+	}
 	if v := os.Getenv("KAFKA_BATCH_SUPER_FETCH_CONCURRENCY"); v != "" {
 		if n, err := parsePositiveInt(v); err == nil {
 			cfg.SuperFetchConcurrency = n
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_SUPER_FETCH_CLAIM_WINDOW"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			cfg.SuperFetchClaimWindow = n
 		}
 	}
 	if v := os.Getenv("KAFKA_BATCH_CONSUMER_FETCH_MAX_BYTES"); v != "" {

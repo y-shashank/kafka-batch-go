@@ -433,12 +433,26 @@ func (s *Scheduler) activeViewCached() activeView {
 }
 
 func (s *Scheduler) computeActiveView(ctx context.Context) activeView {
+	ringView := s.computeRingLeaseView(ctx)
 	if s.Settings.ActiveCountSource == "ingest_lag" && s.Settings.IngestLag != nil {
 		n, err := s.Settings.IngestLag.IngestActiveCount(ctx, s.Settings.DispatchConsumerGroup, s.Settings.IngestTopic)
 		if err == nil {
-			return activeView{count: n, sumWeight: 0}
+			sum := ringView.sumWeight
+			// Weighted checkout requires shint > 0 to avoid full-ring ZRANGE in Lua.
+			if s.Settings.weightedFlag() == 1 && sum <= 0 && n > 0 {
+				dw := s.Settings.DefaultWeight
+				if dw <= 0 {
+					dw = 1
+				}
+				sum = dw * float64(n)
+			}
+			return activeView{count: n, sumWeight: sum}
 		}
 	}
+	return ringView
+}
+
+func (s *Scheduler) computeRingLeaseView(ctx context.Context) activeView {
 	members, err := s.Client.ZRange(ctx, ringKey(s.Lane), 0, -1).Result()
 	if err != nil {
 		return activeView{}

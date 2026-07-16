@@ -40,3 +40,30 @@ func TestCancelBatchNotFound(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestCancelledBatchIDs(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := NewRedisStore(rdb, time.Hour)
+	ctx := context.Background()
+
+	for _, id := range []string{"b1", "b2"} {
+		if _, err := st.CreateBatch(ctx, CreateBatchParams{ID: id, Sealed: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.CancelBatch(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ids, err := st.CancelledBatchIDs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, id := range ids {
+		got[id] = true
+	}
+	if !got["b1"] || !got["b2"] {
+		t.Fatalf("ids=%v", ids)
+	}
+}

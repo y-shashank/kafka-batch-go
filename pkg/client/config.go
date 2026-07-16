@@ -89,6 +89,7 @@ func DefaultConfig() Config {
 		ProduceChunkSize:                500,
 		FairnessTimeIngest:              "kafka_batch.fair_time_ingest",
 		FairnessThroughputIngest:        "kafka_batch.fair_throughput_ingest",
+		FairnessDynamicTenantPartitions: true,
 		FairnessTenantPartitionCacheTTL: 30 * time.Second,
 	}
 }

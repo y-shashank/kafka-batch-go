@@ -2,6 +2,8 @@ package client
 
 import (
 	"context"
+
+	"github.com/y-shashank/kafka-batch-go/pkg/cancellation"
 )
 
 // CancelBatch cancels a batch by id (Ruby KafkaBatch::Batch.cancel).
@@ -13,7 +15,12 @@ func (c *Client) CancelBatch(ctx context.Context, id string) error {
 	if row == nil {
 		return BatchNotFoundError{BatchID: id}
 	}
-	return c.store.CancelBatch(ctx, id)
+	if err := c.store.CancelBatch(ctx, id); err != nil {
+		return err
+	}
+	// Same-process workers/schedule see the cancel immediately (Ruby CancellationCache#add).
+	cancellation.AddToProcess(id)
+	return nil
 }
 
 // Cancel cancels this open batch.

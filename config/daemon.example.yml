@@ -92,6 +92,7 @@ jobs_consumer_concurrency: 8
 # fair_ready_consumer_concurrency: 8
 # priority_consumer_concurrency: 4
 # super_fetch_concurrency: 10               # in-flight #perform pool per member (try higher for IO)
+# super_fetch_claim_window: 20              # Claimed∨Queued∨Performing (0 → 2× concurrency); ack can run ahead of perform
 
 # ── Delayed jobs — perform_in / perform_at (daemon only) ─────────────────────
 
@@ -139,8 +140,8 @@ fairness_enabled: true
 # fairness_active_count_ttl: 5          # sec — in-flight count cache TTL
 # fairness_active_count_source: inflight_plus_ready   # inflight_plus_ready | inflight
 # fairness_tenant_partition_cache_ttl: 30  # sec — in-process tenant→partition cache
-# fairness_dynamic_tenant_partitions: false
-# fairness_tenant_partitions:             # pin tenants to ingest partitions
+# fairness_dynamic_tenant_partitions: true  # default on — exclusive ingest partitions per tenant
+# fairness_tenant_partitions:               # static pins win over dynamic checkout
 #   acme: 0
 #   globex: 1
 
@@ -155,7 +156,8 @@ fairness_enabled: true
 # store: redis                         # redis (default) | mysql
 # store_mysql_dsn: ${KB_MYSQL_URL}    # required when store: mysql (failures + pause tables)
 
-# skip_cancelled_jobs: true             # drop schedule dispatches for cancelled batches (default true; code default only — not YAML-loaded today)
+# skip_cancelled_jobs: true             # drop jobs/schedule for cancelled batches (default true)
+# cancellation_cache_ttl: 120           # sec — process-local cancelled-index refresh (not Redis per job)
 
 # ── Reconciler (daemon — triggered from events consumer) ──────────────────────
 # Recovers stuck running batches and re-fires lost callbacks. Manual run:

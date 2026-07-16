@@ -662,11 +662,15 @@ Raise these when messages are large or brokers are far away and polls return too
 | `KAFKA_BATCH_JOBS_CONSUMER_CONCURRENCY` | `jobs_consumer_concurrency` | `8` | In-process members for `{group}-go-worker-jobs` (plain go topics). |
 | `KAFKA_BATCH_FAIR_READY_CONSUMER_CONCURRENCY` | `fair_ready_consumer_concurrency` | `8` | In-process members **per** fair-ready lane (`time`, `throughput`). |
 | `KAFKA_BATCH_PRIORITY_CONSUMER_CONCURRENCY` | `priority_consumer_concurrency` | `4` | In-process members **per** priority YAML group. |
-| `KAFKA_BATCH_SUPER_FETCH_CONCURRENCY` | `super_fetch_concurrency` | `10` | Goroutine pool size **per member** for in-flight performs (claim → ack → pool). Try higher for IO — see [tuning profiles](#tuning-profiles). |
+| `KAFKA_BATCH_SUPER_FETCH_CONCURRENCY` | `super_fetch_concurrency` | `10` | Goroutine pool size **per member** for in-flight performs. Try higher for IO — see [tuning profiles](#tuning-profiles). |
+| `KAFKA_BATCH_SUPER_FETCH_CLAIM_WINDOW` | `super_fetch_claim_window` | `0` → `2×` concurrency | Max Claimed∨Queued∨Performing per member. Claim+ack is gated here (not the perform pool) so rebalance is not held for long `#perform`. Renew starts at Claim. |
 | — | `super_fetch_orphan_grace` | `40` | Seconds after claim before a missing heartbeat counts as death (reclaim/steal). |
+| `KAFKA_BATCH_CANCELLATION_CACHE_TTL` | `cancellation_cache_ttl` | `120` | Process-local cancelled-batch index TTL (Ruby parity). Workers refresh the Redis ZSET at most once per window — **not** `ZSCORE` per job. Cancellation is eventually consistent until refresh; same-process `CancelBatch` updates the cache immediately. |
 | `KAFKA_BATCH_PRODUCER_REQUIRED_ACKS` | `producer_required_acks` | `all_isr` | Same as daemon — event emission after job completion. |
 
 Fairness admission is capped by control-plane `fairness_global_concurrency` (YAML). Raising worker concurrency above what control admits will backlog **ready** topics, not speed up end-to-end.
+
+**Hot tenants (fair ingest):** `fairness_dynamic_tenant_partitions` defaults to **true** so each tenant gets an exclusive ingest partition (avoids hash collisions under partition-serial dispatch). Override whales with `fairness_tenant_partitions`, or set dynamic to `false` for murmur2 key-hash only. Weighted checkout always passes a positive weight-sum hint (`shint`) so Redis does not full-scan the tenant ring.
 
 #### Tuning profiles
 

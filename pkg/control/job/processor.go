@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/y-shashank/kafka-batch-go/pkg/cancellation"
 	"github.com/y-shashank/kafka-batch-go/pkg/config"
 	"github.com/y-shashank/kafka-batch-go/pkg/fairness"
 	"github.com/y-shashank/kafka-batch-go/pkg/jobexpiry"
@@ -30,7 +31,10 @@ type Processor struct {
 	FairTime       *fairness.Scheduler
 	FairThroughput *fairness.Scheduler
 	Liveness       *liveness.Reporter
-	Now            func() time.Time
+	// CancelCache skips per-job Redis ZSCORE (Ruby CancellationCache). Optional;
+	// when nil, falls back to Store.BatchCancelled.
+	CancelCache *cancellation.Cache
+	Now         func() time.Time
 }
 
 // Outcome describes what happened to one job message.
@@ -57,7 +61,7 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 	}
 
 	if p.Cfg.SkipCancelledJobs && job.BatchID != nil {
-		cancelled, err := p.Store.BatchCancelled(ctx, *job.BatchID)
+		cancelled, err := p.batchCancelled(ctx, *job.BatchID)
 		if err != nil {
 			return out, err
 		}
@@ -459,4 +463,14 @@ func (p *Processor) markJobStarted(ctx context.Context, job protocol.JobMessage,
 		meta.BatchID = *job.BatchID
 	}
 	p.Liveness.JobStarted(ctx, meta)
+}
+
+func (p *Processor) batchCancelled(ctx context.Context, batchID string) (bool, error) {
+	if p.CancelCache != nil {
+		return p.CancelCache.Cancelled(ctx, batchID)
+	}
+	if p.Store == nil {
+		return false, nil
+	}
+	return p.Store.BatchCancelled(ctx, batchID)
 }

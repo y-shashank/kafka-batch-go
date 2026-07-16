@@ -11,6 +11,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/twmb/franz-go/pkg/kgo"
 
+	"github.com/y-shashank/kafka-batch-go/pkg/cancellation"
 	"github.com/y-shashank/kafka-batch-go/pkg/config"
 	"github.com/y-shashank/kafka-batch-go/pkg/control/job"
 	"github.com/y-shashank/kafka-batch-go/pkg/daemon"
@@ -109,11 +110,16 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	}
 	defer prod.Close()
 
+	cancelCache := cancellation.New(cfg.CancellationCacheTTL, st.CancelledBatchIDs)
+	cancellation.SetProcessCache(cancelCache)
+	defer cancellation.SetProcessCache(nil)
+
 	jobProc := &job.Processor{
-		Cfg:      cfg,
-		Manifest: manifest,
-		Store:    st,
-		Producer: prod,
+		Cfg:         cfg,
+		Manifest:    manifest,
+		Store:       st,
+		Producer:    prod,
+		CancelCache: cancelCache,
 	}
 	if cfg.FairnessEnabled {
 		jobProc.FairTime = fairness.NewScheduler(rdb, cfg.FairnessTimeSettings())

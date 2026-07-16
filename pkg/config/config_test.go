@@ -196,6 +196,12 @@ func TestDefaultDaemonConsumerConcurrency(t *testing.T) {
 	if cfg.SuperFetchWorkers() != 10 {
 		t.Fatalf("superfetch workers=%d", cfg.SuperFetchWorkers())
 	}
+	if cfg.SuperFetchClaimWindowSize() != 20 {
+		t.Fatalf("superfetch claim window=%d want 20", cfg.SuperFetchClaimWindowSize())
+	}
+	if !cfg.FairnessDynamicTenantPartitions {
+		t.Fatal("expected fairness_dynamic_tenant_partitions default true")
+	}
 	if cfg.LivenessTTLDuration() != 180*time.Second {
 		t.Fatalf("liveness ttl=%s", cfg.LivenessTTLDuration())
 	}

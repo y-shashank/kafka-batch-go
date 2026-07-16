@@ -80,7 +80,13 @@ func (s *Store) reclaimOne(ctx context.Context, prod Producer, e Entry) error {
 		return nil
 	}
 
-	body, err := markReclaimPayload(e.Payload)
+	rawPayload, err := PayloadForReclaim(&e)
+	if err != nil {
+		log.Printf("[kbatch-workset] reclaim decode job_id=%s: %v", e.JobID, err)
+		_ = s.AbortReclaim(ctx, e.JobID)
+		return err
+	}
+	body, err := markReclaimPayload(rawPayload)
 	if err != nil {
 		log.Printf("[kbatch-workset] reclaim encode job_id=%s: %v", e.JobID, err)
 		_ = s.AbortReclaim(ctx, e.JobID)

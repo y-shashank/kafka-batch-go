@@ -16,7 +16,14 @@ import (
 )
 
 // SuperFetchExecutor claims Redis ownership, Kafka-acks immediately, then runs
-// #perform on a bounded goroutine pool without blocking the poll loop.
+// #perform on a bounded goroutine pool without blocking the poll loop on perform.
+//
+// Two limits:
+//   - ClaimWindow: max jobs Claimed∨Queued∨Performing (gates Claim+Mark)
+//   - Sem: max concurrent #perform
+//
+// ClaimWindow ≥ Sem so ack can run ahead of perform; renew starts at Claim so
+// leases stay alive while waiting for a perform slot.
 type SuperFetchExecutor struct {
 	Work             *workset.Store
 	ConsumerID       string
@@ -24,7 +31,8 @@ type SuperFetchExecutor struct {
 	HeartbeatTTL     time.Duration // live:consumer:* TTL used for pod-alive checks
 	HeartbeatEvery   time.Duration // how often to refresh the heartbeat key
 	OrphanGrace      time.Duration // steal grace aligned with daemon reclaim
-	Sem              chan struct{}
+	ClaimWindow      chan struct{} // outstanding claimed∨queued∨performing
+	Sem              chan struct{} // concurrent #perform
 	Process          func(ctx context.Context, raw []byte, src protocol.SourceCoords) (job.Outcome, error)
 	Apply            func(ctx context.Context, out job.Outcome) error
 	heartbeatStarted sync.Once
@@ -34,7 +42,7 @@ type SuperFetchExecutor struct {
 	lifeMu  sync.Mutex
 	lifeCtx context.Context
 
-	inFlight sync.Map // job_id → struct{} while perform runs locally
+	inFlight sync.Map // job_id → struct{} while claimed/queued/performing locally
 }
 
 func NewSuperFetchExecutor(cfg config.Daemon, work *workset.Store, consumerID string,
@@ -42,6 +50,7 @@ func NewSuperFetchExecutor(cfg config.Daemon, work *workset.Store, consumerID st
 	apply func(ctx context.Context, out job.Outcome) error,
 ) *SuperFetchExecutor {
 	n := cfg.SuperFetchWorkers()
+	win := cfg.SuperFetchClaimWindowSize()
 	lease := cfg.SuperFetchLeaseTTL
 	if lease <= 0 {
 		lease = 2 * time.Minute
@@ -57,6 +66,7 @@ func NewSuperFetchExecutor(cfg config.Daemon, work *workset.Store, consumerID st
 		HeartbeatTTL:   cfg.LivenessTTLDuration(),
 		HeartbeatEvery: cfg.LivenessHeartbeatIntervalDuration(),
 		OrphanGrace:    grace,
+		ClaimWindow:    make(chan struct{}, win),
 		Sem:            make(chan struct{}, n),
 		Process:        process,
 		Apply:          apply,
@@ -119,8 +129,8 @@ func (e *SuperFetchExecutor) StartHeartbeatLoop(ctx context.Context) {
 }
 
 // DispatchClaimsAndAcks claims each record, marks the Kafka offset, and starts
-// perform in the background. Returns when all records in the batch are claimed
-// (or skipped) — does not wait for #perform to finish.
+// perform in the background. Blocks only on ClaimWindow (not perform Sem) so
+// rebalance is not held for the full #perform duration when window > Sem.
 //
 // ctx may be the poll-scoped procCtx (canceled when this function returns).
 // #perform uses BindLife's context so it is not canceled by endProc.
@@ -134,19 +144,19 @@ func (e *SuperFetchExecutor) DispatchClaimsAndAcks(ctx context.Context, cl *kgo.
 		select {
 		case <-ctx.Done():
 			return
-		case e.Sem <- struct{}{}:
+		case e.ClaimWindow <- struct{}{}:
 		}
 		jobID := extractJobID(rec.Value)
 		if jobID == "" {
 			// Malformed — process synchronously for DLT then ack (no Redis claim).
 			e.processMissingJobID(ctx, cl, rec, group)
-			<-e.Sem
+			<-e.ClaimWindow
 			continue
 		}
 		if _, loaded := e.inFlight.LoadOrStore(jobID, struct{}{}); loaded {
-			// Already performing in this process (kafka redelivery).
+			// Already claimed/performing in this process (kafka redelivery).
 			cl.MarkCommitRecords(rec)
-			<-e.Sem
+			<-e.ClaimWindow
 			continue
 		}
 		claim, err := e.Work.Claim(life, workset.ClaimParams{
@@ -159,7 +169,7 @@ func (e *SuperFetchExecutor) DispatchClaimsAndAcks(ctx context.Context, cl *kgo.
 			log.Printf("[kbatch-superfetch] claim error group=%s job_id=%s: %v — leaving unacked",
 				group, jobID, err)
 			e.inFlight.Delete(jobID)
-			<-e.Sem
+			<-e.ClaimWindow
 			continue
 		}
 		if !claim.Won {
@@ -167,22 +177,33 @@ func (e *SuperFetchExecutor) DispatchClaimsAndAcks(ctx context.Context, cl *kgo.
 				group, jobID)
 			cl.MarkCommitRecords(rec)
 			e.inFlight.Delete(jobID)
-			<-e.Sem
+			<-e.ClaimWindow
 			continue
 		}
 		// Durability: Redis owns the job before Kafka forgets it.
 		cl.MarkCommitRecords(rec)
-		go e.perform(life, rec, jobID, claim.Fence, group)
+		// Renew from claim time so lease cannot expire while waiting for Sem.
+		stopRenew := e.startRenew(life, jobID, claim.Fence)
+		go e.perform(life, rec, jobID, claim.Fence, group, stopRenew)
 	}
 }
 
-func (e *SuperFetchExecutor) perform(ctx context.Context, rec *kgo.Record, jobID, fence, group string) {
+func (e *SuperFetchExecutor) perform(ctx context.Context, rec *kgo.Record, jobID, fence, group string, stopRenew func()) {
 	defer func() {
+		if stopRenew != nil {
+			stopRenew()
+		}
 		e.inFlight.Delete(jobID)
-		<-e.Sem
+		<-e.ClaimWindow
 	}()
-	stopRenew := e.startRenew(ctx, jobID, fence)
-	defer stopRenew()
+
+	// Perform pool — may wait here while ClaimWindow already holds the job.
+	select {
+	case <-ctx.Done():
+		return
+	case e.Sem <- struct{}{}:
+	}
+	defer func() { <-e.Sem }()
 
 	src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
 	out, err := e.Process(ctx, rec.Value, src)
