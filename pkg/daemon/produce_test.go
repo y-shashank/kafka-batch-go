@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/y-shashank/kafka-batch-go/pkg/config"
+	"github.com/y-shashank/kafka-batch-go/pkg/control/job"
 	"github.com/y-shashank/kafka-batch-go/pkg/control/retry"
 	"github.com/y-shashank/kafka-batch-go/pkg/instrument"
 	"github.com/y-shashank/kafka-batch-go/pkg/protocol"
@@ -84,6 +85,31 @@ func TestApplyRetryOutcomeExpiredInstruments(t *testing.T) {
 type memProd struct{}
 
 func (memProd) Produce(context.Context, string, string, []byte) error { return nil }
+
+type hangProducer struct{}
+
+func (hangProducer) Produce(ctx context.Context, _, _ string, _ []byte) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestApplyJobSideEffectsHonorsProduceTimeout(t *testing.T) {
+	cfg := config.Daemon{EventsTopic: "events", EventEmitRetries: 0}
+	out := job.Outcome{
+		Event: &protocol.EventMessage{BatchID: "b", JobID: "j", SrcTopic: "jobs"},
+	}
+	// Parent shorter than jobProduceTimeout — proves produce uses a derived timeout ctx.
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := applyJobSideEffects(ctx, cfg, hangProducer{}, out)
+	if err == nil {
+		t.Fatal("expected context deadline error")
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("produce did not honor timeout: %v", time.Since(start))
+	}
+}
 
 func TestEmitRetryDLT(t *testing.T) {
 	var dltType string

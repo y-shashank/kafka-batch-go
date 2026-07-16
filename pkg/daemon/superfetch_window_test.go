@@ -119,3 +119,74 @@ func TestDispatchClaimsAheadOfPerformPool(t *testing.T) {
 	}
 	t.Fatalf("performs=%d want 3 after release", atomic.LoadInt32(&performs))
 }
+
+func TestPerformReleasesSemBeforeSlowApply(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	work := workset.NewStore(rdb)
+
+	var performs int32
+	firstApplyStarted := make(chan struct{}, 1)
+	releaseApply := make(chan struct{})
+	secondProcessStarted := make(chan struct{}, 1)
+
+	cfg := config.DefaultDaemon()
+	cfg.SuperFetchConcurrency = 1
+	cfg.SuperFetchClaimWindow = 4
+	cfg.SuperFetchLeaseTTL = time.Minute
+
+	exec := NewSuperFetchExecutor(cfg, work, "c-sem",
+		func(ctx context.Context, raw []byte, src protocol.SourceCoords) (job.Outcome, error) {
+			n := atomic.AddInt32(&performs, 1)
+			if n == 2 {
+				secondProcessStarted <- struct{}{}
+			}
+			return job.Outcome{CommitOffset: true}, nil
+		},
+		func(ctx context.Context, out job.Outcome) error {
+			select {
+			case firstApplyStarted <- struct{}{}:
+			default:
+			}
+			<-releaseApply
+			return nil
+		},
+	)
+	life := context.Background()
+	exec.BindLife(life)
+
+	for i, id := range []string{"s1", "s2"} {
+		rec := &kgo.Record{Topic: "jobs", Partition: 0, Offset: int64(i + 1), Value: []byte(`{"job_id":"` + id + `"}`)}
+		exec.ClaimWindow <- struct{}{}
+		claim, err := work.Claim(life, workset.ClaimParams{
+			JobID: id, Payload: rec.Value, Topic: rec.Topic,
+			Partition: 0, Offset: rec.Offset, ConsumerID: "c-sem",
+			LeaseTTL: time.Minute, StealGrace: -1,
+		})
+		if err != nil || !claim.Won {
+			t.Fatalf("claim %s: %+v %v", id, claim, err)
+		}
+		exec.inFlight.Store(id, struct{}{})
+		go exec.perform(life, rec, id, claim.Fence, "g", func() {})
+	}
+
+	select {
+	case <-firstApplyStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first apply did not start")
+	}
+	select {
+	case <-secondProcessStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second process blocked on Sem during slow Apply — Sem not released after Process")
+	}
+	close(releaseApply)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&performs) == 2 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("performs=%d want 2", atomic.LoadInt32(&performs))
+}

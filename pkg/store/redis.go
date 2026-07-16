@@ -123,13 +123,26 @@ func (s *RedisStore) RecordCompletionsBatch(ctx context.Context, events []Comple
 		}
 	}
 
-	for _, f := range fires {
-		batch, err := s.FindBatch(ctx, events[f.idx].BatchID)
+	if len(fires) == 0 {
+		return out, nil
+	}
+
+	// Pipeline finalized-batch HGETALLs (Ruby redis_store #29 parity).
+	hpipe := s.client.Pipeline()
+	hcmds := make([]*redis.MapStringStringCmd, len(fires))
+	for i, f := range fires {
+		hcmds[i] = hpipe.HGetAll(ctx, batchKey(events[f.idx].BatchID))
+	}
+	if _, err := hpipe.Exec(ctx); err != nil && err != redis.Nil {
+		return out, err
+	}
+	for i, f := range fires {
+		h, err := hcmds[i].Result()
 		if err != nil {
 			return out, err
 		}
 		out.Finished = append(out.Finished, FinishedBatch{
-			Batch: batch, Outcome: f.outcome, Early: f.code == 3,
+			Batch: hashToBatch(h), Outcome: f.outcome, Early: f.code == 3,
 		})
 	}
 	return out, nil

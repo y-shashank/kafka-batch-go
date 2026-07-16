@@ -235,29 +235,83 @@ func (s *Store) ListOrphans(ctx context.Context, limit int, grace time.Duration)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]Entry, 0, limit)
-	for _, id := range ids {
-		if len(out) >= limit {
-			break
-		}
-		raw, err := s.client.Get(ctx, jobKey(id)).Bytes()
-		if err == redis.Nil {
-			_ = s.client.ZRem(ctx, indexKey, id).Err()
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	// Pass 1: pipeline GETs for all aged candidates.
+	gpipe := s.client.Pipeline()
+	getCmds := make([]*redis.StringCmd, len(ids))
+	for i, id := range ids {
+		getCmds[i] = gpipe.Get(ctx, jobKey(id))
+	}
+	_, _ = gpipe.Exec(ctx)
+
+	type candidate struct {
+		entry Entry
+	}
+	candidates := make([]candidate, 0, len(ids))
+	missing := make([]string, 0)
+	for i, id := range ids {
+		raw, err := getCmds[i].Bytes()
+		if err == redis.Nil || (err == nil && len(raw) == 0) {
+			missing = append(missing, id)
 			continue
 		}
 		if err != nil {
-			return out, err
+			return nil, err
 		}
 		var e Entry
 		if err := json.Unmarshal(raw, &e); err != nil {
 			continue
 		}
-		alive, err := s.client.Exists(ctx, liveKey(e.ConsumerID)).Result()
-		if err != nil {
-			return out, err
+		candidates = append(candidates, candidate{entry: e})
+	}
+	if len(missing) > 0 {
+		rpipe := s.client.Pipeline()
+		for _, id := range missing {
+			rpipe.ZRem(ctx, indexKey, id)
 		}
-		if alive == 0 {
-			out = append(out, e)
+		_, _ = rpipe.Exec(ctx)
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	// Pass 2: pipeline EXISTS for distinct consumer IDs (many orphans share a dead pod).
+	aliveByConsumer := make(map[string]bool, len(candidates))
+	unique := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		cid := c.entry.ConsumerID
+		if _, seen := aliveByConsumer[cid]; seen {
+			continue
+		}
+		aliveByConsumer[cid] = false
+		unique = append(unique, cid)
+	}
+	epipe := s.client.Pipeline()
+	existCmds := make([]*redis.IntCmd, len(unique))
+	for i, cid := range unique {
+		existCmds[i] = epipe.Exists(ctx, liveKey(cid))
+	}
+	if _, err := epipe.Exec(ctx); err != nil && err != redis.Nil {
+		return nil, err
+	}
+	for i, cid := range unique {
+		n, err := existCmds[i].Result()
+		if err != nil {
+			return nil, err
+		}
+		aliveByConsumer[cid] = n > 0
+	}
+
+	out := make([]Entry, 0, limit)
+	for _, c := range candidates {
+		if len(out) >= limit {
+			break
+		}
+		if !aliveByConsumer[c.entry.ConsumerID] {
+			out = append(out, c.entry)
 		}
 	}
 	return out, nil

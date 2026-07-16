@@ -187,6 +187,50 @@ func TestListOrphansRespectsGrace(t *testing.T) {
 	}
 }
 
+func TestListOrphansPipelinesMixedOwners(t *testing.T) {
+	st, mr := testStore(t)
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+
+	for _, c := range []struct {
+		job, consumer string
+	}{
+		{"o1", "dead-pod"},
+		{"o2", "dead-pod"},
+		{"o3", "live-pod"},
+	} {
+		if _, err := st.Claim(ctx, ClaimParams{
+			JobID: c.job, Payload: []byte(`{"job_id":"` + c.job + `"}`), Topic: "jobs",
+			ConsumerID: c.consumer, LeaseTTL: time.Minute, StealGrace: -1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		ageClaim(t, st, mr, c.job, time.Minute)
+	}
+	killConsumer(t, mr, "dead-pod")
+	// Stale index member with missing job key should be pruned.
+	if err := rdb.ZAdd(ctx, indexKey, redis.Z{
+		Score: float64(time.Now().Add(-time.Minute).Unix()), Member: "ghost",
+	}).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	orphans, err := st.ListOrphans(ctx, 10, 40*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, e := range orphans {
+		got[e.JobID] = true
+	}
+	if !got["o1"] || !got["o2"] || got["o3"] || got["ghost"] {
+		t.Fatalf("orphans=%v (want o1,o2 only)", got)
+	}
+	if n, err := rdb.ZScore(ctx, indexKey, "ghost").Result(); err == nil {
+		t.Fatalf("expected ghost pruned from index, score=%v", n)
+	}
+}
+
 func TestListOrphansAndReclaim(t *testing.T) {
 	st, mr := testStore(t)
 	ctx := context.Background()

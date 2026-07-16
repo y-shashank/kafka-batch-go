@@ -109,6 +109,51 @@ func TestRecordCompletionsExecutedThenSuccess(t *testing.T) {
 	}
 }
 
+func TestRecordCompletionsBatchPipelinesMultiFinalize(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mr.Close()
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := NewRedisStore(rdb, time.Hour)
+	ctx := context.Background()
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	for _, id := range []string{"batch-a", "batch-b"} {
+		mr.HSet("kafka_batch:b:"+id,
+			"id", id, "total_jobs", "1", "completed_count", "0", "failed_count", "0",
+			"touched_count", "0", "status", "running", "locked_at", now,
+			"on_success", "Cb", "on_complete", "Cb",
+		)
+		mr.ZAdd("kafka_batch:index:running", 1, id)
+	}
+
+	res, err := st.RecordCompletionsBatch(ctx, []CompletionEvent{
+		{BatchID: "batch-a", JobID: "ja", Status: "success", BatchSeq: 1},
+		{BatchID: "batch-b", JobID: "jb", Status: "success", BatchSeq: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Finished) != 2 {
+		t.Fatalf("finished=%d want 2 (%+v)", len(res.Finished), res.Finished)
+	}
+	got := map[string]string{}
+	for _, f := range res.Finished {
+		if f.Batch == nil {
+			t.Fatal("nil batch in finished")
+		}
+		got[f.Batch.ID] = f.Outcome
+		if f.Batch.Status != "success" || f.Batch.CompletedCount != 1 {
+			t.Fatalf("batch %+v", f.Batch)
+		}
+	}
+	if got["batch-a"] != "success" || got["batch-b"] != "success" {
+		t.Fatalf("outcomes %+v", got)
+	}
+}
+
 func TestRecordCompletionsBatchDedup(t *testing.T) {
 	mr, err := miniredis.Run()
 	if err != nil {

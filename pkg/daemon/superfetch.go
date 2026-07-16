@@ -197,16 +197,11 @@ func (e *SuperFetchExecutor) perform(ctx context.Context, rec *kgo.Record, jobID
 		<-e.ClaimWindow
 	}()
 
-	// Perform pool — may wait here while ClaimWindow already holds the job.
-	select {
-	case <-ctx.Done():
-		return
-	case e.Sem <- struct{}{}:
-	}
-	defer func() { <-e.Sem }()
-
+	// Sem gates concurrent #perform only. Apply (event/retry/DLT produce) and
+	// Complete run after release so slow Kafka emit does not starve the pool.
+	// ClaimWindow still covers the full lifetime (durability / renew).
 	src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
-	out, err := e.Process(ctx, rec.Value, src)
+	out, err := e.processWithSem(ctx, rec.Value, src)
 	if err != nil {
 		log.Printf("[kbatch-superfetch] process error group=%s job_id=%s: %v — leaving in workset",
 			group, jobID, err)
@@ -232,6 +227,16 @@ func (e *SuperFetchExecutor) perform(ctx context.Context, rec *kgo.Record, jobID
 		}
 		return
 	}
+}
+
+func (e *SuperFetchExecutor) processWithSem(ctx context.Context, raw []byte, src protocol.SourceCoords) (job.Outcome, error) {
+	select {
+	case <-ctx.Done():
+		return job.Outcome{}, ctx.Err()
+	case e.Sem <- struct{}{}:
+	}
+	defer func() { <-e.Sem }()
+	return e.Process(ctx, raw, src)
 }
 
 func (e *SuperFetchExecutor) startRenew(ctx context.Context, jobID, fence string) func() {

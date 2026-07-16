@@ -64,25 +64,32 @@ func ApplyJobSideEffects(ctx context.Context, cfg config.Daemon, prod kafkaProdu
 }
 
 func applyJobSideEffects(ctx context.Context, cfg config.Daemon, prod kafkaProducer, out job.Outcome) error {
+	// Bound emit so a wedged broker cannot hold a SuperFetch ClaimWindow forever.
+	produceCtx, cancel := context.WithTimeout(ctx, jobProduceTimeout)
+	defer cancel()
+
 	if out.Event != nil {
-		if err := produceEventWithRetry(ctx, cfg, prod, out.Event); err != nil {
+		if err := produceEventWithRetry(produceCtx, cfg, prod, out.Event); err != nil {
 			return err
 		}
 	}
 	if out.RetryPayload != nil {
-		if err := prod.Produce(ctx, out.RetryTopic, out.RetryKey, out.RetryPayload); err != nil {
+		if err := prod.Produce(produceCtx, out.RetryTopic, out.RetryKey, out.RetryPayload); err != nil {
 			return err
 		}
 	}
 	if out.DLTPayload != nil {
-		if err := prod.Produce(ctx, cfg.DeadLetterTopic, out.DLTKey, out.DLTPayload); err != nil {
+		if err := prod.Produce(produceCtx, cfg.DeadLetterTopic, out.DLTKey, out.DLTPayload); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-const retryProduceTimeout = 30 * time.Second
+const (
+	retryProduceTimeout = 30 * time.Second
+	jobProduceTimeout   = 30 * time.Second
+)
 
 func applyRetryOutcome(ctx context.Context, cfg config.Daemon, prod kafkaProducer, out retry.Outcome, src protocol.SourceCoords) error {
 	if out.Event != nil {
