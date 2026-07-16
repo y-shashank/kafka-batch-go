@@ -59,7 +59,8 @@ func runRetryFailureStoreScenario(t *testing.T, combo Combo, mysql bool, mysqlDS
 	}
 
 	s := e2e.NewStack(t, e2e.BaseHandlersStack, func(_ *e2e.Stack, cfg *e2e.DaemonYAML) {
-		// Keep "retrying" visible long enough for WaitFailureStatus (zero-delay can race).
+		// Keep "retrying" visible long enough for WaitMySQLFailureStatus
+		// (zero-delay can race); only observed in the mysql variant below.
 		cfg.RetryTiers = map[string]int{"short": 2, "medium": 2, "large": 2}
 		if mysql {
 			cfg.Store = "mysql"
@@ -96,10 +97,10 @@ func runRetryFailureStoreScenario(t *testing.T, combo Combo, mysql bool, mysqlDS
 	}
 	jobID = batchJobID(batch, jobID, runtime)
 
+	// No per-job failure metadata is ever written to Redis, so only the
+	// MySQL variant has a failure-store lifecycle to observe here.
 	if mysql {
 		s.WaitMySQLFailureStatus(ctx, mysqlDSN, batch.ID(), jobID, "retrying", 20*time.Second)
-	} else {
-		s.WaitFailureStatus(ctx, batch.ID(), jobID, "retrying", 20*time.Second)
 	}
 
 	s.WaitBatchTimeout(ctx, 90*time.Second, batch.ID(), "success")
@@ -112,7 +113,5 @@ func runRetryFailureStoreScenario(t *testing.T, combo Combo, mysql bool, mysqlDS
 
 	if mysql {
 		s.WaitMySQLFailureCleared(ctx, mysqlDSN, batch.ID(), jobID, 10*time.Second)
-	} else {
-		s.WaitFailureCleared(ctx, batch.ID(), jobID, 10*time.Second)
 	}
 }

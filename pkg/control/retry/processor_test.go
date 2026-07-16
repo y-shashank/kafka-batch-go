@@ -54,6 +54,12 @@ func TestProcessRepublishesWhenReady(t *testing.T) {
 	if _, ok := m["retry_after"]; ok {
 		t.Fatal("retry_after should be stripped")
 	}
+	if m["attempt"] != float64(1) {
+		t.Fatalf("attempt=%v", m["attempt"])
+	}
+	if m["retry_count"] != float64(1) {
+		t.Fatalf("retry_count=%v", m["retry_count"])
+	}
 }
 
 func TestProcessPausesWhenNotReady(t *testing.T) {

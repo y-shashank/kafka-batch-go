@@ -64,19 +64,16 @@ func (p expiredPublisher) publish(ctx context.Context, raw []byte, src protocol.
 			return err
 		}
 	}
-	if drop.Failure != nil {
-		rec := p.failures
-		if rec == nil && p.store != nil {
-			rec = p.store
-		}
-		if rec != nil {
-			_ = rec.RecordFailure(ctx, store.FailureEntry{
+	// Best-effort and only does anything when p.failures is set (MySQL store
+	// mode). The default Redis-backed store never persists per-job failure
+	// metadata for expired jobs either.
+	if drop.Failure != nil && p.failures != nil {
+		_ = p.failures.RecordFailure(ctx, store.FailureEntry{
 			BatchID: drop.Failure.BatchID, JobID: drop.Failure.JobID,
 			WorkerClass: drop.Failure.WorkerClass, ErrorClass: drop.Failure.ErrorClass,
 			ErrorMessage: drop.Failure.ErrorMessage, Status: drop.Failure.Status,
-				Attempt: drop.Failure.Attempt,
-			})
-		}
+			Attempt: drop.Failure.Attempt,
+		})
 	}
 	if drop.DLTPayload != nil {
 		if err := p.prod.Produce(ctx, p.cfg.DeadLetterTopic, drop.DLTKey, drop.DLTPayload); err != nil {

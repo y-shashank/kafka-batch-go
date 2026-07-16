@@ -91,6 +91,10 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 
 	delete(m, "retry_after")
 	delete(m, "retry_to")
+	// Preserve attempt and mirror as retry_count for handlers (Ruby Worker#retry_count).
+	if _, ok := m["attempt"]; ok {
+		m["retry_count"] = m["attempt"]
+	}
 	body, _ := json.Marshal(m)
 	key, _ := m["job_id"].(string)
 	out.ProduceTopic = retryTo

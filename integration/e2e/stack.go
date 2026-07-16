@@ -478,52 +478,6 @@ func (s *Stack) Store() *store.RedisStore {
 	return store.NewRedisStore(s.rdb, 7*24*time.Hour)
 }
 
-// FailureStatus reads a per-batch failure row from Redis (Web UI parity).
-func (s *Stack) FailureStatus(ctx context.Context, batchID, jobID string) (status string, ok bool) {
-	s.T.Helper()
-	raw, err := s.rdb.HGet(ctx, batchFailuresKey(batchID), jobID).Result()
-	if err == redis.Nil || raw == "" {
-		return "", false
-	}
-	if err != nil {
-		s.T.Fatalf("failure status batch=%s job=%s: %v", batchID, jobID, err)
-	}
-	var row map[string]interface{}
-	if err := json.Unmarshal([]byte(raw), &row); err != nil {
-		s.T.Fatalf("failure json batch=%s job=%s: %v", batchID, jobID, err)
-	}
-	st, _ := row["status"].(string)
-	return st, st != ""
-}
-
-func (s *Stack) WaitFailureStatus(ctx context.Context, batchID, jobID, want string, timeout time.Duration) {
-	s.T.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if st, ok := s.FailureStatus(ctx, batchID, jobID); ok && st == want {
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	s.T.Fatalf("timeout waiting failure status=%q batch=%s job=%s", want, batchID, jobID)
-}
-
-func (s *Stack) WaitFailureCleared(ctx context.Context, batchID, jobID string, timeout time.Duration) {
-	s.T.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if _, ok := s.FailureStatus(ctx, batchID, jobID); !ok {
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	s.T.Fatalf("timeout waiting failure clear batch=%s job=%s", batchID, jobID)
-}
-
-func batchFailuresKey(batchID string) string {
-	return "kafka_batch:b:" + batchID + ":failures"
-}
-
 func (s *Stack) WaitBatch(ctx context.Context, batchID string, statuses ...string) *store.Batch {
 	return s.WaitBatchTimeout(ctx, 60*time.Second, batchID, statuses...)
 }

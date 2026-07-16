@@ -37,9 +37,13 @@ func BuildPauseControl(cfg config.Daemon, rdb *redis.Client) (pauseChecker, *con
 	return consumption.NewHybridControl(rdb, mysqlPause, cfg.ConsumptionControlRefreshInterval), mysqlPause, func() { _ = mysqlPause.Close() }, nil
 }
 
+// BuildFailureRecorder returns the durable (MySQL-table) failure recorder
+// when config.Store is "mysql", or nil otherwise. No per-job failure
+// metadata is ever written to Redis: exhausted jobs land on the dead-letter
+// topic and retrying jobs are listed live from the retry topics.
 func BuildFailureRecorder(cfg config.Daemon, st *store.RedisStore) (store.FailureRecorder, func(), error) {
 	if strings.ToLower(cfg.Store) != "mysql" {
-		return st, func() {}, nil
+		return nil, func() {}, nil
 	}
 	if strings.TrimSpace(cfg.StoreMySQLDSN) == "" {
 		return nil, nil, fmt.Errorf("store_mysql_dsn is required when store is mysql")
@@ -48,7 +52,7 @@ func BuildFailureRecorder(cfg config.Daemon, st *store.RedisStore) (store.Failur
 	if err != nil {
 		return nil, nil, fmt.Errorf("store mysql failures: %w", err)
 	}
-	return &store.CompositeFailures{Redis: st, MySQL: mysqlFailures}, func() { _ = mysqlFailures.Close() }, nil
+	return mysqlFailures, func() { _ = mysqlFailures.Close() }, nil
 }
 
 func BuildTenantPartitions(cfg config.Daemon, rdb *redis.Client, prod *kafkaclient.Client) *fairness.TenantPartitions {

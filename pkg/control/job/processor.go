@@ -357,6 +357,7 @@ func (p *Processor) buildRetryPayload(raw []byte, job protocol.JobMessage, retry
 		return nil, err
 	}
 	m["attempt"] = job.Attempt + 1
+	m["retry_count"] = job.Attempt + 1
 	m["retry_after"] = retryAt.UTC().Format(time.RFC3339)
 	m["retry_to"] = retryTo
 	if job.BatchCounted {
@@ -429,23 +430,19 @@ func nonRetryable(err error) bool {
 	}
 }
 
+// recordFailure/clearFailure are best-effort and only do anything when
+// p.Failures is set (MySQL store mode). The default Redis-backed store never
+// persists per-job failure metadata: exhausted jobs land on the dead-letter
+// topic and retrying jobs are listed live from the retry topics.
 func (p *Processor) recordFailure(ctx context.Context, e store.FailureEntry) {
-	rec := p.Failures
-	if rec == nil && p.Store != nil {
-		rec = p.Store
-	}
-	if rec != nil {
-		_ = rec.RecordFailure(ctx, e)
+	if p.Failures != nil {
+		_ = p.Failures.RecordFailure(ctx, e)
 	}
 }
 
 func (p *Processor) clearFailure(ctx context.Context, batchID, jobID string) {
-	rec := p.Failures
-	if rec == nil && p.Store != nil {
-		rec = p.Store
-	}
-	if rec != nil {
-		_ = rec.ClearFailure(ctx, batchID, jobID)
+	if p.Failures != nil {
+		_ = p.Failures.ClearFailure(ctx, batchID, jobID)
 	}
 }
 

@@ -10,38 +10,11 @@ import (
 	"github.com/y-shashank/kafka-batch-go/pkg/client"
 )
 
-func TestE2E_RetryFailureStoreLifecycle_Redis(t *testing.T) {
-	// A non-zero short delay keeps status="retrying" observable; with zero-delay
-	// tiers the fail→retry→success→clear window can fall between WaitFailureStatus polls.
-	s := NewStack(t, baseHandlersStack, func(_ *Stack, cfg *daemonYAML) {
-		cfg.RetryTiers = map[string]int{"short": 2, "medium": 2, "large": 2}
-	})
-	s.Start()
-	defer s.Stop()
-
-	c := s.NewClient()
-	defer c.Close()
-	ctx := context.Background()
-
-	var jobID string
-	batch, err := c.CreateBatch(ctx, client.BatchOptions{Description: "retry failure store"}, func(b *client.Batch) error {
-		var err error
-		jobID, err = b.PushJob(ctx, "integration.go_retry_once", map[string]interface{}{"ping": 1}, client.PushOptions{})
-		return err
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	s.WaitFailureStatus(ctx, batch.ID(), jobID, "retrying", 20*time.Second)
-
-	s.WaitBatch(ctx, batch.ID(), "success")
-	if got := s.WaitMarker(45 * time.Second); got != jobID {
-		t.Fatalf("marker = %q want %q", got, jobID)
-	}
-	s.WaitFailureCleared(ctx, batch.ID(), jobID, 10*time.Second)
-}
-
+// TestE2E_RetryFailureStoreLifecycle_MySQL is the only failure-store
+// lifecycle test: no per-job failure metadata is ever written to Redis
+// (exhausted jobs land on the dead-letter topic, retrying jobs are listed
+// live from the retry topics), so there is nothing to observe there. Only
+// the MySQL-backed store (config.Store == "mysql") durably records failures.
 func TestE2E_RetryFailureStoreLifecycle_MySQL(t *testing.T) {
 	mysqlDSN := mysqlFailuresDSN()
 	if mysqlDSN == "" {

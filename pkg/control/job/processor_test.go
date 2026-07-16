@@ -285,13 +285,15 @@ func TestProcessRetryDoesNotCacheRetryingInRedis(t *testing.T) {
 		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3,
 		BatchSeq: &seq,
 	})
-	p := &Processor{Cfg: config.DefaultDaemon(), Store: st, Failures: &store.CompositeFailures{Redis: st}, Producer: &memProducer{},
+	p := &Processor{Cfg: config.DefaultDaemon(), Store: st, Producer: &memProducer{},
 		Now: func() time.Time { return time.Unix(0, 0) }}
 	out, err := p.Process(context.Background(), rawFail, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 10})
 	if err != nil || out.RetryPayload == nil {
 		t.Fatalf("retry out=%+v err=%v", out, err)
 	}
-	// Retrying jobs are listed from Kafka; Redis failure hash stays empty.
+	// Retrying jobs are listed from Kafka; no per-job failure metadata is
+	// ever written to Redis (p.Failures is nil in this test, matching the
+	// default Redis-only store).
 	n, err := rdb.HLen(context.Background(), "kafka_batch:b:"+batchID+":failures").Result()
 	if err != nil || n != 0 {
 		t.Fatalf("expected no retrying cache row, n=%d err=%v", n, err)
