@@ -6,7 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 	"github.com/y-shashank/kafka-batch-go/pkg/protocol"
+	"github.com/y-shashank/kafka-batch-go/pkg/retrycancel"
 )
 
 type memProducer struct {
@@ -110,5 +113,68 @@ func TestProcessMissingRetryToDLT(t *testing.T) {
 	}
 	if out.Event == nil || out.Event.Status != "failed" {
 		t.Fatalf("event %+v", out.Event)
+	}
+}
+
+func TestProcessSkipsCancelledBeforePause(t *testing.T) {
+	mr := miniredis.RunT(t)
+	cancel := &retrycancel.Store{Client: redis.NewClient(&redis.Options{Addr: mr.Addr()})}
+	ctx := context.Background()
+	if _, err := cancel.Cancel(ctx, []string{"j1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Unix(100, 0)
+	raw, _ := json.Marshal(map[string]interface{}{
+		"job_id":      "j1",
+		"batch_id":    "b1",
+		"batch_seq":   float64(1),
+		"retry_after": now.Add(2 * time.Minute).UTC().Format(time.RFC3339),
+		"retry_to":    "jobs.worker",
+	})
+	p := &Processor{
+		Producer: &memProducer{}, Cancel: cancel,
+		Now: func() time.Time { return now }, MaxPause: 30 * time.Second,
+	}
+	out, err := p.Process(ctx, raw, protocol.SourceCoords{Topic: "retry.short", Partition: 0, Offset: 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Pause {
+		t.Fatal("should not pause cancelled job")
+	}
+	if !out.CommitOffset {
+		t.Fatal("should commit skipped job")
+	}
+	if out.Event == nil || out.Event.Status != "failed" {
+		t.Fatalf("expected failed event, got %+v", out.Event)
+	}
+	if cancel.Cancelled(ctx, "j1") {
+		t.Fatal("should acknowledge cancel")
+	}
+}
+
+func TestProcessSkipsWatermark(t *testing.T) {
+	mr := miniredis.RunT(t)
+	cancel := &retrycancel.Store{Client: redis.NewClient(&redis.Options{Addr: mr.Addr()})}
+	ctx := context.Background()
+	_ = cancel.SetSkipWatermarks(ctx, map[string]map[int32]int64{"retry.short": {0: 9}})
+
+	now := time.Unix(100, 0)
+	raw, _ := json.Marshal(map[string]interface{}{
+		"job_id":      "j9",
+		"retry_after": now.Add(2 * time.Minute).UTC().Format(time.RFC3339),
+		"retry_to":    "jobs.worker",
+	})
+	p := &Processor{
+		Producer: &memProducer{}, Cancel: cancel,
+		Now: func() time.Time { return now }, MaxPause: 30 * time.Second,
+	}
+	out, err := p.Process(ctx, raw, protocol.SourceCoords{Topic: "retry.short", Partition: 0, Offset: 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Pause || out.ProduceTopic != "" {
+		t.Fatalf("expected skip, got %+v", out)
 	}
 }

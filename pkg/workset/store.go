@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+	"github.com/y-shashank/kafka-batch-go/pkg/liveness"
 )
 
 const (
@@ -376,7 +377,8 @@ func (s *Store) AbortReclaim(ctx context.Context, jobID string) error {
 
 // TouchConsumer refreshes the live:consumer heartbeat for a SuperFetch member ID.
 // Must use the same consumerID stored on working-set entries so reclaim does not
-// false-positive while the member is alive.
+// false-positive while the member is alive. Writes JSON (rss/cpu) so the Ruby
+// /live dashboard can show SuperFetch members the same way as poll consumers.
 func (s *Store) TouchConsumer(ctx context.Context, consumerID string, ttl time.Duration) error {
 	if s == nil || s.client == nil || consumerID == "" {
 		return nil
@@ -384,5 +386,6 @@ func (s *Store) TouchConsumer(ctx context.Context, consumerID string, ttl time.D
 	if ttl <= 0 {
 		ttl = defaultHeartbeatTTL
 	}
-	return s.client.Set(ctx, liveKey(consumerID), "1", ttl).Err()
+	payload := liveness.ConsumerHeartbeatJSON(consumerID, "", liveness.DefaultProcessSampler())
+	return s.client.Set(ctx, liveKey(consumerID), payload, ttl).Err()
 }

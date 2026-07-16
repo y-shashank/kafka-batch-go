@@ -21,6 +21,7 @@ import (
 	"github.com/y-shashank/kafka-batch-go/pkg/metrics"
 	"github.com/y-shashank/kafka-batch-go/pkg/priority"
 	"github.com/y-shashank/kafka-batch-go/pkg/protocol"
+	"github.com/y-shashank/kafka-batch-go/pkg/retrycancel"
 	"github.com/y-shashank/kafka-batch-go/pkg/store"
 	"github.com/y-shashank/kafka-batch-go/pkg/workset"
 )
@@ -120,6 +121,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 		Store:       st,
 		Producer:    prod,
 		CancelCache: cancelCache,
+		RetryCancel: &retrycancel.Store{Client: rdb},
 	}
 	if cfg.FairnessEnabled {
 		jobProc.FairTime = fairness.NewScheduler(rdb, cfg.FairnessTimeSettings())

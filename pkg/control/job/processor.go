@@ -14,6 +14,7 @@ import (
 	"github.com/y-shashank/kafka-batch-go/pkg/kbatch"
 	"github.com/y-shashank/kafka-batch-go/pkg/liveness"
 	"github.com/y-shashank/kafka-batch-go/pkg/protocol"
+	"github.com/y-shashank/kafka-batch-go/pkg/retrycancel"
 	"github.com/y-shashank/kafka-batch-go/pkg/store"
 )
 // Producer publishes Kafka messages.
@@ -34,6 +35,8 @@ type Processor struct {
 	// CancelCache skips per-job Redis ZSCORE (Ruby CancellationCache). Optional;
 	// when nil, falls back to Store.BatchCancelled.
 	CancelCache *cancellation.Cache
+	// RetryCancel skips operator-deleted retries (job_id cancel set).
+	RetryCancel *retrycancel.Store
 	Now         func() time.Time
 }
 
@@ -70,6 +73,19 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 			emitJobCancelled(job)
 			return out, nil
 		}
+	}
+
+	if p.RetryCancel != nil && p.RetryCancel.Cancelled(ctx, job.JobID) {
+		if job.BatchID != nil && job.BatchSeq != nil {
+			ev := p.buildEvent(job, "failed", src)
+			out.Event = &ev
+		}
+		if job.BatchID != nil {
+			p.clearFailure(ctx, *job.BatchID, job.JobID)
+		}
+		p.RetryCancel.Acknowledge(ctx, job.JobID)
+		p.releaseUniq(ctx, job)
+		return out, nil
 	}
 
 	if jobexpiry.Expired(job.ValidTill, p.now()) {
@@ -266,7 +282,7 @@ func (p *Processor) handleFailure(ctx context.Context, job protocol.JobMessage, 
 		delay := p.retryDelay(tier)
 		retryAt := p.now().Add(delay)
 
-		p.recordExecutionFailure(ctx, job, execErr, "retrying", retryAt.UTC().Format(time.RFC3339))
+		// Retrying jobs are listed from Kafka (Ruby parity); do not cache in Redis.
 
 		// Sidekiq-style: first finish touches the batch for on_complete; job keeps retrying.
 		if job.BatchID != nil && job.BatchSeq != nil && !job.BatchCounted {

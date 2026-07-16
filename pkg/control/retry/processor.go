@@ -7,6 +7,7 @@ import (
 
 	"github.com/y-shashank/kafka-batch-go/pkg/jobexpiry"
 	"github.com/y-shashank/kafka-batch-go/pkg/protocol"
+	"github.com/y-shashank/kafka-batch-go/pkg/retrycancel"
 )
 
 // Producer publishes Kafka messages.
@@ -17,6 +18,7 @@ type Producer interface {
 // Processor handles retry-tier messages.
 type Processor struct {
 	Producer Producer
+	Cancel   *retrycancel.Store
 	Now      func() time.Time
 	MaxPause time.Duration
 }
@@ -41,6 +43,15 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 		dlt, key := dltRaw(raw, src.Topic)
 		out.DLTPayload = dlt
 		out.DLTKey = key
+		return out, nil
+	}
+
+	jobID, _ := m["job_id"].(string)
+	if p.Cancel != nil && p.Cancel.ShouldSkip(ctx, src.Topic, src.Partition, src.Offset, jobID) {
+		if ev := failedEvent(m, src); ev != nil {
+			out.Event = ev
+		}
+		p.Cancel.Acknowledge(ctx, jobID)
 		return out, nil
 	}
 

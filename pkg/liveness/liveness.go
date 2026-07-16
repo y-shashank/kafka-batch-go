@@ -34,11 +34,13 @@ type Reporter struct {
 	Client           *redis.Client
 	TTL              time.Duration
 	HeartbeatEvery   time.Duration
+	StatsInterval    time.Duration // CPU/RSS sample throttle (default 15s)
 	ConsumerID       string
 	TrackRunningJobs bool
 
 	mu        sync.Mutex
 	lastTopic string
+	stats     *processSampler
 }
 
 func NewReporter(client *redis.Client, ttl time.Duration) *Reporter {
@@ -50,8 +52,10 @@ func NewReporter(client *redis.Client, ttl time.Duration) *Reporter {
 		Client:           client,
 		TTL:              ttl,
 		HeartbeatEvery:   defaultInterval,
+		StatsInterval:    defaultStatsInterval,
 		ConsumerID:       fmt.Sprintf("%s:%d:%s", host, os.Getpid(), uuid.NewString()[:6]),
 		TrackRunningJobs: true,
+		stats:            newProcessSampler(defaultStatsInterval),
 	}
 }
 
@@ -123,17 +127,41 @@ func (r *Reporter) Heartbeat(ctx context.Context, topic string) {
 	if topic == "" {
 		topic = r.lastTopic
 	}
+	if r.stats == nil {
+		r.stats = newProcessSampler(r.StatsInterval)
+	}
+	sampler := r.stats
 	r.mu.Unlock()
-	payload, _ := json.Marshal(map[string]interface{}{
-		"consumer_id": r.ConsumerID,
+	payload := ConsumerHeartbeatJSON(r.ConsumerID, topic, sampler)
+	_ = r.Client.Set(ctx, consumerPrefix+r.ConsumerID, payload, r.TTL).Err()
+}
+
+// ConsumerHeartbeatJSON builds the Redis live:consumer payload (Ruby Liveness parity),
+// including throttled rss_bytes / cpu_pct when sampler is non-nil.
+func ConsumerHeartbeatJSON(consumerID, topic string, sampler *processSampler) []byte {
+	m := map[string]interface{}{
+		"consumer_id": consumerID,
 		"hostname":    hostname(),
 		"pid":         os.Getpid(),
 		"topic":       topic,
 		"last_seen":   time.Now().UTC().Format(time.RFC3339),
 		"runtime":     "go",
-	})
-	_ = r.Client.Set(ctx, consumerPrefix+r.ConsumerID, payload, r.TTL).Err()
+	}
+	if sampler != nil {
+		for k, v := range sampler.sample() {
+			m[k] = v
+		}
+	}
+	raw, _ := json.Marshal(m)
+	return raw
 }
+
+// DefaultProcessSampler returns a shared sampler for SuperFetch heartbeats.
+func DefaultProcessSampler() *processSampler {
+	return sharedSampler
+}
+
+var sharedSampler = newProcessSampler(defaultStatsInterval)
 
 func hostname() string {
 	h, _ := os.Hostname()

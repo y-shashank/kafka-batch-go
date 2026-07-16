@@ -26,6 +26,7 @@ import (
 	"github.com/y-shashank/kafka-batch-go/pkg/priority"
 	"github.com/y-shashank/kafka-batch-go/pkg/reconciler"
 	"github.com/y-shashank/kafka-batch-go/pkg/protocol"
+	"github.com/y-shashank/kafka-batch-go/pkg/retrycancel"
 	"github.com/y-shashank/kafka-batch-go/pkg/schedule"
 	"github.com/y-shashank/kafka-batch-go/pkg/store"
 	"github.com/y-shashank/kafka-batch-go/pkg/workset"
@@ -106,7 +107,8 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	defer prod.Close()
 
 	eventProc := &event.Processor{Cfg: cfg, Store: st, Producer: prod}
-	retryProc := &retry.Processor{Producer: prod, MaxPause: cfg.RetryMaxPause}
+	retryCancel := &retrycancel.Store{Client: rdb}
+	retryProc := &retry.Processor{Producer: prod, Cancel: retryCancel, MaxPause: cfg.RetryMaxPause}
 	pauseCtl, _, closePauseCtl, err := BuildPauseControl(cfg, rdb)
 	if err != nil {
 		return err

@@ -14,6 +14,7 @@ import (
 	"github.com/y-shashank/kafka-batch-go/pkg/kbatch"
 	"github.com/y-shashank/kafka-batch-go/pkg/liveness"
 	"github.com/y-shashank/kafka-batch-go/pkg/protocol"
+	"github.com/y-shashank/kafka-batch-go/pkg/retrycancel"
 	"github.com/y-shashank/kafka-batch-go/pkg/store"
 )
 
@@ -264,11 +265,9 @@ func TestProcessRetriesExhaustedHookBeforeDLT(t *testing.T) {
 	}
 }
 
-func TestProcessRecordsRetryFailureAndClearsOnSuccess(t *testing.T) {
+func TestProcessRetryDoesNotCacheRetryingInRedis(t *testing.T) {
 	kbatch.Reset()
-	attempts := 0
 	kbatch.Register("test.flip", func(ctx *kbatch.Context) error {
-		attempts++
 		if ctx.Attempt == 0 {
 			return &kbatch.HandlerError{Class: "Boom", Message: "boom"}
 		}
@@ -284,35 +283,65 @@ func TestProcessRecordsRetryFailureAndClearsOnSuccess(t *testing.T) {
 	rawFail, _ := json.Marshal(protocol.JobMessage{
 		JobID: "j1", BatchID: &batchID, JobType: "test.flip", WorkerClass: "go:test.flip",
 		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3,
-		BatchSeq: &seq, 	})
+		BatchSeq: &seq,
+	})
 	p := &Processor{Cfg: config.DefaultDaemon(), Store: st, Failures: &store.CompositeFailures{Redis: st}, Producer: &memProducer{},
 		Now: func() time.Time { return time.Unix(0, 0) }}
 	out, err := p.Process(context.Background(), rawFail, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 10})
 	if err != nil || out.RetryPayload == nil {
 		t.Fatalf("retry out=%+v err=%v", out, err)
 	}
-
-	raw, err := rdb.HGet(context.Background(), "kafka_batch:b:"+batchID+":failures", "j1").Result()
-	if err != nil || raw == "" {
-		t.Fatalf("expected failure row, err=%v raw=%q", err, raw)
-	}
-	var row map[string]interface{}
-	_ = json.Unmarshal([]byte(raw), &row)
-	if row["status"] != "retrying" {
-		t.Fatalf("status %v", row["status"])
+	// Retrying jobs are listed from Kafka; Redis failure hash stays empty.
+	n, err := rdb.HLen(context.Background(), "kafka_batch:b:"+batchID+":failures").Result()
+	if err != nil || n != 0 {
+		t.Fatalf("expected no retrying cache row, n=%d err=%v", n, err)
 	}
 
 	rawOK, _ := json.Marshal(protocol.JobMessage{
 		JobID: "j1", BatchID: &batchID, JobType: "test.flip", WorkerClass: "go:test.flip",
 		Payload: map[string]interface{}{}, Attempt: 1, MaxRetries: 3,
-		BatchSeq: &seq, 	})
+		BatchSeq: &seq,
+	})
 	out, err = p.Process(context.Background(), rawOK, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 11})
-	if err != nil || out.Event == nil {
+	if err != nil || out.Event == nil || out.Event.Status != "success" {
 		t.Fatalf("success out=%+v err=%v", out, err)
 	}
-	n, err := rdb.HLen(context.Background(), "kafka_batch:b:"+batchID+":failures").Result()
-	if err != nil || n != 0 {
-		t.Fatalf("expected failure cleared, n=%d err=%v", n, err)
+}
+
+func TestProcessSkipsRetryCancelJobID(t *testing.T) {
+	kbatch.Reset()
+	ran := false
+	kbatch.Register("test.skip", func(ctx *kbatch.Context) error {
+		ran = true
+		return nil
+	})
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := store.NewRedisStore(rdb, time.Hour)
+	cancel := &retrycancel.Store{Client: rdb}
+	ctx := context.Background()
+	if _, err := cancel.Cancel(ctx, []string{"j-skip"}); err != nil {
+		t.Fatal(err)
+	}
+	batchID := "b-skip"
+	seq := int64(1)
+	raw, _ := json.Marshal(protocol.JobMessage{
+		JobID: "j-skip", BatchID: &batchID, JobType: "test.skip", WorkerClass: "go:test.skip",
+		Payload: map[string]interface{}{}, BatchSeq: &seq,
+	})
+	p := &Processor{Cfg: config.DefaultDaemon(), Store: st, Producer: &memProducer{}, RetryCancel: cancel}
+	out, err := p.Process(ctx, raw, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran {
+		t.Fatal("handler should not run")
+	}
+	if out.Event == nil || out.Event.Status != "failed" {
+		t.Fatalf("event %+v", out.Event)
+	}
+	if cancel.Cancelled(ctx, "j-skip") {
+		t.Fatal("expected acknowledge")
 	}
 }
 
