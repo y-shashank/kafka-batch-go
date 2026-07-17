@@ -958,10 +958,14 @@ func (c Daemon) RetryTierFor(nextAttempt int, workerTier string) string {
 
 func hostname() string {
 	h, err := os.Hostname()
-	if err != nil {
-		return "kbatch-daemon"
+	if err != nil || h == "" {
+		h = "kbatch-daemon"
 	}
-	return h
+	// Match Ruby KafkaBatch.node_id: prefer K8s pod name via HOSTNAME, suffix PID.
+	if env := os.Getenv("HOSTNAME"); env != "" {
+		h = env
+	}
+	return fmt.Sprintf("%s#%d", h, os.Getpid())
 }
 
 // Manifest loads handler definitions (topic routing for Go handlers).

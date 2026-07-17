@@ -163,16 +163,24 @@ func (w *Writer) Handle(event string, payload map[string]interface{}, _ float64)
 	}
 	switch event {
 	case "job.processed":
-		w.Record("processed", stringField(payload, "worker_class"), 1)
+		w.Record("processed", jobTypeField(payload), 1)
 	case "job.retried":
-		w.Record("retried", stringField(payload, "worker_class"), 1)
+		w.Record("retried", jobTypeField(payload), 1)
 	case "job.failed":
-		w.Record("failed", stringField(payload, "worker_class"), 1)
+		w.Record("failed", jobTypeField(payload), 1)
 	case "workset.reclaimed":
 		if n := intField(payload, "reclaimed"); n > 0 {
 			w.Record("reclaimed", "", n)
 		}
 	}
+}
+
+// jobTypeField prefers job_type (Go handlers) then worker_class (Ruby parity).
+func jobTypeField(payload map[string]interface{}) string {
+	if jt := stringField(payload, "job_type"); jt != "" {
+		return jt
+	}
+	return stringField(payload, "worker_class")
 }
 
 // Record writes one HINCRBY (+ pipelined EXPIRE refresh) for a status/job_type

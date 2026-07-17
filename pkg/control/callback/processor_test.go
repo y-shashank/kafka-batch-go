@@ -60,12 +60,48 @@ func TestProcessClaimsAndInvokes(t *testing.T) {
 	if !out.CommitOffset {
 		t.Fatal("expected commit")
 	}
-	if len(inv.calls) != 1 || inv.calls[0].BatchID != batchID {
+  if len(inv.calls) != 1 || inv.calls[0].BatchID != batchID {
 		t.Fatalf("invoker calls %+v", inv.calls)
 	}
 	dispatched, err := st.CallbackDispatched(context.Background(), batchID)
 	if err != nil || !dispatched {
 		t.Fatalf("dispatched=%v err=%v", dispatched, err)
+	}
+	by, err := rdb.HGet(context.Background(), "kafka_batch:b:"+batchID, "callback_dispatched_by").Result()
+	if err != nil || by != "node-1" {
+		t.Fatalf("callback_dispatched_by=%q err=%v", by, err)
+	}
+}
+
+func TestProcessRecordsRunnerWhenPreclaimed(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := store.NewRedisStore(rdb, time.Hour)
+
+	batchID := "cb-pre"
+	now := time.Now().UTC().Format(time.RFC3339)
+	mr.HSet("kafka_batch:b:"+batchID,
+		"id", batchID, "status", "success", "total_jobs", "1",
+		"completed_count", "1", "failed_count", "0",
+		"callback_dispatched_at", now,
+		"complete_callback_dispatched_at", now,
+	)
+
+	inv := &spyInvoker{}
+	p := &Processor{Store: st, Invoker: inv, NodeID: "runner-pod"}
+	raw, _ := json.Marshal(protocol.CallbackMessage{
+		BatchID: batchID, Outcome: "complete", Preclaimed: true, OnComplete: "MyCb",
+	})
+	_, err := p.Process(context.Background(), raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inv.calls) != 1 {
+		t.Fatalf("expected invoke, got %+v", inv.calls)
+	}
+	by, err := rdb.HGet(context.Background(), "kafka_batch:b:"+batchID, "callback_dispatched_by").Result()
+	if err != nil || by != "runner-pod" {
+		t.Fatalf("callback_dispatched_by=%q err=%v want runner-pod", by, err)
 	}
 }
 

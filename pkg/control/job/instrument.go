@@ -8,23 +8,41 @@ import (
 )
 
 func emitJobProcessed(job protocol.JobMessage, durationMs float64) {
-	instrument.JobProcessed(job.JobID, deref(job.BatchID), job.WorkerClass, durationMs)
+	instrument.Emit("job.processed", jobInstrumentPayload(job, nil), durationMs)
 }
 
 func emitJobCancelled(job protocol.JobMessage) {
-	instrument.JobCancelled(job.JobID, deref(job.BatchID), job.WorkerClass)
+	instrument.Emit("job.cancelled", jobInstrumentPayload(job, nil), 0)
 }
 
 func emitJobExpired(job protocol.JobMessage, validTill string) {
-	instrument.JobExpired(job.JobID, deref(job.BatchID), job.WorkerClass, validTill)
+	instrument.Emit("job.expired", jobInstrumentPayload(job, map[string]interface{}{
+		"valid_till": validTill,
+	}), 0)
 }
 
 func emitJobRetried(job protocol.JobMessage, nextAttempt int, retryTopic string) {
-	instrument.JobRetried(job.JobID, deref(job.BatchID), job.WorkerClass, job.Attempt, nextAttempt, retryTopic)
+	instrument.Emit("job.retried", jobInstrumentPayload(job, map[string]interface{}{
+		"attempt":      job.Attempt,
+		"next_attempt": nextAttempt,
+		"retry_topic":  retryTopic,
+	}), 0)
 }
 
 func emitJobFailed(job protocol.JobMessage, attempt int, errClass, errMsg string) {
-	instrument.JobFailed(job.JobID, deref(job.BatchID), job.WorkerClass, attempt, errClass, errMsg)
+	instrument.Emit("job.failed", jobInstrumentPayload(job, map[string]interface{}{
+		"attempt":       attempt,
+		"error_class":   errClass,
+		"error_message": errMsg,
+	}), 0)
+}
+
+func jobInstrumentPayload(job protocol.JobMessage, extra map[string]interface{}) map[string]interface{} {
+	payload := instrument.JobPayload(job.JobID, deref(job.BatchID), job.WorkerClass, extra)
+	if job.JobType != "" {
+		payload["job_type"] = job.JobType
+	}
+	return payload
 }
 
 func emitDLTPublished(jobID, batchID, dltType, sourceTopic string) {

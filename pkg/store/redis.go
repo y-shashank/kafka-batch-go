@@ -190,6 +190,17 @@ func (s *RedisStore) ClaimCallback(ctx context.Context, batchID, nodeID string, 
 	return res == 1, err
 }
 
+// RecordCallbackRunner writes callback_dispatched_by for the UI "Callback ran on"
+// field. Needed when events Lua already preclaimed claim stamps (preclaimed:true)
+// so ClaimCallback is skipped and would leave the field blank.
+func (s *RedisStore) RecordCallbackRunner(ctx context.Context, batchID, nodeID string) error {
+	if s == nil || s.client == nil || batchID == "" || nodeID == "" {
+		return nil
+	}
+	_, err := s.client.Eval(ctx, recordCallbackRunnerLua, []string{batchKey(batchID)}, nodeID).Result()
+	return err
+}
+
 func (s *RedisStore) CallbackDispatched(ctx context.Context, batchID string) (bool, error) {
 	v, err := s.client.HGet(ctx, batchKey(batchID), "callback_dispatched_at").Result()
 	if err == redis.Nil {

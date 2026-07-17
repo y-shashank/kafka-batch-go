@@ -18,8 +18,9 @@ type Config struct {
 }
 
 var (
-	mu        sync.Mutex
-	installed bool
+	mu         sync.Mutex
+	installed  bool
+	removeFunc func()
 )
 
 // FromDaemon maps daemon YAML/env settings to metrics config.
@@ -31,11 +32,15 @@ func FromDaemon(cfg config.Daemon) Config {
 	}
 }
 
-// Install registers the metrics bridge on instrument.Handler when enabled.
+// Install registers the metrics bridge via instrument.AddHandler when enabled
+// (coexists with perfmetrics.Install — do not use SetHandler here).
 func Install(cfg Config) error {
 	mu.Lock()
 	defer mu.Unlock()
 	if !cfg.Enabled {
+		return nil
+	}
+	if installed {
 		return nil
 	}
 	prefix := cfg.Prefix
@@ -57,7 +62,7 @@ func Install(cfg Config) error {
 		return errNoSink
 	}
 
-	instrument.SetHandler(func(event string, payload map[string]interface{}, durationMs float64) {
+	removeFunc = instrument.AddHandler(func(event string, payload map[string]interface{}, durationMs float64) {
 		adapter.emit(event, payload, durationMs)
 	})
 	installed = true
@@ -69,10 +74,11 @@ func Install(cfg Config) error {
 func Reset() {
 	mu.Lock()
 	defer mu.Unlock()
-	if installed {
-		instrument.SetHandler(nil)
-		installed = false
+	if installed && removeFunc != nil {
+		removeFunc()
 	}
+	installed = false
+	removeFunc = nil
 }
 
 type emitter interface {

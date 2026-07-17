@@ -35,6 +35,12 @@ type Client struct {
 // New connects to Kafka and Redis and loads the handler manifest.
 func New(cfg Config) (*Client, error) {
 	ApplyEnv(&cfg)
+	if cfg.BatchTTL <= 0 {
+		cfg.BatchTTL = DefaultConfig().BatchTTL
+	}
+	if cfg.UniqLockTTL <= 0 {
+		cfg.UniqLockTTL = DefaultConfig().UniqLockTTL
+	}
 	if len(cfg.Brokers) == 0 {
 		return nil, ConfigurationError{Message: "brokers are required"}
 	}

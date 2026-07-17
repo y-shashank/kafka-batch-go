@@ -146,6 +146,29 @@ func TestHandleRoutesInstrumentationEventsToRecord(t *testing.T) {
 	}
 }
 
+func TestHandlePrefersJobTypeOverWorkerClass(t *testing.T) {
+	w, rdb, _ := newTestWriter(t)
+	ctx := context.Background()
+
+	w.Handle("job.processed", map[string]interface{}{
+		"job_id":       "j1",
+		"job_type":     "hello.go",
+		"worker_class": "go:hello.go",
+	}, 0)
+
+	key := "kafka_batch:perf:min:" + itoa(w.BucketStart(time.Now())) + ":processed"
+	vals, err := rdb.HGetAll(ctx, key).Result()
+	if err != nil {
+		t.Fatalf("hgetall: %v", err)
+	}
+	if vals["hello.go"] != "1" {
+		t.Fatalf("hello.go = %q, want 1 (job_type should win); vals=%v", vals["hello.go"], vals)
+	}
+	if vals["go:hello.go"] != "" {
+		t.Fatalf("should not write worker_class when job_type present; vals=%v", vals)
+	}
+}
+
 func TestInstallAddsHandlerAndResetRemovesIt(t *testing.T) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})

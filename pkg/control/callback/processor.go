@@ -74,6 +74,11 @@ func (p *Processor) Process(ctx context.Context, raw []byte) (Outcome, error) {
 			return out, nil
 		}
 	}
+	// Events Lua preclaims claim stamps without callback_dispatched_by;
+	// record the runner so the UI "Callback ran on" field is populated.
+	if err := p.Store.RecordCallbackRunner(ctx, cb.BatchID, p.NodeID); err != nil {
+		log.Printf("[kbatch-daemon] record callback runner batch_id=%s: %v", cb.BatchID, err)
+	}
 	if p.Invoker == nil {
 		return out, nil
 	}

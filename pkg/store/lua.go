@@ -148,6 +148,15 @@ end
 return won
 `
 
+// EXISTS-guarded write of callback_dispatched_by (UI "Callback ran on").
+// Used when ledger Lua already preclaimed claim stamps so ClaimCallback is skipped.
+const recordCallbackRunnerLua = `
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+if ARGV[1] == nil or ARGV[1] == '' then return 0 end
+redis.call('HSET', KEYS[1], 'callback_dispatched_by', ARGV[1])
+return 1
+`
+
 const createBatchLua = `
 local created = redis.call('HSETNX', KEYS[1], 'id', ARGV[1])
 if created == 0 then return 0 end
