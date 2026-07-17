@@ -207,3 +207,62 @@ func TestSuperFetchSkipsDuplicateInFlight(t *testing.T) {
 		t.Fatal("should not perform")
 	}
 }
+
+func TestSuperFetchStopAcceptingAndWaitInFlight(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	work := workset.NewStore(rdb)
+	cfg := config.DefaultDaemon()
+	cfg.SuperFetchConcurrency = 2
+
+	release := make(chan struct{})
+	var started sync.WaitGroup
+	started.Add(1)
+	exec := NewSuperFetchExecutor(cfg, work, "c-drain",
+		func(ctx context.Context, raw []byte, src protocol.SourceCoords) (job.Outcome, error) {
+			started.Done()
+			<-release
+			return job.Outcome{CommitOffset: true}, nil
+		},
+		func(ctx context.Context, out job.Outcome) error { return nil },
+	)
+	life := context.Background()
+	exec.BindLife(life)
+
+	rec := &kgo.Record{
+		Topic: "jobs", Partition: 0, Offset: 1,
+		Value: []byte(`{"job_id":"drain-1","job_type":"x"}`),
+	}
+	claim, err := work.Claim(life, workset.ClaimParams{
+		JobID: "drain-1", Payload: rec.Value, Topic: rec.Topic,
+		Partition: 0, Offset: 1, ConsumerID: "c-drain", LeaseTTL: time.Minute, StealGrace: -1,
+	})
+	if err != nil || !claim.Won {
+		t.Fatalf("claim=%+v err=%v", claim, err)
+	}
+	exec.inFlight.Store("drain-1", struct{}{})
+	exec.ClaimWindow <- struct{}{}
+	go exec.perform(life, rec, "drain-1", claim.Fence, "g", func() {})
+	started.Wait()
+	if exec.InFlightCount() != 1 {
+		t.Fatalf("expected 1 in-flight, got %d", exec.InFlightCount())
+	}
+
+	exec.StopAccepting()
+	if exec.accepting.Load() {
+		t.Fatal("expected accepting=false")
+	}
+	// Dispatch must no-op after StopAccepting (nil client is fine — returns before use).
+	exec.DispatchClaimsAndAcks(life, nil, []*kgo.Record{rec}, "g")
+	if exec.InFlightCount() != 1 {
+		t.Fatalf("StopAccepting should refuse new claims, in-flight=%d", exec.InFlightCount())
+	}
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		close(release)
+	}()
+	if rem := exec.WaitInFlight(2 * time.Second); rem != 0 {
+		t.Fatalf("expected drain complete, remaining=%d", rem)
+	}
+}

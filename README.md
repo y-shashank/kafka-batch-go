@@ -731,6 +731,30 @@ Handlers should stay idempotent — reclaim after death can re-run a job.
 | One partition lags while others idle on same member | Lower `KAFKA_BATCH_CONSUMER_FETCH_MAX_PARTITION_BYTES` or `KAFKA_BATCH_CONSUMER_FETCH_MAX_BYTES` |
 | Polls return too few records (large messages / WAN) | Raise `KAFKA_BATCH_CONSUMER_FETCH_MAX_BYTES` and/or `KAFKA_BATCH_CONSUMER_FETCH_MAX_PARTITION_BYTES` |
 
+## Execution mode: `watermark` (advanced, opt-in)
+
+By default, Go workers execute jobs with **SuperFetch**: Redis tracks every in-flight job in a working set, the Kafka offset is committed *ahead* of `#perform`, and a control-plane reclaim loop re-produces a dead pod's in-flight jobs. That costs ~3 Redis round-trips per job (`Claim` + `StillOwned` + `Complete`) but lets one partition feed many long jobs and survive a crash without re-running the window.
+
+`execution_mode: watermark` is a **Redis-free** alternative for the execution path. Instead of a working set, the worker runs jobs concurrently out of order and commits only the **contiguous completed-offset prefix** per partition (the "watermark"). On crash or rebalance, everything after the last committed watermark is redelivered and re-run. This removes the per-job working-set Redis entirely (no `Claim`/`StillOwned`/`Complete`, no reclaim loop, no `live:consumer` heartbeat), raising throughput — but it is **off by default** and correct only under all of the following:
+
+1. **Idempotent handlers are mandatory.** Watermark re-runs completed-but-uncommitted jobs on any crash or rebalance. A non-idempotent handler on a watermark topic *will* double-apply. (SuperFetch is also at-least-once, but watermark re-runs more — see #2.)
+2. **Jobs on a topic must have similar runtimes.** The watermark cannot advance past a still-running job, so one long job holds back every faster job that finished behind it; on crash, that whole finished-but-uncommitted tail re-runs. Uniform durations keep the tail — and duplicate runs — small. Do **not** mix 1-second and 30-minute jobs on a watermark topic; keep those on SuperFetch.
+3. **One mode per topic — never mix.** Every worker consuming a topic must use the same `execution_mode`. A topic consumed by both a SuperFetch and a watermark worker has undefined behavior (raced offsets → lost + duplicated jobs). Run watermark topics on their own dedicated worker deployment and ensure no SuperFetch worker subscribes to them. **The operator is responsible for enforcing this** — there is no cross-pod runtime check.
+
+Everything downstream (events, batch counting, retries, DLT, callbacks) is identical to SuperFetch; watermark only changes the durability/offset mechanism. Standalone (non-batch) jobs are fully Redis-free in watermark mode; batched jobs still emit one completion event (the batch ledger is shared state regardless of execution mode).
+
+```yaml
+# daemon.yml — applies to every topic this worker consumes
+execution_mode: watermark        # superfetch (default) | watermark
+super_fetch_concurrency: 50      # reused as the watermark #perform pool size
+super_fetch_claim_window: 200    # reused as max dispatched-but-uncommitted per member
+                                 # (bounds the pending-completion map and crash re-run count)
+```
+
+Env override: `KAFKA_BATCH_EXECUTION_MODE=watermark`. Invalid values are rejected at boot.
+
+**Boot guardrails.** A watermark worker logs a loud banner at startup listing the mode, the topics, and the three requirements above. When the daemon (control plane) config has `execution_mode: watermark`, the workset **reclaim loop is disabled** (it has nothing to reclaim — Kafka offsets own durability) and logs that it did so. Neither guardrail can detect a *sibling* SuperFetch deployment on the same topic, so rule #3 remains the operator's responsibility.
+
 ## Operations (daemon / worker)
 
 **Startup:** Redis is pinged before consumers start; unreachable Redis fails fast at boot.

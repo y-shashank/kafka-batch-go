@@ -38,7 +38,14 @@ if cur then
     elseif owner == consumerID then
       -- Same consumer already owns (crash between claim and kafka ack). Resume.
       redis.call('EXPIRE', jobKey, ttl)
-      redis.call('SET', livePrefix .. consumerID, '1', 'EX', hbTTL)
+      local liveKey = livePrefix .. consumerID
+      -- Seed only when missing so we do not stomp heartbeat JSON (Ruby /live
+      -- used to crash on Oj.load("1") → Integer then hash[:key]).
+      if redis.call('EXISTS', liveKey) == 0 then
+        redis.call('SET', liveKey, '{"consumer_id":"' .. consumerID .. '"}', 'EX', hbTTL)
+      else
+        redis.call('EXPIRE', liveKey, hbTTL)
+      end
       local claimedUnix = tonumber(obj['claimed_at_unix'] or 0) or now
       redis.call('ZADD', index, claimedUnix, jobID)
       return 2
@@ -49,7 +56,12 @@ end
 redis.call('SET', jobKey, payload, 'EX', ttl)
 redis.call('SADD', byCons, jobID)
 redis.call('ZADD', index, now, jobID)
-redis.call('SET', livePrefix .. consumerID, '1', 'EX', hbTTL)
+local liveKey = livePrefix .. consumerID
+if redis.call('EXISTS', liveKey) == 0 then
+  redis.call('SET', liveKey, '{"consumer_id":"' .. consumerID .. '"}', 'EX', hbTTL)
+else
+  redis.call('EXPIRE', liveKey, hbTTL)
+end
 return 1
 `
 

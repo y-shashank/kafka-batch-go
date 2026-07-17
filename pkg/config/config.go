@@ -12,26 +12,26 @@ import (
 
 // Daemon holds runtime configuration for kbatch daemon.
 type Daemon struct {
-	Brokers                   []string
-	TopicPrefix               string
-	ConsumerGroup             string
-	JobsTopics                []string
-	EventsTopic               string
-	CallbacksTopic            string
-	DeadLetterTopic           string
-	RetryTopicBase            string
-	RetryTiers                map[string]int // seconds
-	RetryProgression          []string
-	RetryJitter               float64
+	Brokers          []string
+	TopicPrefix      string
+	ConsumerGroup    string
+	JobsTopics       []string
+	EventsTopic      string
+	CallbacksTopic   string
+	DeadLetterTopic  string
+	RetryTopicBase   string
+	RetryTiers       map[string]int // seconds
+	RetryProgression []string
+	RetryJitter      float64
 	// RetryMaxPause caps how long the retry consumer sleeps before re-checking a
 	// not-yet-due message (mirrors Ruby retry_max_pause_seconds).
-	RetryMaxPause             time.Duration
-	MaxRetries                int
-	EventEmitRetries          int
-	EventEmitBackoff          time.Duration
-	RedisURL                  string
-	BatchTTL                  time.Duration
-	HandlerManifest           string
+	RetryMaxPause     time.Duration
+	MaxRetries        int
+	EventEmitRetries  int
+	EventEmitBackoff  time.Duration
+	RedisURL          string
+	BatchTTL          time.Duration
+	HandlerManifest   string
 	SkipCancelledJobs bool
 	// CancellationCacheTTL is how long a process keeps the cancelled-batch
 	// index locally before refreshing from Redis (Ruby cancellation_cache_ttl).
@@ -63,12 +63,23 @@ type Daemon struct {
 	// SuperFetchOrphanGrace is how long after claim before a missing heartbeat
 	// counts as death (default 40s ≈ 2× liveness heartbeat interval).
 	SuperFetchOrphanGrace time.Duration
+	// SuperFetchDrainTimeout is how long SIGTERM/SIGINT waits for in-flight
+	// #perform to finish before cancelling lifeCtx (default 30s). Leftovers stay
+	// in the Redis workset for control-plane reclaim.
+	SuperFetchDrainTimeout time.Duration
+	// ExecutionMode selects how tier-3 (worker) jobs are executed: "superfetch"
+	// (default — Redis working-set ownership, offset acked ahead of #perform) or
+	// "watermark" (Redis-free — commit the contiguous completed-offset prefix, re-run
+	// everything after the watermark on crash). Watermark requires idempotent handlers
+	// and similar per-topic job runtimes, and every worker on a topic must agree on
+	// the mode. See WatermarkMode / the README "Execution mode" section.
+	ExecutionMode string
 	// ConsumerFetchMaxBytes caps total bytes per broker fetch (default 1 MiB).
 	ConsumerFetchMaxBytes int32
 	// ConsumerFetchMaxPartitionBytes caps bytes per partition in a fetch (default 128 KiB).
 	ConsumerFetchMaxPartitionBytes int32
 	// ConsumerFetchMaxWait is max broker wait before returning a partial fetch.
-	ConsumerFetchMaxWait              time.Duration
+	ConsumerFetchMaxWait time.Duration
 	// ConsumerStallTimeout is how long a consumer loop may go without progress
 	// before the watchdog force-closes the client and reconnects.
 	ConsumerStallTimeout              time.Duration
@@ -108,7 +119,7 @@ type Daemon struct {
 	FairnessTenantPartitionCacheTTL   time.Duration
 	Store                             string
 	StoreMySQLDSN                     string
-	LivenessEnabled bool
+	LivenessEnabled                   bool
 	// LivenessTTL is Redis EX on kafka_batch:live:consumer:* — pod considered
 	// dead once the key expires without refresh. Default 180s (~9×20s heartbeats).
 	LivenessTTL time.Duration
@@ -117,12 +128,27 @@ type Daemon struct {
 	LivenessHeartbeatInterval time.Duration
 	LivenessHTTPAddr          string
 	TrackRunningJobs          bool
-	MetricsEnabled                    bool
-	MetricsPrefix                     string
-	MetricsStatsDAddr                 string
-	ReconciliationInterval            time.Duration
-	ReconcilerLockTTL                 time.Duration
-	MaxReconcilePerRun                int
+	MetricsEnabled            bool
+	MetricsPrefix             string
+	MetricsStatsDAddr         string
+	// PerformanceMetricsEnabled gates the opt-in Redis-backed throughput/error
+	// history for the Web UI's Performance page (Ruby parity:
+	// performance_metrics_enabled). Disabled by default.
+	PerformanceMetricsEnabled bool
+	// PerformanceMetricsRetention is the Redis EXPIRE on each per-bucket hash
+	// and bounds the longest UI range (24h -> 86400s). Default 24h.
+	PerformanceMetricsRetention time.Duration
+	// PerformanceMetricsMaxJobTypes caps distinct job_type fields tracked per
+	// bucket; overflow folds into "_other". Default 50.
+	PerformanceMetricsMaxJobTypes int
+	// PerformanceMetricsBucketSeconds is the bucket width (advanced). Default 60s.
+	PerformanceMetricsBucketSeconds time.Duration
+	// PerformanceMetricsSampleRate is the fraction (0, 1.0] of events actually
+	// written to Redis. Default 1.0 (every event recorded).
+	PerformanceMetricsSampleRate float64
+	ReconciliationInterval       time.Duration
+	ReconcilerLockTTL            time.Duration
+	MaxReconcilePerRun           int
 }
 
 func DefaultDaemon() Daemon {
@@ -171,30 +197,36 @@ func DefaultDaemon() Daemon {
 		FairnessActiveCountSource:         "inflight_plus_ready",
 		// Exclusive ingest partitions for hot tenants (static map still wins).
 		// Default on — large tenant fleets rarely maintain a manual pin map.
-		FairnessDynamicTenantPartitions:   true,
-		FairnessTenantPartitionCacheTTL:   30 * time.Second,
-		LivenessTTL:                       180 * time.Second,
-		LivenessHeartbeatInterval:         20 * time.Second,
-		LivenessHTTPAddr:                  ":8080",
-		TrackRunningJobs:                  true,
-		MetricsPrefix:                     "kafka_batch",
-		ReconciliationInterval:            300 * time.Second,
-		ReconcilerLockTTL:                 600 * time.Second,
-		MaxReconcilePerRun:                100,
-		ProducerRequiredAcks:              "all_isr",
-		JobsConsumerConcurrency:           8,
-		FairReadyConsumerConcurrency:      8,
-		PriorityConsumerConcurrency:       4,
-		SuperFetchConcurrency:             10,
-		SuperFetchClaimWindow:             0, // → 2× concurrency via SuperFetchClaimWindowSize()
-		SuperFetchLeaseTTL:                2 * time.Minute,
-		SuperFetchReclaimEvery:            30 * time.Second,
-		SuperFetchReclaimLimit:            100,
-		SuperFetchOrphanGrace:             40 * time.Second,
-		ConsumerFetchMaxBytes:             DefaultConsumerFetchMaxBytes,
-		ConsumerFetchMaxPartitionBytes:    DefaultConsumerFetchMaxPartitionBytes,
-		ConsumerFetchMaxWait:              DefaultConsumerFetchMaxWait,
-		ConsumerStallTimeout:              90 * time.Second,
+		FairnessDynamicTenantPartitions: true,
+		FairnessTenantPartitionCacheTTL: 30 * time.Second,
+		LivenessTTL:                     180 * time.Second,
+		LivenessHeartbeatInterval:       20 * time.Second,
+		LivenessHTTPAddr:                ":8080",
+		TrackRunningJobs:                true,
+		MetricsPrefix:                   "kafka_batch",
+		PerformanceMetricsRetention:     24 * time.Hour,
+		PerformanceMetricsMaxJobTypes:   50,
+		PerformanceMetricsBucketSeconds: 60 * time.Second,
+		PerformanceMetricsSampleRate:    1.0,
+		ReconciliationInterval:          300 * time.Second,
+		ReconcilerLockTTL:               600 * time.Second,
+		MaxReconcilePerRun:              100,
+		ProducerRequiredAcks:            "all_isr",
+		JobsConsumerConcurrency:         8,
+		FairReadyConsumerConcurrency:    8,
+		PriorityConsumerConcurrency:     4,
+		SuperFetchConcurrency:           10,
+		SuperFetchClaimWindow:           0, // → 2× concurrency via SuperFetchClaimWindowSize()
+		SuperFetchLeaseTTL:              2 * time.Minute,
+		SuperFetchReclaimEvery:          30 * time.Second,
+		SuperFetchReclaimLimit:          100,
+		SuperFetchOrphanGrace:           40 * time.Second,
+		SuperFetchDrainTimeout:          30 * time.Second,
+		ExecutionMode:                   ExecutionModeSuperFetch,
+		ConsumerFetchMaxBytes:           DefaultConsumerFetchMaxBytes,
+		ConsumerFetchMaxPartitionBytes:  DefaultConsumerFetchMaxPartitionBytes,
+		ConsumerFetchMaxWait:            DefaultConsumerFetchMaxWait,
+		ConsumerStallTimeout:            90 * time.Second,
 	}
 }
 
@@ -230,12 +262,80 @@ func (c Daemon) PriorityConsumerMembers() int {
 	return c.PriorityConsumerConcurrency
 }
 
+// Execution modes for tier-3 (worker) job execution. See Daemon.ExecutionMode.
+const (
+	ExecutionModeSuperFetch = "superfetch"
+	ExecutionModeWatermark  = "watermark"
+)
+
+// NormalizedExecutionMode returns the lower-cased execution mode, defaulting to
+// superfetch when unset. Callers should use WatermarkMode / SuperFetchExecution
+// rather than comparing the raw string.
+func (c Daemon) NormalizedExecutionMode() string {
+	m := strings.ToLower(strings.TrimSpace(c.ExecutionMode))
+	if m == "" {
+		return ExecutionModeSuperFetch
+	}
+	return m
+}
+
+// WatermarkMode reports whether the worker should run the Redis-free watermark
+// executor instead of SuperFetch.
+func (c Daemon) WatermarkMode() bool {
+	return c.NormalizedExecutionMode() == ExecutionModeWatermark
+}
+
+// ControlPlaneTopics returns the set of topics that must be handled by the control
+// plane's own consumers (events ledger counting, retry, callbacks, dead-letter,
+// scheduled, fair ingest) and must NEVER be executed as jobs by a worker's
+// SuperFetch/watermark executor. Job execution re-runs on crash/rebalance, which
+// would double-count batch completions or corrupt control state. Used by a worker
+// boot guard (see worker.Run) to reject a manifest that routes a job topic here.
+func (c Daemon) ControlPlaneTopics() map[string]struct{} {
+	set := map[string]struct{}{}
+	add := func(t string) {
+		if t != "" {
+			set[t] = struct{}{}
+		}
+	}
+	add(c.EventsTopic)
+	add(c.CallbacksTopic)
+	add(c.DeadLetterTopic)
+	add(c.ScheduledTopic)
+	add(c.FairnessTimeIngest)
+	add(c.FairnessThroughputIngest)
+	for _, rt := range c.RetryTopics() {
+		add(rt)
+	}
+	return set
+}
+
+// ValidateExecutionMode rejects an unknown execution_mode at boot.
+func (c Daemon) ValidateExecutionMode() error {
+	switch c.NormalizedExecutionMode() {
+	case ExecutionModeSuperFetch, ExecutionModeWatermark:
+		return nil
+	default:
+		return fmt.Errorf("invalid execution_mode %q (want %q or %q)",
+			c.ExecutionMode, ExecutionModeSuperFetch, ExecutionModeWatermark)
+	}
+}
+
 // SuperFetchWorkers returns the SuperFetch goroutine pool size (min 1).
 func (c Daemon) SuperFetchWorkers() int {
 	if c.SuperFetchConcurrency < 1 {
 		return 10
 	}
 	return c.SuperFetchConcurrency
+}
+
+// SuperFetchDrainTimeoutDuration is the graceful-shutdown wait for in-flight
+// SuperFetch jobs (default 30s).
+func (c Daemon) SuperFetchDrainTimeoutDuration() time.Duration {
+	if c.SuperFetchDrainTimeout <= 0 {
+		return 30 * time.Second
+	}
+	return c.SuperFetchDrainTimeout
 }
 
 // SuperFetchClaimWindowSize returns the claim/ack outstanding window (min workers).
@@ -313,6 +413,8 @@ func LoadDaemon(path string) (Daemon, error) {
 		SuperFetchReclaimIntervalSec         float64          `yaml:"super_fetch_reclaim_interval"`
 		SuperFetchReclaimLimit               int              `yaml:"super_fetch_reclaim_limit"`
 		SuperFetchOrphanGraceSec             float64          `yaml:"super_fetch_orphan_grace"`
+		SuperFetchDrainTimeoutSec            float64          `yaml:"super_fetch_drain_timeout"`
+		ExecutionMode                        string           `yaml:"execution_mode"`
 		ConsumerFetchMaxBytes                int32            `yaml:"consumer_fetch_max_bytes"`
 		ConsumerFetchMaxPartitionBytes       int32            `yaml:"consumer_fetch_max_partition_bytes"`
 		ConsumerFetchMaxWaitMs               float64          `yaml:"consumer_fetch_max_wait_ms"`
@@ -361,6 +463,11 @@ func LoadDaemon(path string) (Daemon, error) {
 		MetricsEnabled                       bool             `yaml:"metrics_enabled"`
 		MetricsPrefix                        string           `yaml:"metrics_prefix"`
 		MetricsStatsDAddr                    string           `yaml:"metrics_statsd_addr"`
+		PerformanceMetricsEnabled            bool             `yaml:"performance_metrics_enabled"`
+		PerformanceMetricsRetentionSec       float64          `yaml:"performance_metrics_retention"`
+		PerformanceMetricsMaxJobTypes        int              `yaml:"performance_metrics_max_job_types"`
+		PerformanceMetricsBucketSecondsSec   float64          `yaml:"performance_metrics_bucket_seconds"`
+		PerformanceMetricsSampleRate         float64          `yaml:"performance_metrics_sample_rate"`
 		ReconciliationIntervalSec            float64          `yaml:"reconciliation_interval"`
 		ReconcilerLockTTLSec                 float64          `yaml:"reconciler_lock_ttl"`
 		MaxReconcilePerRun                   int              `yaml:"max_reconcile_per_run"`
@@ -442,6 +549,12 @@ func LoadDaemon(path string) (Daemon, error) {
 	}
 	if doc.SuperFetchOrphanGraceSec > 0 {
 		cfg.SuperFetchOrphanGrace = time.Duration(doc.SuperFetchOrphanGraceSec * float64(time.Second))
+	}
+	if doc.SuperFetchDrainTimeoutSec > 0 {
+		cfg.SuperFetchDrainTimeout = time.Duration(doc.SuperFetchDrainTimeoutSec * float64(time.Second))
+	}
+	if doc.ExecutionMode != "" {
+		cfg.ExecutionMode = doc.ExecutionMode
 	}
 	if doc.ConsumerFetchMaxBytes > 0 {
 		cfg.ConsumerFetchMaxBytes = doc.ConsumerFetchMaxBytes
@@ -587,6 +700,21 @@ func LoadDaemon(path string) (Daemon, error) {
 	if doc.MetricsStatsDAddr != "" {
 		cfg.MetricsStatsDAddr = doc.MetricsStatsDAddr
 	}
+	if doc.PerformanceMetricsEnabled {
+		cfg.PerformanceMetricsEnabled = true
+	}
+	if doc.PerformanceMetricsRetentionSec > 0 {
+		cfg.PerformanceMetricsRetention = time.Duration(doc.PerformanceMetricsRetentionSec * float64(time.Second))
+	}
+	if doc.PerformanceMetricsMaxJobTypes > 0 {
+		cfg.PerformanceMetricsMaxJobTypes = doc.PerformanceMetricsMaxJobTypes
+	}
+	if doc.PerformanceMetricsBucketSecondsSec > 0 {
+		cfg.PerformanceMetricsBucketSeconds = time.Duration(doc.PerformanceMetricsBucketSecondsSec * float64(time.Second))
+	}
+	if doc.PerformanceMetricsSampleRate > 0 {
+		cfg.PerformanceMetricsSampleRate = doc.PerformanceMetricsSampleRate
+	}
 	if doc.ReconciliationIntervalSec > 0 {
 		cfg.ReconciliationInterval = time.Duration(doc.ReconciliationIntervalSec * float64(time.Second))
 	}
@@ -655,6 +783,29 @@ func applyEnv(cfg *Daemon) {
 	if v := os.Getenv("KAFKA_BATCH_METRICS_STATSD_ADDR"); v != "" {
 		cfg.MetricsStatsDAddr = strings.TrimSpace(v)
 	}
+	if v := os.Getenv("KAFKA_BATCH_PERFORMANCE_METRICS_ENABLED"); v == "1" || strings.EqualFold(v, "true") {
+		cfg.PerformanceMetricsEnabled = true
+	}
+	if v := os.Getenv("KAFKA_BATCH_PERFORMANCE_METRICS_RETENTION"); v != "" {
+		if n, err := parsePositiveFloat(v); err == nil {
+			cfg.PerformanceMetricsRetention = time.Duration(n * float64(time.Second))
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_PERFORMANCE_METRICS_MAX_JOB_TYPES"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			cfg.PerformanceMetricsMaxJobTypes = n
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_PERFORMANCE_METRICS_BUCKET_SECONDS"); v != "" {
+		if n, err := parsePositiveFloat(v); err == nil {
+			cfg.PerformanceMetricsBucketSeconds = time.Duration(n * float64(time.Second))
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_PERFORMANCE_METRICS_SAMPLE_RATE"); v != "" {
+		if n, err := parsePositiveFloat(v); err == nil && n <= 1.0 {
+			cfg.PerformanceMetricsSampleRate = n
+		}
+	}
 	if v := os.Getenv("KAFKA_BATCH_RETRY_MAX_PAUSE"); v != "" {
 		if n, err := parsePositiveFloat(v); err == nil {
 			cfg.RetryMaxPause = time.Duration(n * float64(time.Second))
@@ -698,6 +849,9 @@ func applyEnv(cfg *Daemon) {
 		if n, err := parsePositiveInt(v); err == nil {
 			cfg.SuperFetchClaimWindow = n
 		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_EXECUTION_MODE"); v != "" {
+		cfg.ExecutionMode = v
 	}
 	if v := os.Getenv("KAFKA_BATCH_CONSUMER_FETCH_MAX_BYTES"); v != "" {
 		if n, err := parsePositiveInt(v); err == nil {
@@ -816,14 +970,14 @@ type Manifest struct {
 }
 
 type HandlerEntry struct {
-	Runtime              string `yaml:"runtime"`
-	WorkerClass          string `yaml:"worker_class"`
-	Topic                string `yaml:"topic"`
-	ApplyTopicPrefix     bool   `yaml:"apply_topic_prefix"`
-	MaxRetries   int    `yaml:"max_retries"`
-	RetryTier    string `yaml:"retry_tier"`
-	FairnessType         string `yaml:"fairness_type"`
-	Uniq                 bool   `yaml:"uniq"`
+	Runtime          string `yaml:"runtime"`
+	WorkerClass      string `yaml:"worker_class"`
+	Topic            string `yaml:"topic"`
+	ApplyTopicPrefix bool   `yaml:"apply_topic_prefix"`
+	MaxRetries       int    `yaml:"max_retries"`
+	RetryTier        string `yaml:"retry_tier"`
+	FairnessType     string `yaml:"fairness_type"`
+	Uniq             bool   `yaml:"uniq"`
 }
 
 func LoadManifest(path, topicPrefix string) (Manifest, error) {

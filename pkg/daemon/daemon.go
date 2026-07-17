@@ -23,9 +23,10 @@ import (
 	"github.com/y-shashank/kafka-batch-go/pkg/kafkaclient"
 	"github.com/y-shashank/kafka-batch-go/pkg/liveness"
 	"github.com/y-shashank/kafka-batch-go/pkg/metrics"
+	"github.com/y-shashank/kafka-batch-go/pkg/perfmetrics"
 	"github.com/y-shashank/kafka-batch-go/pkg/priority"
-	"github.com/y-shashank/kafka-batch-go/pkg/reconciler"
 	"github.com/y-shashank/kafka-batch-go/pkg/protocol"
+	"github.com/y-shashank/kafka-batch-go/pkg/reconciler"
 	"github.com/y-shashank/kafka-batch-go/pkg/retrycancel"
 	"github.com/y-shashank/kafka-batch-go/pkg/schedule"
 	"github.com/y-shashank/kafka-batch-go/pkg/store"
@@ -52,6 +53,9 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 		return err
 	}
 	if err := cfg.ValidateFairReadySplit(manifest); err != nil {
+		return err
+	}
+	if err := cfg.ValidateExecutionMode(); err != nil {
 		return err
 	}
 	if err := cfg.ValidateMySQLConfig(); err != nil {
@@ -94,6 +98,10 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	if err := PingRedis(ctx, rdb); err != nil {
 		return err
 	}
+	if err := perfmetrics.Install(perfmetrics.FromDaemon(cfg), rdb); err != nil {
+		return fmt.Errorf("perfmetrics: %w", err)
+	}
+	defer perfmetrics.Reset()
 
 	st := store.NewRedisStore(rdb, cfg.BatchTTL)
 	acks, err := kafkaclient.RequiredAcksFromConfig(cfg.RequiredAcks())
@@ -166,13 +174,21 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	reconciler.RunScheduler(ctx, cfg, st, prod, func() {
 		loopHealth.RecordTick("reconciler")
 	})
-	workset.RunReclaimScheduler(ctx, workset.NewStore(rdb), prod, cfg.SuperFetchReclaimEvery, cfg.SuperFetchReclaimLimit, cfg.SuperFetchOrphanGrace, func() {
-		loopHealth.RecordTick("workset-reclaim")
-	})
+	// Guardrail: the workset reclaim loop recovers orphaned SuperFetch in-flight
+	// jobs from Redis. Watermark mode owns durability via Kafka offset commits and
+	// writes nothing to the working set, so reclaim has nothing to do — skip it to
+	// keep the "one execution mode per cluster" contract unambiguous.
+	if cfg.WatermarkMode() {
+		log.Printf("kbatch workset reclaim DISABLED (execution_mode=watermark; durability is via Kafka offset watermarks, not the Redis working set)")
+	} else {
+		workset.RunReclaimScheduler(ctx, workset.NewStore(rdb), prod, cfg.SuperFetchReclaimEvery, cfg.SuperFetchReclaimLimit, cfg.SuperFetchOrphanGrace, func() {
+			loopHealth.RecordTick("workset-reclaim")
+		})
+		log.Printf("kbatch workset reclaim enabled every=%s limit=%d grace=%s", cfg.SuperFetchReclaimEvery, cfg.SuperFetchReclaimLimit, cfg.SuperFetchOrphanGrace)
+	}
 	cancelCache := cancellation.New(cfg.CancellationCacheTTL, st.CancelledBatchIDs)
 	cancellation.SetProcessCache(cancelCache)
 	defer cancellation.SetProcessCache(nil)
-	log.Printf("kbatch workset reclaim enabled every=%s limit=%d grace=%s", cfg.SuperFetchReclaimEvery, cfg.SuperFetchReclaimLimit, cfg.SuperFetchOrphanGrace)
 	log.Printf("kbatch events consumer group=%s topic=%s acks=%s fetch_max_bytes=%d fetch_max_partition_bytes=%d fetch_max_wait=%s (one client, goroutine-per-partition)",
 		eventsGroup, cfg.EventsTopic, cfg.RequiredAcks(),
 		fetch.MaxBytes, fetch.MaxPartitionBytes, fetch.MaxWait)

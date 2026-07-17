@@ -93,6 +93,10 @@ jobs_consumer_concurrency: 8
 # priority_consumer_concurrency: 4
 # super_fetch_concurrency: 10               # in-flight #perform pool per member (try higher for IO)
 # super_fetch_claim_window: 20              # Claimed∨Queued∨Performing (0 → 2× concurrency); ack can run ahead of perform
+# execution_mode: superfetch                # superfetch (default) | watermark (advanced, Redis-free — see README).
+                                            # watermark REQUIRES idempotent handlers + similar per-topic runtimes,
+                                            # and one mode per topic (never mix SuperFetch + watermark on a topic).
+                                            # env override: KAFKA_BATCH_EXECUTION_MODE=watermark
 
 # ── Delayed jobs — perform_in / perform_at (daemon only) ─────────────────────
 
@@ -181,6 +185,18 @@ fairness_enabled: true
 # metrics_enabled: false
 # metrics_prefix: kafka_batch
 # metrics_statsd_addr: localhost:8125
+
+# ── Performance dashboard metrics (opt-in; Redis-backed) ─────────────────────
+# Coexists with the Metrics bridge above (both subscribe independently via
+# instrument.AddHandler). Writes into the same Redis key layout as Ruby's
+# KafkaBatch::PerformanceMetrics, so a mixed Ruby+Go deployment shares one
+# Performance dashboard page. Disabled by default.
+
+# performance_metrics_enabled: false
+# performance_metrics_retention: 86400        # sec — default 24h; bounds the longest UI range
+# performance_metrics_max_job_types: 50       # cap distinct job_type fields per bucket; overflow -> "_other"
+# performance_metrics_bucket_seconds: 60      # advanced — default 1 min
+# performance_metrics_sample_rate: 1.0        # (0, 1.0] — lower to cut Redis write volume at very high throughput
 
 # ── Code defaults not exposed in YAML (change requires code / future YAML keys) ─
 # retry_jitter: 0.1                    # unused in Go retry scheduling today

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -39,10 +40,13 @@ type SuperFetchExecutor struct {
 
 	// lifeCtx is the process/member lifetime (not the poll-scoped procCtx).
 	// #perform must outlive DispatchClaimsAndAcks — endProc cancels procCtx.
+	// On SIGTERM, runCtx is cancelled first; lifeCtx stays alive until drain ends
+	// so renew/heartbeat/#perform can finish or leave work in Redis for reclaim.
 	lifeMu  sync.Mutex
 	lifeCtx context.Context
 
-	inFlight sync.Map // job_id → struct{} while claimed/queued/performing locally
+	accepting atomic.Bool // false after StopAccepting — no new claims
+	inFlight  sync.Map    // job_id → struct{} while claimed/queued/performing locally
 }
 
 func NewSuperFetchExecutor(cfg config.Daemon, work *workset.Store, consumerID string,
@@ -59,7 +63,7 @@ func NewSuperFetchExecutor(cfg config.Daemon, work *workset.Store, consumerID st
 	if grace <= 0 {
 		grace = workset.DefaultOrphanGrace
 	}
-	return &SuperFetchExecutor{
+	e := &SuperFetchExecutor{
 		Work:           work,
 		ConsumerID:     consumerID,
 		LeaseTTL:       lease,
@@ -71,6 +75,48 @@ func NewSuperFetchExecutor(cfg config.Daemon, work *workset.Store, consumerID st
 		Process:        process,
 		Apply:          apply,
 	}
+	e.accepting.Store(true)
+	return e
+}
+
+// StopAccepting refuses new Claim+ack work (graceful shutdown step 1).
+func (e *SuperFetchExecutor) StopAccepting() {
+	if e == nil {
+		return
+	}
+	e.accepting.Store(false)
+}
+
+// InFlightCount returns jobs claimed/queued/performing in this executor.
+func (e *SuperFetchExecutor) InFlightCount() int {
+	if e == nil {
+		return 0
+	}
+	n := 0
+	e.inFlight.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
+}
+
+// WaitInFlight blocks until in-flight is empty or timeout elapses.
+// Returns the remaining in-flight count (0 = drained cleanly).
+func (e *SuperFetchExecutor) WaitInFlight(timeout time.Duration) int {
+	if e == nil {
+		return 0
+	}
+	if timeout <= 0 {
+		return e.InFlightCount()
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if e.InFlightCount() == 0 {
+			return 0
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return e.InFlightCount()
 }
 
 // BindLife pins the member lifetime context used by #perform / renew / heartbeat.
@@ -138,9 +184,15 @@ func (e *SuperFetchExecutor) DispatchClaimsAndAcks(ctx context.Context, cl *kgo.
 	if e == nil || e.Work == nil {
 		return
 	}
+	if !e.accepting.Load() {
+		return
+	}
 	life := e.life()
 	e.StartHeartbeatLoop(life)
 	for _, rec := range recs {
+		if !e.accepting.Load() {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return

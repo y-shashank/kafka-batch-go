@@ -55,8 +55,12 @@ func RunConsumer(ctx context.Context, brokers []string, group string, topics []s
 // RunSuperFetchConsumerGroupMembers starts N supervised job consumers. Each
 // member claims Redis ownership, Kafka-acks immediately, then runs #perform on
 // a bounded pool (SuperFetch — the only supported job execution mode).
+//
+// runCtx cancels the Kafka poll loop (stop fetching). lifeCtx should outlive
+// runCtx during graceful drain so renew/heartbeat/#perform keep running.
+// If lifeCtx is nil, runCtx is used for both (legacy abrupt-cancel behavior).
 func RunSuperFetchConsumerGroupMembers(
-	ctx context.Context, members int,
+	runCtx, lifeCtx context.Context, members int,
 	brokers []string, group string, topics []string, fetch config.ConsumerFetchSettings,
 	newSF func(consumerID string) *SuperFetchExecutor,
 	health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter,
@@ -67,6 +71,9 @@ func RunSuperFetchConsumerGroupMembers(
 	if newSF == nil {
 		log.Printf("[kbatch-worker] RunSuperFetchConsumerGroupMembers requires SuperFetch factory group=%s", group)
 		return
+	}
+	if lifeCtx == nil {
+		lifeCtx = runCtx
 	}
 	for member := 1; member <= members; member++ {
 		label := memberLabel(member, members)
@@ -80,8 +87,8 @@ func RunSuperFetchConsumerGroupMembers(
 			log.Printf("[kbatch-worker] SuperFetch factory returned nil group=%s member=%s", group, label)
 			continue
 		}
-		sf.BindLife(ctx)
-		go runConcurrentConsumerSupervised(ctx, concurrentConsumerSpec{
+		sf.BindLife(lifeCtx)
+		go runConcurrentConsumerSupervised(runCtx, concurrentConsumerSpec{
 			brokers:     brokers,
 			group:       group,
 			topics:      topics,
@@ -280,8 +287,9 @@ func runConsumerLoop(ctx context.Context, spec consumerSpec) error {
 
 // RunPriorityGroupMembersSuperFetch starts N priority consumers with SuperFetch
 // (claim → ack → pool perform) and lag gating.
+// runCtx stops polling; lifeCtx drains in-flight (see RunSuperFetchConsumerGroupMembers).
 func RunPriorityGroupMembersSuperFetch(
-	ctx context.Context, members int, cfg config.Daemon, pc priority.Config, gate *priority.Gate,
+	runCtx, lifeCtx context.Context, members int, cfg config.Daemon, pc priority.Config, gate *priority.Gate,
 	newSF func(consumerID string) *SuperFetchExecutor,
 	health *ConsumerHealth, pauseCtl pauseChecker, live *liveness.Reporter,
 ) {
@@ -291,6 +299,9 @@ func RunPriorityGroupMembersSuperFetch(
 	if newSF == nil {
 		log.Printf("[kbatch-worker] RunPriorityGroupMembersSuperFetch requires SuperFetch factory group=%s", pc.ConsumerGroup)
 		return
+	}
+	if lifeCtx == nil {
+		lifeCtx = runCtx
 	}
 	group := pc.ConsumerGroup
 	log.Printf("[kbatch-daemon] starting priority consumers group=%s members=%d topics=%v", group, members, pc.Topics)
@@ -306,8 +317,8 @@ func RunPriorityGroupMembersSuperFetch(
 			log.Printf("[kbatch-worker] SuperFetch factory returned nil group=%s member=%s", group, label)
 			continue
 		}
-		sf.BindLife(ctx)
-		go runPrioritySupervised(ctx, cfg, pc, gate, health, pauseCtl, live, sf, label, hk)
+		sf.BindLife(lifeCtx)
+		go runPrioritySupervised(runCtx, cfg, pc, gate, health, pauseCtl, live, sf, label, hk)
 	}
 }
 

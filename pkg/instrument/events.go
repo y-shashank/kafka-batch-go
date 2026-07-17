@@ -186,3 +186,26 @@ func ReconcilerRan(staleCount, lostCount int, duration time.Duration, triggeredB
 		"triggered_by":   triggeredBy,
 	}, 0)
 }
+
+// WorksetReclaimed fires once per SuperFetch orphan-reclaim sweep (whether or
+// not it found any orphans), mirroring ReconcilerRan so sweep frequency /
+// duration is observable even at zero counts. Ruby parity: workset.reclaimed.
+func WorksetReclaimed(checked, reclaimed, failed, skipped int, duration time.Duration) {
+	Emit("workset.reclaimed", map[string]interface{}{
+		"checked":   checked,
+		"reclaimed": reclaimed,
+		"failed":    failed,
+		"skipped":   skipped,
+		"duration":  duration.Seconds(),
+	}, 0)
+}
+
+// SuperFetchDrained fires once per graceful-shutdown drain, whether it
+// finished cleanly (remaining=0) or timed out with in-flight jobs left in
+// the Redis workset for control-plane reclaim. Ruby parity: super_fetch.drained.
+func SuperFetchDrained(remaining int, timeout time.Duration) {
+	Emit("super_fetch.drained", map[string]interface{}{
+		"remaining": remaining,
+		"timeout":   timeout.Seconds(),
+	}, 0)
+}

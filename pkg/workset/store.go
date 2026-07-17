@@ -389,3 +389,12 @@ func (s *Store) TouchConsumer(ctx context.Context, consumerID string, ttl time.D
 	payload := liveness.ConsumerHeartbeatJSON(consumerID, "", liveness.DefaultProcessSampler())
 	return s.client.Set(ctx, liveKey(consumerID), payload, ttl).Err()
 }
+
+// DeleteConsumer removes live:consumer:{id} so reclaim can proceed immediately
+// after a graceful drain that still has workset leftovers (skip waiting for TTL).
+func (s *Store) DeleteConsumer(ctx context.Context, consumerID string) error {
+	if s == nil || s.client == nil || consumerID == "" {
+		return nil
+	}
+	return s.client.Del(ctx, liveKey(consumerID)).Err()
+}

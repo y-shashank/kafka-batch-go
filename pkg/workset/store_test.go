@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -78,6 +79,55 @@ func TestClaimSetsLiveKey(t *testing.T) {
 	}
 	if !mr.Exists(liveConsumerPrefix + "c-live") {
 		t.Fatal("expected live:consumer key after claim")
+	}
+	raw, err := mr.Get(liveConsumerPrefix + "c-live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw == "1" {
+		t.Fatalf("live:consumer should be JSON, got %q", raw)
+	}
+	if !strings.Contains(raw, "c-live") {
+		t.Fatalf("live:consumer payload %q missing consumer id", raw)
+	}
+}
+
+func TestDeleteConsumer(t *testing.T) {
+	st, mr := testStore(t)
+	ctx := context.Background()
+	key := liveConsumerPrefix + "c-del"
+	if err := mr.Set(key, `{"consumer_id":"c-del"}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteConsumer(ctx, "c-del"); err != nil {
+		t.Fatal(err)
+	}
+	if mr.Exists(key) {
+		t.Fatal("expected live:consumer deleted")
+	}
+}
+
+func TestClaimDoesNotStompExistingHeartbeatJSON(t *testing.T) {
+	st, mr := testStore(t)
+	ctx := context.Background()
+	key := liveConsumerPrefix + "c-keep"
+	want := `{"consumer_id":"c-keep","rss_bytes":12345,"cpu_pct":1.5}`
+	if err := mr.Set(key, want); err != nil {
+		t.Fatal(err)
+	}
+	_, err := st.Claim(ctx, ClaimParams{
+		JobID: "j-keep", Payload: []byte(`{}`), Topic: "jobs",
+		ConsumerID: "c-keep", LeaseTTL: time.Minute, StealGrace: -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := mr.Get(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("claim stomped heartbeat JSON: got %q want %q", got, want)
 	}
 }
 

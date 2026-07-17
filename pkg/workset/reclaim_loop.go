@@ -4,6 +4,8 @@ import (
 	"context"
 	"log"
 	"time"
+
+	"github.com/y-shashank/kafka-batch-go/pkg/instrument"
 )
 
 // RunReclaimScheduler periodically reclaims orphans until ctx is cancelled.
@@ -31,6 +33,7 @@ func RunReclaimScheduler(ctx context.Context, store *Store, prod Producer, every
 				if onTick != nil {
 					onTick()
 				}
+				started := time.Now()
 				res, err := store.ReclaimOrphans(ctx, prod, limit, 30*time.Second, grace)
 				if err != nil {
 					log.Printf("[kbatch-workset] reclaim sweep error: %v", err)
@@ -40,6 +43,7 @@ func RunReclaimScheduler(ctx context.Context, store *Store, prod Producer, every
 					log.Printf("[kbatch-workset] reclaim sweep checked=%d reclaimed=%d failed=%d skipped=%d",
 						res.Checked, res.Reclaimed, res.Failed, res.Skipped)
 				}
+				instrument.WorksetReclaimed(res.Checked, res.Reclaimed, res.Failed, res.Skipped, time.Since(started))
 			}
 		}
 	}()

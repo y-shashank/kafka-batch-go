@@ -287,3 +287,26 @@ func TestWriteAndLoadRoundTrip(t *testing.T) {
 		t.Fatalf("group=%q", cfg.ConsumerGroup)
 	}
 }
+
+func TestControlPlaneTopicsGuardSet(t *testing.T) {
+	c := DefaultDaemon()
+	c.RetryTiers = map[string]int{"short": 30, "medium": 420}
+	set := c.ControlPlaneTopics()
+	for _, want := range []string{
+		c.EventsTopic, c.CallbacksTopic, c.DeadLetterTopic, c.ScheduledTopic,
+		c.FairnessTimeIngest, c.FairnessThroughputIngest,
+	} {
+		if _, ok := set[want]; !ok {
+			t.Fatalf("control-plane set missing %q", want)
+		}
+	}
+	for _, rt := range c.RetryTopics() {
+		if _, ok := set[rt]; !ok {
+			t.Fatalf("control-plane set missing retry topic %q", rt)
+		}
+	}
+	// A plain execution topic must not be considered control-plane.
+	if _, ok := set["kafka_batch.jobs"]; ok {
+		t.Fatal("plain jobs topic must not be in the control-plane set")
+	}
+}
