@@ -141,7 +141,11 @@ go get github.com/y-shashank/kafka-batch-go/pkg/kbatch
 ## Tier 1 — Client library
 
 ```go
-import "github.com/y-shashank/kafka-batch-go/pkg/client"
+import (
+    "time"
+
+    "github.com/y-shashank/kafka-batch-go/pkg/client"
+)
 
 cfg := client.DefaultConfig()
 cfg.Brokers = []string{"localhost:9092"}
@@ -154,16 +158,48 @@ defer c.Close()
 // Standalone job (routes ruby or go runtime via manifest)
 _, _ = c.EnqueueJob(ctx, "orders.process", map[string]interface{}{"id": 1}, client.PushOptions{})
 
+// Many standalone jobs (no batch ledger / no completion events) — chunked produce.
+// Same idea as Ruby KafkaBatch::Batch.enqueue_many / enqueue_job loop.
+payloads := make([]map[string]interface{}, 50)
+for i := range payloads {
+    payloads[i] = map[string]interface{}{"id": i}
+}
+// By manifest job_type (Go or Ruby runtime from handlers.yml):
+_, _ = c.EnqueueManyJobs(ctx, "orders.process", payloads, client.PushOptions{TenantID: "acme"})
+// Fair handlers: TenantID drives WFQ ingest partitioning.
+_, _ = c.EnqueueManyJobs(ctx, "fair.time.go", payloads, client.PushOptions{TenantID: "acme"})
+
+// By Ruby worker class name (when registered in manifest / Workers config):
+_, _ = c.EnqueueMany(ctx, "Orders::ProcessWorker", payloads, client.PushOptions{TenantID: "acme"})
+
+// Delayed many
+_, _ = c.EnqueueManyJobsIn(ctx, 30*time.Minute, "orders.process", payloads, client.PushOptions{TenantID: "acme"})
+_, _ = c.EnqueueManyJobsAt(ctx, time.Now().Add(time.Hour), "orders.process", payloads, client.PushOptions{})
+
 // Batch — callback_args are passed only to on_success / on_complete handlers (not work jobs)
 _, _ = c.CreateBatch(ctx, client.BatchOptions{
     OnComplete:   "MyCallback",
+    TenantID:     "acme",
     Meta:         map[string]interface{}{"source": "api"},              // batch metadata only
     CallbackArgs: map[string]interface{}{"run_id": "42", "channel": "#ops"},
 }, func(b *client.Batch) error {
-    _, err := b.PushJob(ctx, "orders.process", map[string]interface{}{"id": 1}, client.PushOptions{})
+    // Bulk inside a batch (tracks completion; emits batch events)
+    _, err := b.PushManyJobs(ctx, "orders.process", payloads, client.PushOptions{})
     return err
 })
 ```
+
+| Go API | Ruby equivalent |
+|--------|-----------------|
+| `EnqueueJob` | `Batch.enqueue_job` |
+| `EnqueueManyJobs` | `Batch.enqueue_many` by job_type / loop `enqueue_job` (standalone, no ledger) |
+| `Enqueue` / `EnqueueMany` | `Batch.enqueue` / `Batch.enqueue_many` (worker class) |
+| `PushManyJobs` / `PushMany` | `batch.push_many` (with batch ledger + completion events) |
+| `EnqueueManyJobsIn` / `At` | `Batch.enqueue_many_in` / `enqueue_many_at` |
+
+`EnqueueMany*` / `EnqueueManyJobs*` do **not** create a Redis batch — fire-and-forget Kafka delivery only. Use `CreateBatch` + `PushMany*` when you need completion counting / callbacks.
+
+`PushOptions.TenantID` is required for fair handlers (same role as Ruby `tenant_id:`).
 
 `meta` is stored on the batch hash for dashboards and APIs. `callback_args` is stored separately and included in callback job payloads / legacy callback messages — work jobs never see it.
 
