@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/google/uuid"
@@ -269,6 +270,8 @@ func (s *Store) ListOrphans(ctx context.Context, limit int, grace time.Duration)
 		candidates = append(candidates, candidate{entry: e})
 	}
 	if len(missing) > 0 {
+		log.Printf("[kbatch-workset] list_orphans: %d aged index entries missing job payloads (lease TTL expiry?) — cannot reclaim without payload; cleaning index only",
+			len(missing))
 		rpipe := s.client.Pipeline()
 		for _, id := range missing {
 			rpipe.ZRem(ctx, indexKey, id)

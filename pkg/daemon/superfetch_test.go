@@ -181,6 +181,58 @@ func TestSuperFetchPerformSurvivesPollCtxCancel(t *testing.T) {
 	_ = pollCtx
 }
 
+func TestSuperFetchAppliesEvenAfterLostFence(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	work := workset.NewStore(rdb)
+	cfg := config.DefaultDaemon()
+	cfg.SuperFetchConcurrency = 1
+	cfg.SuperFetchClaimWindow = 2
+
+	var applied int32
+	life, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	exec := NewSuperFetchExecutor(cfg, work, "c-lost",
+		func(ctx context.Context, raw []byte, src protocol.SourceCoords) (job.Outcome, error) {
+			return job.Outcome{
+				CommitOffset: true,
+				Event: &protocol.EventMessage{
+					JobID: "sf-lost", BatchID: "b1", Status: "success",
+				},
+			}, nil
+		},
+		func(ctx context.Context, out job.Outcome) error {
+			atomic.AddInt32(&applied, 1)
+			return nil
+		},
+	)
+	exec.BindLife(life)
+	exec.ClaimWindow <- struct{}{}
+
+	rec := &kgo.Record{
+		Topic: "jobs", Partition: 0, Offset: 9,
+		Value: []byte(`{"job_id":"sf-lost","job_type":"x","batch_id":"b1","batch_seq":1}`),
+	}
+	claim, err := work.Claim(life, workset.ClaimParams{
+		JobID: "sf-lost", Payload: rec.Value, Topic: rec.Topic,
+		Partition: 0, Offset: 9, ConsumerID: "c-lost", LeaseTTL: time.Minute, StealGrace: -1,
+	})
+	if err != nil || !claim.Won {
+		t.Fatalf("claim=%+v err=%v", claim, err)
+	}
+	// Simulate lease TTL / reclaim Finish deleting the workset entry mid-perform.
+	if err := work.Complete(life, "sf-lost", "c-lost", claim.Fence); err != nil {
+		t.Fatal(err)
+	}
+	exec.inFlight.Store("sf-lost", struct{}{})
+	exec.perform(life, rec, "sf-lost", claim.Fence, "g", func() {})
+
+	if atomic.LoadInt32(&applied) != 1 {
+		t.Fatalf("applied=%d want 1 (must emit event even when fence is gone)", applied)
+	}
+}
+
 func TestSuperFetchSkipsDuplicateInFlight(t *testing.T) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})

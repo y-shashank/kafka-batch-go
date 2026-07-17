@@ -259,15 +259,19 @@ func (e *SuperFetchExecutor) perform(ctx context.Context, rec *kgo.Record, jobID
 			group, jobID, err)
 		return
 	}
-	owned, err := e.Work.StillOwned(ctx, jobID, e.ConsumerID, fence)
-	if err != nil || !owned {
-		log.Printf("[kbatch-superfetch] lost fence group=%s job_id=%s owned=%v err=%v — skip apply",
-			group, jobID, owned, err)
-		return
-	}
+	// Apply BEFORE the fence check (Ruby SuperFetch parity). If the workset
+	// entry expired or was reclaimed while #perform ran, skipping Apply would
+	// permanently lose the job: Kafka already acked at Claim, and reclaim has
+	// nothing left to re-produce. Batch bitmap / DLT paths are idempotent.
 	if err := e.Apply(ctx, out); err != nil {
 		log.Printf("[kbatch-superfetch] apply error group=%s job_id=%s: %v — leaving in workset",
 			group, jobID, err)
+		return
+	}
+	owned, err := e.Work.StillOwned(ctx, jobID, e.ConsumerID, fence)
+	if err != nil || !owned {
+		log.Printf("[kbatch-superfetch] lost fence group=%s job_id=%s owned=%v err=%v — apply already done, skip complete",
+			group, jobID, owned, err)
 		return
 	}
 	for i := 0; i < 5; i++ {
