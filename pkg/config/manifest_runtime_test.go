@@ -115,3 +115,28 @@ func TestValidateRoutingWithoutRegistration(t *testing.T) {
 		t.Fatalf("routing should not require registration: %v", err)
 	}
 }
+
+func TestResolveJobType(t *testing.T) {
+	m := Manifest{Handlers: map[string]HandlerEntry{
+		"hello.go":   {Runtime: "go", Topic: "kafka_batch.jobs.go"},
+		"hello.ruby": {Runtime: "ruby", WorkerClass: "HelloRubyWorker", Topic: "kafka_batch.jobs.ruby"},
+	}}
+	cases := []struct {
+		in     string
+		want   string
+		wantOK bool
+	}{
+		{"hello.go", "hello.go", true},
+		{"hello.ruby", "hello.ruby", true},
+		{"HelloRubyWorker", "hello.ruby", true}, // worker class → job_type
+		{" hello.ruby ", "hello.ruby", true},    // trimmed
+		{"Nonsense", "", false},
+		{"", "", false},
+	}
+	for _, c := range cases {
+		got, ok := m.ResolveJobType(c.in)
+		if got != c.want || ok != c.wantOK {
+			t.Errorf("ResolveJobType(%q) = (%q,%v), want (%q,%v)", c.in, got, ok, c.want, c.wantOK)
+		}
+	}
+}

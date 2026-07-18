@@ -2,8 +2,41 @@ package config
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
+
+// ResolveJobType maps a user-entered handler identifier to the canonical
+// manifest job_type. It accepts either a job_type already in the manifest
+// (e.g. "hello.go", "hello.ruby") or a worker_class name (e.g. "HelloRubyWorker"
+// → "hello.ruby"). ok is false when it resolves to neither — callers should
+// reject it early rather than store a value that only fails at enqueue/fire time
+// with "unknown job_type". A job_type match wins over a worker_class match.
+func (m Manifest) ResolveJobType(name string) (string, bool) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", false
+	}
+	if _, ok := m.Handlers[name]; ok {
+		return name, true
+	}
+	for jt, h := range m.Handlers {
+		if h.WorkerClass == name {
+			return jt, true
+		}
+	}
+	return "", false
+}
+
+// JobTypes returns the manifest's job_types sorted (for error messages / listing).
+func (m Manifest) JobTypes() []string {
+	out := make([]string, 0, len(m.Handlers))
+	for jt := range m.Handlers {
+		out = append(out, jt)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // RuntimeFor returns the normalized runtime for a job_type.
 func (m Manifest) RuntimeFor(jobType string) string {
