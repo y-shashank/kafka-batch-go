@@ -146,6 +146,12 @@ type Daemon struct {
 	// PerformanceMetricsSampleRate is the fraction (0, 1.0] of events actually
 	// written to Redis. Default 1.0 (every event recorded).
 	PerformanceMetricsSampleRate float64
+	// RedisRTTProbeInterval is how often each process attempts the cluster-wide
+	// NX-locked Redis PING for the Performance page RTT chart. Default 15s.
+	RedisRTTProbeInterval time.Duration
+	// RedisRTTProbeTimeout is the client timeout for that PING; failures increment
+	// the rtt bucket's errors field. Default 200ms.
+	RedisRTTProbeTimeout time.Duration
 	ReconciliationInterval       time.Duration
 	ReconcilerLockTTL            time.Duration
 	MaxReconcilePerRun           int
@@ -208,6 +214,8 @@ func DefaultDaemon() Daemon {
 		PerformanceMetricsMaxJobTypes:   50,
 		PerformanceMetricsBucketSeconds: 60 * time.Second,
 		PerformanceMetricsSampleRate:    1.0,
+		RedisRTTProbeInterval:           15 * time.Second,
+		RedisRTTProbeTimeout:            200 * time.Millisecond,
 		ReconciliationInterval:          300 * time.Second,
 		ReconcilerLockTTL:               600 * time.Second,
 		MaxReconcilePerRun:              100,
@@ -468,6 +476,8 @@ func LoadDaemon(path string) (Daemon, error) {
 		PerformanceMetricsMaxJobTypes        int              `yaml:"performance_metrics_max_job_types"`
 		PerformanceMetricsBucketSecondsSec   float64          `yaml:"performance_metrics_bucket_seconds"`
 		PerformanceMetricsSampleRate         float64          `yaml:"performance_metrics_sample_rate"`
+		RedisRTTProbeIntervalSec             float64          `yaml:"redis_rtt_probe_interval"`
+		RedisRTTProbeTimeoutSec              float64          `yaml:"redis_rtt_probe_timeout"`
 		ReconciliationIntervalSec            float64          `yaml:"reconciliation_interval"`
 		ReconcilerLockTTLSec                 float64          `yaml:"reconciler_lock_ttl"`
 		MaxReconcilePerRun                   int              `yaml:"max_reconcile_per_run"`
@@ -715,6 +725,12 @@ func LoadDaemon(path string) (Daemon, error) {
 	if doc.PerformanceMetricsSampleRate > 0 {
 		cfg.PerformanceMetricsSampleRate = doc.PerformanceMetricsSampleRate
 	}
+	if doc.RedisRTTProbeIntervalSec > 0 {
+		cfg.RedisRTTProbeInterval = time.Duration(doc.RedisRTTProbeIntervalSec * float64(time.Second))
+	}
+	if doc.RedisRTTProbeTimeoutSec > 0 {
+		cfg.RedisRTTProbeTimeout = time.Duration(doc.RedisRTTProbeTimeoutSec * float64(time.Second))
+	}
 	if doc.ReconciliationIntervalSec > 0 {
 		cfg.ReconciliationInterval = time.Duration(doc.ReconciliationIntervalSec * float64(time.Second))
 	}
@@ -804,6 +820,16 @@ func applyEnv(cfg *Daemon) {
 	if v := os.Getenv("KAFKA_BATCH_PERFORMANCE_METRICS_SAMPLE_RATE"); v != "" {
 		if n, err := parsePositiveFloat(v); err == nil && n <= 1.0 {
 			cfg.PerformanceMetricsSampleRate = n
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_REDIS_RTT_PROBE_INTERVAL"); v != "" {
+		if n, err := parsePositiveFloat(v); err == nil {
+			cfg.RedisRTTProbeInterval = time.Duration(n * float64(time.Second))
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_REDIS_RTT_PROBE_TIMEOUT"); v != "" {
+		if n, err := parsePositiveFloat(v); err == nil {
+			cfg.RedisRTTProbeTimeout = time.Duration(n * float64(time.Second))
 		}
 	}
 	if v := os.Getenv("KAFKA_BATCH_RETRY_MAX_PAUSE"); v != "" {

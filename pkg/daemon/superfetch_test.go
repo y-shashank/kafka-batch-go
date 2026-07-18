@@ -233,6 +233,60 @@ func TestSuperFetchAppliesEvenAfterLostFence(t *testing.T) {
 	}
 }
 
+func TestSuperFetchRetriesApplyWhileRenewing(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	work := workset.NewStore(rdb)
+	cfg := config.DefaultDaemon()
+	cfg.SuperFetchConcurrency = 1
+	cfg.SuperFetchClaimWindow = 2
+	cfg.SuperFetchLeaseTTL = time.Minute
+
+	var applied int32
+	life, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	exec := NewSuperFetchExecutor(cfg, work, "c-retry",
+		func(ctx context.Context, raw []byte, src protocol.SourceCoords) (job.Outcome, error) {
+			return job.Outcome{CommitOffset: true, Event: &protocol.EventMessage{JobID: "sf-retry", Status: "success"}}, nil
+		},
+		func(ctx context.Context, out job.Outcome) error {
+			n := atomic.AddInt32(&applied, 1)
+			if n < 3 {
+				return context.DeadlineExceeded
+			}
+			return nil
+		},
+	)
+	exec.BindLife(life)
+	exec.ClaimWindow <- struct{}{}
+
+	rec := &kgo.Record{
+		Topic: "jobs", Value: []byte(`{"job_id":"sf-retry","job_type":"x"}`),
+	}
+	claim, err := work.Claim(life, workset.ClaimParams{
+		JobID: "sf-retry", Payload: rec.Value, Topic: "jobs",
+		ConsumerID: "c-retry", LeaseTTL: time.Minute, StealGrace: -1,
+	})
+	if err != nil || !claim.Won {
+		t.Fatalf("claim=%+v err=%v", claim, err)
+	}
+	renewStopped := int32(0)
+	exec.inFlight.Store("sf-retry", struct{}{})
+	exec.perform(life, rec, "sf-retry", claim.Fence, "g", func() { atomic.StoreInt32(&renewStopped, 1) })
+
+	if atomic.LoadInt32(&applied) < 3 {
+		t.Fatalf("applied=%d want >=3 (retries on apply error)", applied)
+	}
+	if atomic.LoadInt32(&renewStopped) != 1 {
+		t.Fatal("expected renew stopped only after perform finished")
+	}
+	// Job should be completed out of the workset after successful apply.
+	if e, _ := work.StillOwned(life, "sf-retry", "c-retry", claim.Fence); e {
+		t.Fatal("expected workset entry completed after successful apply retry")
+	}
+}
+
 func TestSuperFetchSkipsDuplicateInFlight(t *testing.T) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})

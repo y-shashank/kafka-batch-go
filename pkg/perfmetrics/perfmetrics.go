@@ -54,6 +54,8 @@ type Config struct {
 	BucketSeconds time.Duration
 	MaxJobTypes   int
 	SampleRate    float64
+	RTTInterval   time.Duration
+	RTTTimeout    time.Duration
 }
 
 // FromDaemon maps daemon YAML/env settings to a perfmetrics Config.
@@ -64,6 +66,8 @@ func FromDaemon(cfg config.Daemon) Config {
 		BucketSeconds: cfg.PerformanceMetricsBucketSeconds,
 		MaxJobTypes:   cfg.PerformanceMetricsMaxJobTypes,
 		SampleRate:    cfg.PerformanceMetricsSampleRate,
+		RTTInterval:   cfg.RedisRTTProbeInterval,
+		RTTTimeout:    cfg.RedisRTTProbeTimeout,
 	}
 }
 
@@ -133,11 +137,19 @@ func Install(cfg Config, client *redis.Client) error {
 	installed = true
 	log.Printf("[kbatch-perfmetrics] installed retention=%s bucket=%s max_job_types=%d sample_rate=%.2f",
 		w.retention, w.bucketSeconds, w.maxJobTypes, w.sampleRate)
+	StartRTTProbe(RTTProbeConfig{
+		Enabled:       true,
+		Interval:      cfg.RTTInterval,
+		Timeout:       cfg.RTTTimeout,
+		Retention:     w.retention,
+		BucketSeconds: w.bucketSeconds,
+	}, client)
 	return nil
 }
 
 // Reset unregisters the perf writer handler (tests / graceful shutdown).
 func Reset() {
+	StopRTTProbe()
 	mu.Lock()
 	defer mu.Unlock()
 	if installed && removeFunc != nil {

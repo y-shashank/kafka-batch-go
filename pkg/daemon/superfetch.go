@@ -253,20 +253,43 @@ func (e *SuperFetchExecutor) perform(ctx context.Context, rec *kgo.Record, jobID
 	// Complete run after release so slow Kafka emit does not starve the pool.
 	// ClaimWindow still covers the full lifetime (durability / renew).
 	src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
-	out, err := e.processWithSem(ctx, rec.Value, src)
-	if err != nil {
-		log.Printf("[kbatch-superfetch] process error group=%s job_id=%s: %v — leaving in workset",
-			group, jobID, err)
-		return
+
+	// Retry process/apply while healthy. Returning early used to stop renew while
+	// the consumer heartbeat stayed alive — reclaim only steals from *dead*
+	// consumers, so the job lease TTL then deleted the payload with no Kafka
+	// redelivery path (permanent batch hole, lag already 0).
+	var out job.Outcome
+	for attempt := 1; ; attempt++ {
+		var err error
+		out, err = e.processWithSem(ctx, rec.Value, src)
+		if err == nil {
+			break
+		}
+		log.Printf("[kbatch-superfetch] process error group=%s job_id=%s attempt=%d: %v — retrying (renew kept)",
+			group, jobID, attempt, err)
+		if !sleepOrDone(ctx, retryBackoff(attempt)) {
+			log.Printf("[kbatch-superfetch] process aborted group=%s job_id=%s — leaving in workset for reclaim",
+				group, jobID)
+			return
+		}
 	}
+
 	// Apply BEFORE the fence check (Ruby SuperFetch parity). If the workset
 	// entry expired or was reclaimed while #perform ran, skipping Apply would
 	// permanently lose the job: Kafka already acked at Claim, and reclaim has
 	// nothing left to re-produce. Batch bitmap / DLT paths are idempotent.
-	if err := e.Apply(ctx, out); err != nil {
-		log.Printf("[kbatch-superfetch] apply error group=%s job_id=%s: %v — leaving in workset",
-			group, jobID, err)
-		return
+	for attempt := 1; ; attempt++ {
+		if err := e.Apply(ctx, out); err == nil {
+			break
+		} else {
+			log.Printf("[kbatch-superfetch] apply error group=%s job_id=%s attempt=%d: %v — retrying (renew kept)",
+				group, jobID, attempt, err)
+		}
+		if !sleepOrDone(ctx, retryBackoff(attempt)) {
+			log.Printf("[kbatch-superfetch] apply aborted group=%s job_id=%s — leaving in workset for reclaim",
+				group, jobID)
+			return
+		}
 	}
 	owned, err := e.Work.StillOwned(ctx, jobID, e.ConsumerID, fence)
 	if err != nil || !owned {
@@ -282,6 +305,25 @@ func (e *SuperFetchExecutor) perform(ctx context.Context, rec *kgo.Record, jobID
 			continue
 		}
 		return
+	}
+}
+
+func retryBackoff(attempt int) time.Duration {
+	d := time.Duration(attempt) * 200 * time.Millisecond
+	if d > 5*time.Second {
+		d = 5 * time.Second
+	}
+	return d
+}
+
+func sleepOrDone(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 

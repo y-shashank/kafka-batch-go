@@ -180,6 +180,9 @@ func TestInstallAddsHandlerAndResetRemovesIt(t *testing.T) {
 	if !perfmetrics.Installed() {
 		t.Fatalf("expected Installed() true after Install")
 	}
+	if !perfmetrics.RTTProbeRunning() {
+		t.Fatalf("expected RTTProbeRunning() true after Install")
+	}
 
 	instrument.Emit("job.processed", map[string]interface{}{"job_id": "j1", "worker_class": "FooWorker"}, 0)
 
@@ -193,9 +196,27 @@ func TestInstallAddsHandlerAndResetRemovesIt(t *testing.T) {
 		t.Fatalf("_all = %q, want 1 (Install should subscribe via instrument.AddHandler)", vals[perfmetrics.AllField])
 	}
 
+	// Allow the immediate first RTT tick to land.
+	deadline := time.Now().Add(2 * time.Second)
+	var rttVals map[string]string
+	for time.Now().Before(deadline) {
+		rttKey := "kafka_batch:perf:min:" + itoa((time.Now().Unix()/60)*60) + ":rtt"
+		rttVals, _ = rdb.HGetAll(ctx, rttKey).Result()
+		if rttVals["count"] != "" || rttVals["errors"] != "" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if rttVals["count"] == "" && rttVals["errors"] == "" {
+		t.Fatalf("expected rtt bucket after Install immediate tick; got %v", rttVals)
+	}
+
 	perfmetrics.Reset()
 	if perfmetrics.Installed() {
 		t.Fatalf("expected Installed() false after Reset")
+	}
+	if perfmetrics.RTTProbeRunning() {
+		t.Fatalf("expected RTTProbeRunning() false after Reset")
 	}
 }
 
