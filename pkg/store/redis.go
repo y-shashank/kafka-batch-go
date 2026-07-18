@@ -50,6 +50,19 @@ type FinishedBatch struct {
 type CompletionsResult struct {
 	Finished []FinishedBatch
 	Replays  []string
+	// Dropped lists completion events that could not be applied to a batch
+	// (batch hash absent → "not_found", or malformed → "invalid"). These are
+	// silent count losses: the batch can no longer converge for that seq. The
+	// caller should log/alert on them rather than swallow them.
+	Dropped []DroppedCompletion
+}
+
+// DroppedCompletion is one completion event that the ledger could not apply.
+type DroppedCompletion struct {
+	BatchID  string
+	JobID    string
+	BatchSeq int64
+	Reason   string // "not_found" | "invalid"
 }
 
 // RedisStore implements the batch ledger against Redis (Ruby-compatible).
@@ -119,6 +132,16 @@ func (s *RedisStore) RecordCompletionsBatch(ctx context.Context, events []Comple
 		case 0:
 			if payload == "duplicate" {
 				out.Replays = append(out.Replays, events[i].BatchID)
+			} else {
+				// "not_found" / "invalid": the event cannot be applied and is
+				// otherwise silently lost. Surface it so counts can't drift
+				// undetected (batch stuck below total with no trace).
+				out.Dropped = append(out.Dropped, DroppedCompletion{
+					BatchID:  events[i].BatchID,
+					JobID:    events[i].JobID,
+					BatchSeq: events[i].BatchSeq,
+					Reason:   payload,
+				})
 			}
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/y-shashank/kafka-batch-go/pkg/config"
 	"github.com/y-shashank/kafka-batch-go/pkg/instrument"
@@ -71,6 +72,16 @@ func (p *Processor) ProcessBatch(ctx context.Context, rawEvents [][]byte) (Outco
 		return out, err
 	}
 
+	// Dropped completions (batch hash absent / malformed) are silent count
+	// losses that leave a batch stuck below total. Make them loud + monitorable
+	// instead of swallowing them. Common root cause: the daemon reads a different
+	// Redis than the producer that created the batch, or the batch TTL expired.
+	for _, d := range result.Dropped {
+		log.Printf("[kbatch-event] DROPPED completion reason=%s batch_id=%q batch_seq=%d job_id=%q — count lost; batch may never converge (check Redis/topic-prefix parity between producer and daemon)",
+			d.Reason, d.BatchID, d.BatchSeq, d.JobID)
+		instrument.CompletionDropped(d.BatchID, d.JobID, d.BatchSeq, d.Reason)
+	}
+
 	for _, fin := range result.Finished {
 		if fin.Batch == nil {
 			continue
@@ -124,32 +135,100 @@ func (p *Processor) ProcessBatch(ctx context.Context, rawEvents [][]byte) (Outco
 	return out, nil
 }
 
+// callbackProduceAttempts bounds the in-call retries before a callback is parked
+// on the dead-letter topic. Kept small so a broker blip is absorbed without
+// stalling the events consumer for long.
+const callbackProduceAttempts = 3
+
 func (p *Processor) produceCallbacks(ctx context.Context, callbacks []protocol.CallbackMessage) error {
 	if len(callbacks) == 0 {
 		return nil
 	}
-	reqs := make([]kafkaclient.ProduceRequest, 0, len(callbacks))
-	for _, cb := range callbacks {
-		raw, err := json.Marshal(cb)
-		if err != nil {
-			return fmt.Errorf("callback marshal: %w", err)
-		}
-		reqs = append(reqs, kafkaclient.ProduceRequest{
-			Topic: p.Cfg.CallbacksTopic,
-			Key:   cb.BatchID,
-			Value: raw,
-		})
-	}
+	// Fast path: try the batch produce once when supported. If it fails we do NOT
+	// retry the whole batch (a partial success would re-emit already-produced
+	// callbacks, and Preclaimed callbacks skip the consumer's ClaimCallback dedup
+	// → double-invoke). Instead fall back to per-item produce, which has
+	// unambiguous per-callback success so retries never double-produce.
 	if bp, ok := p.Producer.(BatchProducer); ok {
-		if err := bp.ProduceMany(ctx, reqs...); err != nil {
-			return fmt.Errorf("callback produce: %w", err)
+		reqs := make([]kafkaclient.ProduceRequest, 0, len(callbacks))
+		marshalled := true
+		for _, cb := range callbacks {
+			raw, err := json.Marshal(cb)
+			if err != nil {
+				marshalled = false
+				break
+			}
+			reqs = append(reqs, kafkaclient.ProduceRequest{Topic: p.Cfg.CallbacksTopic, Key: cb.BatchID, Value: raw})
 		}
-		return nil
+		if marshalled {
+			if err := bp.ProduceMany(ctx, reqs...); err == nil {
+				return nil
+			}
+			// fall through to per-item recovery
+		}
 	}
-	for _, req := range reqs {
-		if err := p.Producer.Produce(ctx, req.Topic, req.Key, req.Value); err != nil {
-			return fmt.Errorf("callback produce: %w", err)
+	// Per-item path: each callback is produced independently with bounded retry;
+	// one that still fails is parked on the dead-letter topic so it is never
+	// silently lost (the old behavior returned an error → redelivery → the
+	// duplicate events were then excluded from replay → callback lost forever).
+	for _, cb := range callbacks {
+		if err := p.produceOneCallback(ctx, cb); err != nil {
+			p.deadLetterCallback(ctx, cb, err)
 		}
 	}
 	return nil
+}
+
+func (p *Processor) produceOneCallback(ctx context.Context, cb protocol.CallbackMessage) error {
+	raw, err := json.Marshal(cb)
+	if err != nil {
+		return fmt.Errorf("callback marshal: %w", err)
+	}
+	for attempt := 1; ; attempt++ {
+		err = p.Producer.Produce(ctx, p.Cfg.CallbacksTopic, cb.BatchID, raw)
+		if err == nil {
+			return nil
+		}
+		if attempt >= callbackProduceAttempts || ctx.Err() != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
+		}
+	}
+}
+
+// deadLetterCallback parks an unproducible callback on the dead-letter topic so a
+// completed batch's callback is preserved (operator-visible / replayable) rather
+// than lost. Best-effort: if the DLT is unset or also fails, we log loudly.
+func (p *Processor) deadLetterCallback(ctx context.Context, cb protocol.CallbackMessage, cause error) {
+	log.Printf("[kbatch-event] callback produce failed batch_id=%s outcome=%s: %v — parking on dead-letter",
+		cb.BatchID, cb.Outcome, cause)
+	instrument.CallbackProduceFailed(cb.BatchID, cb.Outcome, cause.Error())
+	if p.Cfg.DeadLetterTopic == "" {
+		log.Printf("[kbatch-event] no dead_letter_topic configured — callback for batch_id=%s is LOST", cb.BatchID)
+		return
+	}
+	dlt := map[string]interface{}{
+		"batch_id":          cb.BatchID,
+		"dlt_type":          "callback_produce_failed",
+		"outcome":           cb.Outcome,
+		"on_success":        cb.OnSuccess,
+		"on_complete":       cb.OnComplete,
+		"dlt_error_message": cause.Error(),
+	}
+	if raw, err := json.Marshal(cb); err == nil {
+		dlt["dlt_raw_payload"] = string(raw)
+	}
+	rawDLT, err := json.Marshal(dlt)
+	if err != nil {
+		return
+	}
+	if err := p.Producer.Produce(ctx, p.Cfg.DeadLetterTopic, cb.BatchID, rawDLT); err != nil {
+		log.Printf("[kbatch-event] dead-letter callback produce failed batch_id=%s: %v — callback LOST", cb.BatchID, err)
+		return
+	}
+	instrument.DLTPublished("", cb.BatchID, "callback_produce_failed", p.Cfg.CallbacksTopic)
 }

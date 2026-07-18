@@ -93,8 +93,13 @@ func BuildDrop(raw []byte, src protocol.SourceCoords, now time.Time) DropOutcome
 
 	batchID, _ := m["batch_id"].(string)
 	seqF, hasSeq := m["batch_seq"].(float64)
-	batchCounted, _ := m["batch_counted"].(bool)
-	if batchID != "" && hasSeq && seqF > 0 && !batchCounted {
+	// NOTE: batch_counted only means the job already emitted an "executed" touch
+	// on an earlier retry. Expiry is a TERMINAL outcome that must still count
+	// toward failed_count, or a batch whose last job expires-after-retry never
+	// converges (touched==total but completed+failed<total → stuck forever).
+	// The completion Lua dedups by seq-bit, so emitting "failed" for an already
+	// touched seq bumps failed_count exactly once and never double-counts.
+	if batchID != "" && hasSeq && seqF > 0 {
 		jobID, _ := m["job_id"].(string)
 		worker, _ := m["worker_class"].(string)
 		out.Event = &protocol.EventMessage{

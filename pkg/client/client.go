@@ -137,6 +137,14 @@ func (c *Client) Close() {
 
 // CreateBatch persists a new batch. When populate is non-nil the batch stays
 // unsealed until populate returns (block form, Ruby Batch.create with block).
+//
+// IMPORTANT: passing populate == nil creates the batch ALREADY SEALED. If you
+// then PushJob in a loop, a fast worker can finalize the batch after the first
+// job (completed >= total) before later pushes land; those pushes are then
+// rejected with BatchClosedError and the batch shows fewer jobs than intended.
+// Prefer the block form (populate != nil) whenever you enqueue more than one
+// job, so the batch is sealed only after every job is added. Rejections are also
+// surfaced via the batch.push_rejected instrumentation event.
 func (c *Client) CreateBatch(ctx context.Context, opts BatchOptions, populate func(*Batch) error) (*Batch, error) {
 	id := opts.ID
 	if id == "" {

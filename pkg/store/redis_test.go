@@ -180,3 +180,32 @@ func TestRecordCompletionsBatchDedup(t *testing.T) {
 		t.Fatalf("replays %+v", res.Replays)
 	}
 }
+
+// Regression (#1): a completion for a batch that doesn't exist must be surfaced
+// in Dropped (reason "not_found"), not silently swallowed.
+func TestRecordCompletionsBatchReportsNotFound(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mr.Close()
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := NewRedisStore(rdb, time.Hour)
+
+	res, err := st.RecordCompletionsBatch(context.Background(), []CompletionEvent{
+		{BatchID: "ghost", JobID: "j1", Status: "success", BatchSeq: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Finished) != 0 || len(res.Replays) != 0 {
+		t.Fatalf("expected nothing finished/replayed, got %+v", res)
+	}
+	if len(res.Dropped) != 1 {
+		t.Fatalf("expected 1 dropped completion, got %d", len(res.Dropped))
+	}
+	d := res.Dropped[0]
+	if d.Reason != "not_found" || d.BatchID != "ghost" || d.BatchSeq != 1 || d.JobID != "j1" {
+		t.Fatalf("unexpected dropped: %+v", d)
+	}
+}

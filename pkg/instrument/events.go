@@ -266,3 +266,39 @@ func CronHeartbeat(enabled, stale int, maxStaleSeconds float64) {
 		"stale_count":   stale,
 	}, maxStaleSeconds*1000)
 }
+
+// CompletionDropped fires when a completion event could not be applied to a
+// batch (e.g. the batch hash was absent → "not_found", or the event was
+// malformed → "invalid"). This is a silent count loss made visible: the batch
+// can no longer converge for that seq. Reason is the store's drop reason.
+func CompletionDropped(batchID, jobID string, batchSeq int64, reason string) {
+	Emit("completion.dropped", map[string]interface{}{
+		"batch_id":  batchID,
+		"job_id":    jobID,
+		"batch_seq": batchSeq,
+		"reason":    reason,
+	}, 0)
+}
+
+// BatchPushRejected fires when a job could not be added to a batch because the
+// batch is already sealed/terminal or cancelled (Ruby parity: a closed batch
+// refuses new jobs). Surfaces the create-sealed-then-push race so an ignored
+// error is still observable.
+func BatchPushRejected(batchID, jobType, reason string) {
+	Emit("batch.push_rejected", map[string]interface{}{
+		"batch_id": batchID,
+		"job_type": jobType,
+		"reason":   reason,
+	}, 0)
+}
+
+// CallbackProduceFailed fires when a completion callback could not be produced
+// to the callbacks topic after retries and was parked on the dead-letter topic
+// instead (so it is never silently lost).
+func CallbackProduceFailed(batchID, outcome, errMsg string) {
+	Emit("callback.produce_failed", map[string]interface{}{
+		"batch_id":      batchID,
+		"outcome":       outcome,
+		"error_message": errMsg,
+	}, 0)
+}

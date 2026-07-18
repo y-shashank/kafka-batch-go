@@ -2,12 +2,23 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
 
 	"github.com/y-shashank/kafka-batch-go/pkg/instrument"
 )
+
+// noteBatchRejection surfaces a sealed/cancelled-batch push rejection via
+// instrumentation so a caller that ignores the returned error still leaves a
+// trace (the create-sealed-then-push race silently drops jobs otherwise).
+func noteBatchRejection(err error, batchID, jobType string) {
+	var closed BatchClosedError
+	if errors.As(err, &closed) {
+		instrument.BatchPushRejected(batchID, jobType, closed.Reason)
+	}
+}
 
 // BatchOptions configures batch creation.
 type BatchOptions struct {
@@ -72,6 +83,7 @@ func (b *Batch) PushJob(ctx context.Context, jobType string, payload map[string]
 	}
 	seq, err := b.reserve(ctx, 1)
 	if err != nil {
+		noteBatchRejection(err, b.id, jobType)
 		b.client.releaseUniq(entry, jobType, payload, jobID, "")
 		return "", err
 	}
@@ -105,6 +117,7 @@ func (b *Batch) PushJobAt(ctx context.Context, runAt interface{}, jobType string
 	}
 	seq, err := b.reserve(ctx, 1)
 	if err != nil {
+		noteBatchRejection(err, b.id, jobType)
 		b.client.releaseUniq(entry, jobType, payload, jobID, "")
 		return "", err
 	}
