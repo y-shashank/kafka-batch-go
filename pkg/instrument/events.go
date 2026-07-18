@@ -209,3 +209,60 @@ func SuperFetchDrained(remaining int, timeout time.Duration) {
 		"timeout":   timeout.Seconds(),
 	}, 0)
 }
+
+// ── Recurring (cron) scheduler ──────────────────────────────────────────────
+// Event names: cron.fired, cron.misfire_skipped, cron.enqueue_failed,
+// cron.stale, cron.heartbeat. The metrics bridge maps each to
+// kafka_batch.cron_*.count (+ .duration). Staleness values are carried in the
+// duration slot so a Datadog monitor can alert on kafka_batch.cron_stale.duration
+// or simply on kafka_batch.cron_stale.count > 0.
+
+// CronFired fires once per successfully enqueued recurring occurrence.
+func CronFired(schedule, jobType, jobID, tenantID string) {
+	Emit("cron.fired", map[string]interface{}{
+		"schedule":  schedule,
+		"job_type":  jobType,
+		"job_id":    jobID,
+		"tenant_id": tenantID,
+	}, 0)
+}
+
+// CronMisfireSkipped fires when a due schedule intentionally skipped missed
+// instants (misfire_policy=skip).
+func CronMisfireSkipped(schedule, jobType string) {
+	Emit("cron.misfire_skipped", map[string]interface{}{
+		"schedule": schedule,
+		"job_type": jobType,
+	}, 0)
+}
+
+// CronEnqueueFailed fires when a claimed occurrence could not be enqueued and
+// was left pending for recovery.
+func CronEnqueueFailed(schedule, jobType, errMsg string) {
+	Emit("cron.enqueue_failed", map[string]interface{}{
+		"schedule":      schedule,
+		"job_type":      jobType,
+		"error_message": errMsg,
+	}, 0)
+}
+
+// CronStale fires (per schedule) when an enabled schedule has not fired within
+// its staleness threshold (default 2× its interval) — the "the scheduler
+// silently stopped" alert. staleSeconds is also carried as the event duration.
+func CronStale(schedule, jobType string, staleSeconds, thresholdSeconds float64) {
+	Emit("cron.stale", map[string]interface{}{
+		"schedule":          schedule,
+		"job_type":          jobType,
+		"stale_seconds":     staleSeconds,
+		"threshold_seconds": thresholdSeconds,
+	}, staleSeconds*1000)
+}
+
+// CronHeartbeat fires once per heartbeat sweep as a liveness pulse for the
+// recurring scheduler. maxStaleSeconds is carried as the event duration.
+func CronHeartbeat(enabled, stale int, maxStaleSeconds float64) {
+	Emit("cron.heartbeat", map[string]interface{}{
+		"enabled_count": enabled,
+		"stale_count":   stale,
+	}, maxStaleSeconds*1000)
+}

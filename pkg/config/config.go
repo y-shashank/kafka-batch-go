@@ -155,6 +155,24 @@ type Daemon struct {
 	ReconciliationInterval       time.Duration
 	ReconcilerLockTTL            time.Duration
 	MaxReconcilePerRun           int
+
+	// ── Recurring (cron) scheduler (Go daemon only) ─────────────────────────
+	// Fires a registered manifest job on a repeating cron schedule. Rows live in
+	// kafka_batch_recurring_schedules; exactly-once emission is guarded by the
+	// (schedule_id, fire_at) ledger, not the leader lock. Never runs arbitrary code.
+	RecurringSchedulerEnabled bool
+	RecurringWindow           time.Duration // resolution/poll interval (default 30s)
+	RecurringLockTTL          time.Duration // leader-lease TTL (default 60s)
+	RecurringBatchSize        int           // schedules processed per tick
+	RecurringMisfireGrace     time.Duration // instants within this of now always fire
+	RecurringMaxBackfill      int           // cap fires per schedule per tick (backfill)
+	RecurringRecoverEvery     time.Duration // pending-fire recovery sweep interval
+	RecurringRecoverGrace     time.Duration // pending age before recovery re-enqueues
+	RecurringPruneEvery       time.Duration // dispatched-ledger prune interval
+	RecurringPruneRetention   time.Duration // keep dispatched fire rows this long
+	RecurringMySQLDSN         string        // defaults to ScheduleMySQLDSN when empty
+	RecurringHeartbeatEvery   time.Duration // stale-schedule sweep interval (default 60s)
+	RecurringStaleFactor      float64       // staleness threshold = factor × interval (default 2)
 }
 
 func DefaultDaemon() Daemon {
@@ -219,6 +237,17 @@ func DefaultDaemon() Daemon {
 		ReconciliationInterval:          300 * time.Second,
 		ReconcilerLockTTL:               600 * time.Second,
 		MaxReconcilePerRun:              100,
+		RecurringWindow:                 30 * time.Second,
+		RecurringLockTTL:                60 * time.Second,
+		RecurringBatchSize:              100,
+		RecurringMisfireGrace:           60 * time.Second,
+		RecurringMaxBackfill:            1000,
+		RecurringRecoverEvery:           5 * time.Minute,
+		RecurringRecoverGrace:           2 * time.Minute,
+		RecurringPruneEvery:             time.Hour,
+		RecurringPruneRetention:         7 * 24 * time.Hour,
+		RecurringHeartbeatEvery:         60 * time.Second,
+		RecurringStaleFactor:            2.0,
 		ProducerRequiredAcks:            "all_isr",
 		JobsConsumerConcurrency:         8,
 		FairReadyConsumerConcurrency:    8,
@@ -481,6 +510,19 @@ func LoadDaemon(path string) (Daemon, error) {
 		ReconciliationIntervalSec            float64          `yaml:"reconciliation_interval"`
 		ReconcilerLockTTLSec                 float64          `yaml:"reconciler_lock_ttl"`
 		MaxReconcilePerRun                   int              `yaml:"max_reconcile_per_run"`
+		RecurringSchedulerEnabled            bool             `yaml:"recurring_scheduler_enabled"`
+		RecurringWindowSec                   float64          `yaml:"recurring_window"`
+		RecurringLockTTLSec                  float64          `yaml:"recurring_lock_ttl"`
+		RecurringBatchSize                   int              `yaml:"recurring_batch_size"`
+		RecurringMisfireGraceSec             float64          `yaml:"recurring_misfire_grace"`
+		RecurringMaxBackfill                 int              `yaml:"recurring_max_backfill"`
+		RecurringRecoverEverySec             float64          `yaml:"recurring_recover_every"`
+		RecurringRecoverGraceSec             float64          `yaml:"recurring_recover_grace"`
+		RecurringPruneEverySec               float64          `yaml:"recurring_prune_every"`
+		RecurringPruneRetentionSec           float64          `yaml:"recurring_prune_retention"`
+		RecurringMySQLDSN                    string           `yaml:"recurring_mysql_dsn"`
+		RecurringHeartbeatEverySec           float64          `yaml:"recurring_heartbeat_every"`
+		RecurringStaleFactor                 float64          `yaml:"recurring_stale_factor"`
 	}
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
 		return cfg, err
@@ -739,6 +781,45 @@ func LoadDaemon(path string) (Daemon, error) {
 	}
 	if doc.MaxReconcilePerRun > 0 {
 		cfg.MaxReconcilePerRun = doc.MaxReconcilePerRun
+	}
+	if doc.RecurringSchedulerEnabled {
+		cfg.RecurringSchedulerEnabled = true
+	}
+	if doc.RecurringWindowSec > 0 {
+		cfg.RecurringWindow = time.Duration(doc.RecurringWindowSec * float64(time.Second))
+	}
+	if doc.RecurringLockTTLSec > 0 {
+		cfg.RecurringLockTTL = time.Duration(doc.RecurringLockTTLSec * float64(time.Second))
+	}
+	if doc.RecurringBatchSize > 0 {
+		cfg.RecurringBatchSize = doc.RecurringBatchSize
+	}
+	if doc.RecurringMisfireGraceSec > 0 {
+		cfg.RecurringMisfireGrace = time.Duration(doc.RecurringMisfireGraceSec * float64(time.Second))
+	}
+	if doc.RecurringMaxBackfill > 0 {
+		cfg.RecurringMaxBackfill = doc.RecurringMaxBackfill
+	}
+	if doc.RecurringRecoverEverySec > 0 {
+		cfg.RecurringRecoverEvery = time.Duration(doc.RecurringRecoverEverySec * float64(time.Second))
+	}
+	if doc.RecurringRecoverGraceSec > 0 {
+		cfg.RecurringRecoverGrace = time.Duration(doc.RecurringRecoverGraceSec * float64(time.Second))
+	}
+	if doc.RecurringPruneEverySec > 0 {
+		cfg.RecurringPruneEvery = time.Duration(doc.RecurringPruneEverySec * float64(time.Second))
+	}
+	if doc.RecurringPruneRetentionSec > 0 {
+		cfg.RecurringPruneRetention = time.Duration(doc.RecurringPruneRetentionSec * float64(time.Second))
+	}
+	if doc.RecurringMySQLDSN != "" {
+		cfg.RecurringMySQLDSN = doc.RecurringMySQLDSN
+	}
+	if doc.RecurringHeartbeatEverySec > 0 {
+		cfg.RecurringHeartbeatEvery = time.Duration(doc.RecurringHeartbeatEverySec * float64(time.Second))
+	}
+	if doc.RecurringStaleFactor > 0 {
+		cfg.RecurringStaleFactor = doc.RecurringStaleFactor
 	}
 	applyEnv(&cfg)
 	cfg.prefixTopics()

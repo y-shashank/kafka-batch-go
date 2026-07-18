@@ -253,6 +253,14 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 		log.Printf("kbatch schedule poller enabled topic=%s store=%s", cfg.ScheduledTopic, cfg.ScheduleStore)
 	}
 
+	if cfg.RecurringSchedulerEnabled {
+		closeCron, err := StartRecurringScheduler(ctx, cfg, rdb, loopHealth)
+		if err != nil {
+			return fmt.Errorf("recurring scheduler: %w", err)
+		}
+		defer closeCron()
+	}
+
 	if cfg.FairnessEnabled {
 		wireFairLane(ctx, cfg, manifest, rdb, prod, st, failures, consumerHealth, loopHealth, pauseCtl, live, ingestLag,
 			fairness.LaneTime, cfg.FairnessTimeIngest, cfg.FairnessTimeSettings())
