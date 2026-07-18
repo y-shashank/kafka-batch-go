@@ -2,6 +2,12 @@ module github.com/y-shashank/kafka-batch-go
 
 go 1.25.0
 
+// Stale tags deleted from GitHub still live forever on proxy.golang.org.
+// v0.0.7 publishes these retractions so go get / @latest stop selecting them.
+retract (
+	[v0.0.1, v0.0.6] // Reset line; proxy still serves these. Use v0.0.7+.
+)
+
 require (
 	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/cespare/xxhash/v2 v2.3.0
