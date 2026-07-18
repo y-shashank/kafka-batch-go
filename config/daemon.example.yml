@@ -1,5 +1,7 @@
 # Example kbatch daemon config.
 # Copy to your app as config/daemon.yml (or config/kbatch_daemon.yml) and adjust.
+# Full annotated copy-paste (SQL + every YAML key + handler fields): see README
+# appendix "Go-only bootstrap reference".
 #
 # ── Environment overrides (applied on top of YAML when set) ───────────────────
 #   KAFKA_BROKERS                              comma-separated broker list
@@ -110,6 +112,23 @@ schedule_store: redis                  # redis | mysql
 # schedule_batch_size: 100             # max due jobs claimed per poll (SQL LIMIT)
 # schedule_lease_seconds: 60             # lease TTL on a claimed schedule pointer
 # schedule_reclaim_interval: 30        # sec — how often to reclaim expired leases
+
+# ── Recurring (cron) scheduler ────────────────────────────────────────────────
+# Shares MySQL tables + Redis leader lock with the Ruby twin. Run SQL block C
+# from the README appendix (or rely on EnsureSchema on first boot).
+# recurring_scheduler_enabled: false
+# recurring_mysql_dsn: ${KB_MYSQL_URL} # defaults to schedule_mysql_dsn when empty
+# recurring_window: 30                 # sec
+# recurring_lock_ttl: 60               # sec
+# recurring_batch_size: 100
+# recurring_misfire_grace: 60          # sec
+# recurring_max_backfill: 1000
+# recurring_recover_every: 300         # sec
+# recurring_recover_grace: 120         # sec
+# recurring_prune_every: 3600          # sec
+# recurring_prune_retention: 604800    # sec — 7 days
+# recurring_heartbeat_every: 60        # sec
+# recurring_stale_factor: 2.0
 
 # ── Priority YAML groups (daemon schedule routing + worker execution) ─────────
 

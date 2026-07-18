@@ -568,7 +568,7 @@ Daemon and worker load `config/daemon.example.yml` (or your app copy), then **en
 Client: `client.DefaultConfig()` + `client.New(cfg)` applies env automatically.  
 CLI: `config.LoadDaemon` applies env after YAML parse.
 
-See `config/daemon.example.yml` for the full YAML surface (fairness, schedule, retry tiers, etc.).
+See [`config/daemon.example.yml`](config/daemon.example.yml) and the [Appendix](#appendix-go-only-bootstrap-reference) for the full YAML surface (fairness, schedule, recurring, retry tiers, etc.).
 
 #### MySQL connection strings
 
@@ -813,6 +813,324 @@ JSON job/event fixtures and legacy notes: `protocol/`.
 ## Ruby compatibility
 
 Cross-runtime integration specs and Ruby itest drivers live under `compat/ruby/`. The matrix harness in `integration/matrix/` is the primary CI gate for mixed deployments — see [Cross-runtime matrix tests](#cross-runtime-matrix-tests) above.
+
+## Appendix: Go-only bootstrap reference
+
+For Go-only (or Go-control) projects: copy the SQL blocks you need into MySQL, then copy the full `daemon.yml` / `kafka_batch_handlers.yml` templates below into your app and trim what you do not use. All YAML keys below match `config.LoadDaemon` / `config.LoadManifest`; values shown are library defaults from `DefaultDaemon()` unless noted.
+
+### MySQL migrations (pick & run)
+
+Run against the DB used by `schedule_mysql_dsn` / `store_mysql_dsn` / `recurring_mysql_dsn` (they may be the same database). Statements are idempotent (`IF NOT EXISTS`).
+
+**A — Delayed-job index** (`schedule_store: mysql`)
+
+```sql
+-- kafka_batch_scheduled_jobs — pointer index for perform_in / perform_at
+-- (payload lives on kafka_batch.scheduled; this row is partition + offset)
+CREATE TABLE IF NOT EXISTS kafka_batch_scheduled_jobs (
+  job_id       VARCHAR(36)  NOT NULL,
+  run_at       DATETIME(6)  NOT NULL,
+  partition_id INT          NOT NULL,
+  kafka_offset BIGINT       NOT NULL,
+  batch_id     VARCHAR(36)  NULL,
+  lease_until  DATETIME(6)  NULL,
+  created_at   DATETIME(6)  NOT NULL,
+  PRIMARY KEY (job_id),
+  KEY idx_kb_scheduled_due (run_at, lease_until),
+  KEY idx_kb_scheduled_batch_id (batch_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+**B — Failures + consumption pauses** (`store: mysql`)
+
+```sql
+-- kafka_batch_failures — per-job failure log for the dashboard
+CREATE TABLE IF NOT EXISTS kafka_batch_failures (
+  id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  batch_id      VARCHAR(36)  NOT NULL,
+  job_id        VARCHAR(36)  NOT NULL,
+  worker_class  VARCHAR(255) NULL,
+  error_class   VARCHAR(255) NULL,
+  error_message TEXT         NULL,
+  attempt       INT          NOT NULL DEFAULT 0,
+  status        VARCHAR(20)  NOT NULL DEFAULT 'failed',
+  next_retry_at DATETIME(6)  NULL,
+  failed_at     DATETIME(6)  NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_kb_failures (batch_id, job_id),
+  KEY idx_kb_failures_batch_failed_at (batch_id, failed_at),
+  KEY idx_kb_failures_failed_at (failed_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- kafka_batch_consumption_pauses — /lag pause state (partition_id = -1 = whole topic)
+CREATE TABLE IF NOT EXISTS kafka_batch_consumption_pauses (
+  id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  consumer_group VARCHAR(255) NOT NULL,
+  topic_name     VARCHAR(255) NOT NULL,
+  partition_id   INT          NOT NULL,
+  created_at     DATETIME     NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_kb_consumption_pauses (consumer_group, topic_name, partition_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+**C — Recurring (cron) scheduler** (`recurring_scheduler_enabled: true`)
+
+Also auto-created by `Store.EnsureSchema` when the daemon starts with recurring enabled; prefer running this explicitly in production.
+
+```sql
+-- kafka_batch_recurring_schedules — cron definitions
+CREATE TABLE IF NOT EXISTS kafka_batch_recurring_schedules (
+  id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  name           VARCHAR(191) NOT NULL,
+  cron_expr      VARCHAR(120) NOT NULL,
+  timezone       VARCHAR(64)  NOT NULL DEFAULT 'UTC',
+  job_type       VARCHAR(120) NOT NULL,
+  args_json      JSON NULL,
+  tenant_id      VARCHAR(120) NULL,
+  enabled        TINYINT(1) NOT NULL DEFAULT 1,
+  misfire_policy VARCHAR(16) NOT NULL DEFAULT 'fire_once',
+  next_run_at    DATETIME NOT NULL,
+  last_fire_at   DATETIME NULL,
+  created_at     DATETIME NOT NULL,
+  updated_at     DATETIME NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_name (name),
+  KEY idx_due (enabled, next_run_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- kafka_batch_recurring_fires — fire idempotency ledger
+-- PRIMARY KEY (schedule_id, fire_at) makes INSERT IGNORE exactly-once per instant
+CREATE TABLE IF NOT EXISTS kafka_batch_recurring_fires (
+  schedule_id   BIGINT UNSIGNED NOT NULL,
+  fire_at       DATETIME NOT NULL,
+  status        VARCHAR(16) NOT NULL DEFAULT 'pending',
+  job_id        VARCHAR(191) NULL,
+  created_at    DATETIME NOT NULL,
+  dispatched_at DATETIME NULL,
+  PRIMARY KEY (schedule_id, fire_at),
+  KEY idx_pending (status, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+| Feature | Tables | Config knobs |
+|---------|--------|--------------|
+| Delayed jobs on MySQL | A | `schedule_store: mysql`, `schedule_mysql_dsn` |
+| Durable failures / pauses | B | `store: mysql`, `store_mysql_dsn` |
+| Recurring cron | C | `recurring_scheduler_enabled: true`, `recurring_mysql_dsn` (falls back to `schedule_mysql_dsn`) |
+
+Batch ledger / uniq / fair weights stay in **Redis** regardless of MySQL options.
+
+### Full `daemon.yml` (all keys + defaults)
+
+Copy to `config/daemon.yml`. Commented lines show optional keys; uncomment and change when needed. Env vars listed in [Config](#config) still override YAML when set.
+
+```yaml
+# ── Kafka & identity ──────────────────────────────────────────────────────────
+brokers:
+  - localhost:9092
+# topic_prefix: ""                       # optional namespace for topics + consumer_group
+consumer_group: kafka-batch
+# node_id: ""                            # default: hostname#pid — set per replica for fencing
+handler_manifest: config/kafka_batch_handlers.yml
+# jobs_topics:                           # optional explicit list; usually derived from manifest
+#   - kafka_batch.jobs
+redis_url: ${REDIS_URL:-redis://localhost:6379/0}
+
+# ── Core topics ───────────────────────────────────────────────────────────────
+events_topic: kafka_batch.events
+callbacks_topic: kafka_batch.callbacks
+dead_letter_topic: kafka_batch.dead_letter
+retry_topic: kafka_batch.jobs.retry      # base; tiers become retry.short / .medium / .large
+
+# ── Job retry policy ──────────────────────────────────────────────────────────
+max_retries: 7
+retry_tiers:
+  short: 30                              # seconds
+  medium: 420
+  large: 1200
+retry_max_pause: 30                      # sec — max sleep before re-checking not-yet-due retry
+# producer_required_acks: all_isr        # all_isr (default) | leader
+# consumer_stall_timeout: 90             # sec — force reconnect when poll loop stalls
+
+# Consumer fetch (daemon + worker)
+# consumer_fetch_max_bytes: 1048576                # 1 MiB
+# consumer_fetch_max_partition_bytes: 131072       # 128 KiB
+# consumer_fetch_max_wait_ms: 200
+
+# ── Worker throughput (kbatch worker) ─────────────────────────────────────────
+jobs_consumer_concurrency: 8
+fair_ready_consumer_concurrency: 8
+priority_consumer_concurrency: 4
+super_fetch_concurrency: 10
+# super_fetch_claim_window: 0            # 0 → 2× super_fetch_concurrency
+# super_fetch_lease_ttl: 120             # sec
+# super_fetch_reclaim_interval: 30       # sec
+# super_fetch_reclaim_limit: 100
+# super_fetch_orphan_grace: 40           # sec
+# super_fetch_drain_timeout: 30          # sec
+execution_mode: superfetch               # superfetch | watermark (see README)
+
+# ── Delayed jobs (perform_in / perform_at) ────────────────────────────────────
+schedule_poller_enabled: false           # enable on scheduler / daemon pods only
+scheduled_topic: kafka_batch.scheduled
+schedule_store: redis                    # redis | mysql  (run SQL A when mysql)
+# schedule_mysql_dsn: ${KB_MYSQL_URL}
+schedule_poll_interval: 5                # sec
+schedule_poll_max_interval: 60           # sec — idle backoff ceiling
+schedule_poll_jitter: 0                  # 0 = off; 0.1 ≈ ±10% de-sync
+schedule_batch_size: 100
+schedule_lease_seconds: 60
+schedule_reclaim_interval: 30            # sec
+
+# ── Recurring cron scheduler ──────────────────────────────────────────────────
+recurring_scheduler_enabled: false       # enable on scheduler pods; run SQL C
+# recurring_mysql_dsn: ${KB_MYSQL_URL}   # defaults to schedule_mysql_dsn when empty
+recurring_window: 30                     # sec — poll / resolution
+recurring_lock_ttl: 60                   # sec — Redis leader lease
+recurring_batch_size: 100
+recurring_misfire_grace: 60              # sec
+recurring_max_backfill: 1000
+recurring_recover_every: 300             # sec
+recurring_recover_grace: 120             # sec
+recurring_prune_every: 3600              # sec
+recurring_prune_retention: 604800        # sec — 7 days
+recurring_heartbeat_every: 60            # sec
+recurring_stale_factor: 2.0
+
+# ── Priority YAML groups ──────────────────────────────────────────────────────
+# priority_config_paths:
+#   - config/priority/jobs-fast.yml
+#   - config/priority/jobs-slow.yml
+priority_lag_check_interval: 2           # sec
+priority_weighted_interleave: 4
+
+# ── Fairness dispatch ─────────────────────────────────────────────────────────
+fairness_enabled: false
+fairness_time_ingest: kafka_batch.fair_time_ingest
+fairness_time_ready: kafka_batch.fair_time_ready
+fairness_time_ready_go: kafka_batch.fair_time_ready.go
+fairness_time_ready_ruby: kafka_batch.fair_time_ready.ruby
+fairness_throughput_ingest: kafka_batch.fair_throughput_ingest
+fairness_throughput_ready: kafka_batch.fair_throughput_ready
+fairness_throughput_ready_go: kafka_batch.fair_throughput_ready.go
+fairness_throughput_ready_ruby: kafka_batch.fair_throughput_ready.ruby
+fairness_ready_window: 100
+fairness_global_concurrency: 50
+# fairness_max_inflight_per_tenant: 0    # 0 = dynamic share only
+fairness_lease_ttl: 1800                 # sec
+fairness_default_weight: 1.0
+fairness_weighted_concurrency: true
+fairness_active_count_ttl: 5             # sec
+fairness_active_count_source: inflight_plus_ready  # | inflight
+fairness_dynamic_tenant_partitions: true
+fairness_tenant_partition_cache_ttl: 30  # sec
+# fairness_tenant_partitions:
+#   acme: 0
+#   globex: 1
+
+# ── Consumption pause/resume (/lag) ───────────────────────────────────────────
+consumption_control_refresh_interval: 30 # sec
+
+# ── Batch store / failures ────────────────────────────────────────────────────
+store: redis                             # redis | mysql  (run SQL B when mysql)
+# store_mysql_dsn: ${KB_MYSQL_URL}
+skip_cancelled_jobs: true
+cancellation_cache_ttl: 120              # sec
+
+# ── Reconciler ────────────────────────────────────────────────────────────────
+reconciliation_interval: 300             # sec
+reconciler_lock_ttl: 600                 # sec
+max_reconcile_per_run: 100
+
+# ── Liveness HTTP ─────────────────────────────────────────────────────────────
+liveness_enabled: false
+liveness_http_addr: ":8080"
+liveness_ttl: 180                        # sec
+liveness_heartbeat_interval: 20          # sec
+track_running_jobs: true
+
+# ── Metrics (StatsD) ──────────────────────────────────────────────────────────
+metrics_enabled: false
+metrics_prefix: kafka_batch
+# metrics_statsd_addr: localhost:8125
+
+# ── Performance dashboard (Redis time-series) ─────────────────────────────────
+performance_metrics_enabled: false
+performance_metrics_retention: 86400     # sec — 24h
+performance_metrics_max_job_types: 50
+performance_metrics_bucket_seconds: 60
+performance_metrics_sample_rate: 1.0
+redis_rtt_probe_interval: 15             # sec
+redis_rtt_probe_timeout: 0.2             # sec (200ms)
+```
+
+Code-only defaults (not YAML today): `batch_ttl` = 7d, `event_emit_retries` = 3, `event_emit_backoff` = 1s, `retry_jitter` = 0.1.
+
+### Full `kafka_batch_handlers.yml` (all handler fields)
+
+Shared with the Ruby gem. One Kafka topic = one `runtime`. Fair handlers omit a plain `topic` (they use lane ingest → ready).
+
+```yaml
+# config/kafka_batch_handlers.yml
+#
+# Per-handler fields:
+#   runtime            go | ruby                          (required)
+#   worker_class       Ruby constant                      (required when runtime: ruby)
+#   topic              Kafka topic for plain jobs         (default: kafka_batch.jobs /
+#                                                         topic_prefix.kafka_batch.jobs)
+#   apply_topic_prefix true → prepend topic_prefix        (default: false)
+#   max_retries        override daemon max_retries        (omit → use daemon default)
+#   retry_tier         short | medium | large             (optional pin)
+#   fairness_type      time | throughput                  (fair lane; no plain topic)
+#   uniq               true → fingerprint dedupe          (default: false)
+#
+handlers:
+  # Plain Go job
+  segment.export:
+    runtime: go
+    topic: segment.exports
+    max_retries: 5
+    uniq: false
+
+  # Plain Ruby job (consumed by Ruby JobConsumer)
+  orders.process:
+    runtime: ruby
+    worker_class: Orders::ProcessWorker
+    topic: kafka_batch.jobs.ruby
+    max_retries: 7
+
+  # Fair time-lane Go job (ingest → fair_time_ready.go)
+  campaigns.dispatch:
+    runtime: go
+    fairness_type: time
+    max_retries: 3
+    uniq: true
+
+  # Fair time-lane Ruby job (ingest → fair_time_ready.ruby)
+  segments.recompute:
+    runtime: ruby
+    worker_class: Segments::RecomputeWorker
+    fairness_type: time
+
+  # Fair throughput-lane Go job
+  bulk.export:
+    runtime: go
+    fairness_type: throughput
+
+  # Priority-topic routing (pair with priority_config_paths YAML)
+  orders.settle:
+    runtime: go
+    topic: kafka_batch.jobs.p0
+    retry_tier: short
+
+  orders.cleanup:
+    runtime: go
+    topic: kafka_batch.jobs.p1
+    apply_topic_prefix: true             # becomes <topic_prefix>.kafka_batch.jobs.p1
+```
+
+After config + tables: create topics (`kbatch topics create --include-control` and/or your harness script), then run `kbatch daemon` + `kbatch worker`.
 
 ## Related
 

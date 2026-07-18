@@ -1,5 +1,17 @@
 # Shared handler manifest (Ruby kafka-batch gem + kafka-batch-go).
 # One Kafka topic = one runtime. Fair jobs use shared ingest; control forwards to .go / .ruby ready.
+#
+# Per-handler fields (all optional except runtime; worker_class required for ruby):
+#   runtime            go | ruby
+#   worker_class       Ruby constant (runtime: ruby)
+#   topic              plain-job topic (default: kafka_batch.jobs)
+#   apply_topic_prefix true → prepend daemon topic_prefix (default: false)
+#   max_retries        override daemon max_retries
+#   retry_tier         short | medium | large
+#   fairness_type      time | throughput (fair lane — no plain topic)
+#   uniq               fingerprint dedupe (default: false)
+#
+# Full annotated copy: see README appendix "Full kafka_batch_handlers.yml".
 
 handlers:
   segment.export:
