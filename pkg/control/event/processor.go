@@ -29,6 +29,10 @@ type Processor struct {
 	Cfg      config.Daemon
 	Store    *store.RedisStore
 	Producer Producer
+	// NodeID is written to callback_dispatched_by when a callback is produced
+	// (events Lua preclaims stamps without a runner). The callbacks consumer
+	// overwrites this with its own node when it actually invokes.
+	NodeID string
 }
 
 // Outcome per poll batch.
@@ -162,6 +166,7 @@ func (p *Processor) produceCallbacks(ctx context.Context, callbacks []protocol.C
 		}
 		if marshalled {
 			if err := bp.ProduceMany(ctx, reqs...); err == nil {
+				p.recordCallbackRunners(ctx, callbacks)
 				return nil
 			}
 			// fall through to per-item recovery
@@ -174,9 +179,25 @@ func (p *Processor) produceCallbacks(ctx context.Context, callbacks []protocol.C
 	for _, cb := range callbacks {
 		if err := p.produceOneCallback(ctx, cb); err != nil {
 			p.deadLetterCallback(ctx, cb, err)
+		} else {
+			p.recordCallbackRunners(ctx, []protocol.CallbackMessage{cb})
 		}
 	}
 	return nil
+}
+
+func (p *Processor) recordCallbackRunners(ctx context.Context, callbacks []protocol.CallbackMessage) {
+	if p == nil || p.Store == nil || p.NodeID == "" {
+		return
+	}
+	for _, cb := range callbacks {
+		if cb.BatchID == "" {
+			continue
+		}
+		if err := p.Store.RecordCallbackRunner(ctx, cb.BatchID, p.NodeID); err != nil {
+			log.Printf("[kbatch-event] record callback runner batch_id=%s: %v", cb.BatchID, err)
+		}
+	}
 }
 
 func (p *Processor) produceOneCallback(ctx context.Context, cb protocol.CallbackMessage) error {

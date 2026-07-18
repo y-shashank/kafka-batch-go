@@ -16,6 +16,7 @@ import (
 	"github.com/y-shashank/kafka-batch-go/pkg/cancellation"
 	"github.com/y-shashank/kafka-batch-go/pkg/config"
 	"github.com/y-shashank/kafka-batch-go/pkg/control/event"
+	"github.com/y-shashank/kafka-batch-go/pkg/control/callback"
 	"github.com/y-shashank/kafka-batch-go/pkg/control/retry"
 	"github.com/y-shashank/kafka-batch-go/pkg/fairness"
 	"github.com/y-shashank/kafka-batch-go/pkg/health"
@@ -114,7 +115,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	}
 	defer prod.Close()
 
-	eventProc := &event.Processor{Cfg: cfg, Store: st, Producer: prod}
+	eventProc := &event.Processor{Cfg: cfg, Store: st, Producer: prod, NodeID: cfg.NodeID}
 	retryCancel := &retrycancel.Store{Client: rdb}
 	retryProc := &retry.Processor{Producer: prod, Cancel: retryCancel, MaxPause: cfg.RetryMaxPause}
 	pauseCtl, _, closePauseCtl, err := BuildPauseControl(cfg, rdb)
@@ -206,6 +207,42 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 		}, consumerHealth, nil, live, loopHealth)
 	log.Printf("kbatch retry consumer group=%s topics=%v (one client)",
 		retryGroup, retryTopics)
+
+	// Legacy batch callbacks (on_success / on_complete class names). Events produce
+	// to callbacks_topic with preclaimed:true; this consumer invokes and writes
+	// callback_dispatched_by for the UI "Callback ran on" field.
+	callbacksGroup := cfg.ConsumerGroup + "-callbacks"
+	cbProc := &callback.Processor{
+		Store:   st,
+		Invoker: callback.LogInvoker{},
+		DLT:     &callbackDLT{prod: prod, topic: cfg.DeadLetterTopic},
+		NodeID:  cfg.NodeID,
+	}
+	RunPartitionConsumer(ctx, partitionConsumerConfig{
+		brokers: cfg.Brokers,
+		group:   callbacksGroup,
+		topics:  []string{cfg.CallbacksTopic},
+		fetch:   fetch,
+		handle: func(ctx context.Context, recs []*kgo.Record) error {
+			for _, rec := range recs {
+				out, err := cbProc.Process(ctx, rec.Value)
+				if err != nil {
+					return err
+				}
+				if !out.CommitOffset {
+					return fmt.Errorf("callback process defer commit batch topic=%s partition=%d offset=%d",
+						rec.Topic, rec.Partition, rec.Offset)
+				}
+			}
+			return nil
+		},
+		health:     consumerHealth,
+		loopHealth: loopHealth,
+		loopName:   "callbacks-" + callbacksGroup,
+		live:       live,
+	})
+	log.Printf("kbatch callbacks consumer group=%s topic=%s (records callback_dispatched_by)",
+		callbacksGroup, cfg.CallbacksTopic)
 
 	if cfg.SchedulePollerEnabled {
 		var schedStore schedule.IndexStore
@@ -341,6 +378,19 @@ func wireFairLane(
 			}
 			return nil
 		}, consumerHealth, pauseCtl, live)
+}
+
+// callbackDLT adapts kafkaProducer to callback.DLTProducer.
+type callbackDLT struct {
+	prod  kafkaProducer
+	topic string
+}
+
+func (d *callbackDLT) ProduceDLT(ctx context.Context, key string, payload []byte) error {
+	if d == nil || d.prod == nil || d.topic == "" {
+		return nil
+	}
+	return d.prod.Produce(ctx, d.topic, key, payload)
 }
 
 func prefixOr(prefix, base string) string {
