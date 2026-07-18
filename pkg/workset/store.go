@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+	"github.com/y-shashank/kafka-batch-go/pkg/instrument"
 	"github.com/y-shashank/kafka-batch-go/pkg/liveness"
 )
 
@@ -73,10 +74,21 @@ type ClaimResult struct {
 // Store is the Redis working-set ledger.
 type Store struct {
 	client *redis.Client
+	// dltTopic, when set, is where reclaim parks deterministically un-reclaimable
+	// payloads (decode/encode/missing-topic) instead of retrying them until the
+	// lease TTL expires and the job is silently lost. Empty ⇒ prior behavior.
+	dltTopic string
 }
 
 func NewStore(client *redis.Client) *Store {
 	return &Store{client: client}
+}
+
+// SetDLTTopic sets the dead-letter topic used for un-reclaimable orphan payloads.
+func (s *Store) SetDLTTopic(topic string) {
+	if s != nil {
+		s.dltTopic = topic
+	}
 }
 
 func jobKey(jobID string) string         { return jobKeyPrefix + jobID }
@@ -270,8 +282,9 @@ func (s *Store) ListOrphans(ctx context.Context, limit int, grace time.Duration)
 		candidates = append(candidates, candidate{entry: e})
 	}
 	if len(missing) > 0 {
-		log.Printf("[kbatch-workset] list_orphans: %d aged index entries missing job payloads (lease TTL expiry?) — cannot reclaim without payload; cleaning index only",
+		log.Printf("[kbatch-workset] list_orphans: %d aged index entries missing job payloads (lease TTL expiry?) — cannot reclaim without payload; JOBS LOST (offset already committed). Ensure super_fetch_lease_ttl > liveness_ttl + orphan_grace + reclaim_interval",
 			len(missing))
+		instrument.WorksetPayloadMissing(len(missing))
 		rpipe := s.client.Pipeline()
 		for _, id := range missing {
 			rpipe.ZRem(ctx, indexKey, id)

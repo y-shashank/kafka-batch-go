@@ -63,11 +63,30 @@ func NewSuperFetchExecutor(cfg config.Daemon, work *workset.Store, consumerID st
 	if grace <= 0 {
 		grace = workset.DefaultOrphanGrace
 	}
+	hbTTL := cfg.LivenessTTLDuration()
+	// The workset payload lease MUST outlive death-detection plus one reclaim
+	// cycle. Reclaim only re-produces a crashed pod's jobs once its heartbeat
+	// (live:consumer:*, TTL=liveness_ttl) has expired; if the payload lease
+	// (super_fetch_lease_ttl) expires first, ListOrphans finds the index entry
+	// with no payload and can only clean it — the job is permanently lost (its
+	// Kafka offset was already committed at claim). Enforce a safe floor so this
+	// TTL inversion cannot silently drop in-flight jobs on an ungraceful crash.
+	reclaimEvery := cfg.SuperFetchReclaimEvery
+	if reclaimEvery <= 0 {
+		reclaimEvery = 30 * time.Second
+	}
+	if minLease := hbTTL + grace + reclaimEvery + 30*time.Second; lease < minLease {
+		log.Printf("[kbatch-superfetch] super_fetch_lease_ttl=%s is below the safe floor %s "+
+			"(liveness_ttl=%s + orphan_grace=%s + reclaim_interval=%s + 30s buffer) — raising it so a "+
+			"crashed pod's in-flight jobs are reclaimable before their payload expires (else they are lost)",
+			lease, minLease, hbTTL, grace, reclaimEvery)
+		lease = minLease
+	}
 	e := &SuperFetchExecutor{
 		Work:           work,
 		ConsumerID:     consumerID,
 		LeaseTTL:       lease,
-		HeartbeatTTL:   cfg.LivenessTTLDuration(),
+		HeartbeatTTL:   hbTTL,
 		HeartbeatEvery: cfg.LivenessHeartbeatIntervalDuration(),
 		OrphanGrace:    grace,
 		ClaimWindow:    make(chan struct{}, win),

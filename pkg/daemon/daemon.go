@@ -182,7 +182,9 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	if cfg.WatermarkMode() {
 		log.Printf("kbatch workset reclaim DISABLED (execution_mode=watermark; durability is via Kafka offset watermarks, not the Redis working set)")
 	} else {
-		workset.RunReclaimScheduler(ctx, workset.NewStore(rdb), prod, cfg.SuperFetchReclaimEvery, cfg.SuperFetchReclaimLimit, cfg.SuperFetchOrphanGrace, func() {
+		reclaimStore := workset.NewStore(rdb)
+		reclaimStore.SetDLTTopic(cfg.DeadLetterTopic)
+		workset.RunReclaimScheduler(ctx, reclaimStore, prod, cfg.SuperFetchReclaimEvery, cfg.SuperFetchReclaimLimit, cfg.SuperFetchOrphanGrace, func() {
 			loopHealth.RecordTick("workset-reclaim")
 		})
 		log.Printf("kbatch workset reclaim enabled every=%s limit=%d grace=%s", cfg.SuperFetchReclaimEvery, cfg.SuperFetchReclaimLimit, cfg.SuperFetchOrphanGrace)

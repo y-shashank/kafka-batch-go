@@ -372,3 +372,39 @@ func TestSuperFetchStopAcceptingAndWaitInFlight(t *testing.T) {
 		t.Fatalf("expected drain complete, remaining=%d", rem)
 	}
 }
+
+// Regression: the workset payload lease TTL must be raised above the safe floor
+// (liveness_ttl + orphan_grace + reclaim_interval + buffer) so a crashed pod's
+// in-flight jobs are reclaimable before their payload expires. Otherwise the
+// payload dies before reclaim is allowed to act and the job is permanently lost.
+func TestSuperFetchLeaseTTLFloor(t *testing.T) {
+	// Inverted config: lease (120s) < liveness (180s) — the loss-causing default.
+	cfg := config.Daemon{
+		SuperFetchLeaseTTL:        120 * time.Second,
+		LivenessTTL:               180 * time.Second,
+		SuperFetchOrphanGrace:     40 * time.Second,
+		SuperFetchReclaimEvery:    30 * time.Second,
+		SuperFetchConcurrency:     4,
+	}
+	exec := NewSuperFetchExecutor(cfg, nil, "c-floor", nil, nil)
+	want := 180*time.Second + 40*time.Second + 30*time.Second + 30*time.Second // 280s
+	if exec.LeaseTTL != want {
+		t.Fatalf("LeaseTTL = %s, want raised to floor %s", exec.LeaseTTL, want)
+	}
+	if exec.LeaseTTL <= exec.HeartbeatTTL {
+		t.Fatalf("LeaseTTL %s must exceed HeartbeatTTL %s", exec.LeaseTTL, exec.HeartbeatTTL)
+	}
+
+	// Already-safe config is left untouched.
+	safe := config.Daemon{
+		SuperFetchLeaseTTL:     600 * time.Second,
+		LivenessTTL:            180 * time.Second,
+		SuperFetchOrphanGrace:  40 * time.Second,
+		SuperFetchReclaimEvery: 30 * time.Second,
+		SuperFetchConcurrency:  4,
+	}
+	exec2 := NewSuperFetchExecutor(safe, nil, "c-safe", nil, nil)
+	if exec2.LeaseTTL != 600*time.Second {
+		t.Fatalf("safe LeaseTTL = %s, want unchanged 600s", exec2.LeaseTTL)
+	}
+}

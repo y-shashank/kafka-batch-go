@@ -74,5 +74,36 @@
       "new_group_delay": 60
     },
     "priority": 3
+  },
+  {
+    "name": "[kbatch] workset payload missing — SuperFetch in-flight jobs LOST",
+    "type": "query alert",
+    "query": "sum(last_5m):sum:kafka_batch.workset_payload_missing.count{*}.as_count() > 0",
+    "message": "Reclaim found aged workset index entries whose job payload had already expired — those SuperFetch in-flight jobs are LOST (their Kafka offset was committed at claim, and there is no payload left to re-run). The batch will never reach total.\n\nRoot cause is almost always super_fetch_lease_ttl set at/below liveness_ttl + orphan_grace + reclaim_interval, so a crashed pod's payload expires before reclaim is allowed to touch it. (The worker now raises the effective lease above that floor and logs a warning; a non-zero value here means the floor is still being crossed or reclaim was down for longer than the lease.)\n\nRunbook:\n1. Check worker logs for `[kbatch-workset] list_orphans: N aged index entries missing job payloads`.\n2. Ensure super_fetch_lease_ttl comfortably exceeds liveness_ttl + orphan_grace + reclaim_interval.\n3. Ensure a reclaimer (worker or daemon) is always running.\n\n{{#is_alert}}Workset payloads missing in the last 5m — jobs lost.{{/is_alert}}\n@CHANGE_ME",
+    "tags": ["service:kafka-batch", "source:kafka-batch", "component:superfetch", "managed-by:kafka-batch-apply"],
+    "options": {
+      "thresholds": { "critical": 0 },
+      "notify_no_data": false,
+      "renotify_interval": 30,
+      "include_tags": true,
+      "new_group_delay": 60,
+      "escalation_message": "Still losing SuperFetch in-flight jobs to expired payloads."
+    },
+    "priority": 1
+  },
+  {
+    "name": "[kbatch] workset payload unreclaimable — dead-lettered",
+    "type": "query alert",
+    "query": "sum(last_15m):sum:kafka_batch.workset_unreclaimable.count{*} by {reason}.as_count() > 0",
+    "message": "Reclaim parked an orphan payload it could never re-run (reason={{reason.name}}: decode/encode/missing_topic) onto the dead-letter topic instead of letting it TTL-expire into a silent loss. The job did not run; it needs manual inspection/replay.\n\nRunbook:\n1. Inspect the dead-letter topic for dlt_type=workset_unreclaimable, reason={{reason.name}}.\n2. decode/encode → a corrupted/incompatible stored payload; missing_topic → a job stored without a source topic (routing bug).\n\n{{#is_alert}}Un-reclaimable payloads dead-lettered in the last 15m.{{/is_alert}}\n@CHANGE_ME",
+    "tags": ["service:kafka-batch", "source:kafka-batch", "component:superfetch", "managed-by:kafka-batch-apply"],
+    "options": {
+      "thresholds": { "critical": 0 },
+      "notify_no_data": false,
+      "renotify_interval": 0,
+      "include_tags": true,
+      "new_group_delay": 60
+    },
+    "priority": 2
   }
 ]

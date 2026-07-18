@@ -252,6 +252,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 		// Reclaim orphans here too (NX-locked sweeps). Daemon also runs this when
 		// present; worker-only deploys must not rely on a separate control plane
 		// or Claim+Mark jobs die when the Redis lease TTL expires.
+		work.SetDLTTopic(cfg.DeadLetterTopic)
 		workset.RunReclaimScheduler(lifeCtx, work, prod, cfg.SuperFetchReclaimEvery, cfg.SuperFetchReclaimLimit, cfg.SuperFetchOrphanGrace, nil)
 		log.Printf("kbatch go-worker workset reclaim enabled every=%s limit=%d grace=%s",
 			cfg.SuperFetchReclaimEvery, cfg.SuperFetchReclaimLimit, cfg.SuperFetchOrphanGrace)

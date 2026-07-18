@@ -452,3 +452,71 @@ type producerFunc func(context.Context, string, string, []byte) error
 func (f producerFunc) Produce(ctx context.Context, topic, key string, payload []byte) error {
 	return f(ctx, topic, key, payload)
 }
+
+// Regression (#3): an orphan whose payload can't be reclaimed (here: missing
+// source topic) must be parked on the DLT and removed, not retried until the
+// lease TTL expires and the job is silently lost.
+func TestReclaimDeadLettersUnreclaimable(t *testing.T) {
+	st, mr := testStore(t)
+	st.SetDLTTopic("dlt")
+	ctx := context.Background()
+	// Claim with an EMPTY topic → deterministically un-reclaimable.
+	_, err := st.Claim(ctx, ClaimParams{
+		JobID: "j-bad", Payload: []byte(`{"job_id":"j-bad","worker_class":"W"}`), Topic: "",
+		ConsumerID: "gone", LeaseTTL: time.Minute, StealGrace: -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	killConsumer(t, mr, "gone")
+	ageClaim(t, st, mr, "j-bad", time.Minute)
+
+	var produced []struct{ topic, key string }
+	prod := producerFunc(func(_ context.Context, topic, key string, _ []byte) error {
+		produced = append(produced, struct{ topic, key string }{topic, key})
+		return nil
+	})
+	res, err := st.ReclaimOrphans(ctx, prod, 10, time.Minute, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Parked on DLT (not re-produced to a source topic) and no longer an orphan.
+	if len(produced) != 1 || produced[0].topic != "dlt" || produced[0].key != "j-bad" {
+		t.Fatalf("expected 1 DLT produce, got %+v", produced)
+	}
+	if res.Reclaimed != 1 {
+		t.Fatalf("expected job handled (Reclaimed=1), got %+v", res)
+	}
+	left, err := st.ListOrphans(ctx, 10, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 0 {
+		t.Fatalf("expected entry removed after dead-letter, still orphaned: %+v", left)
+	}
+}
+
+// Without a DLT topic configured, an un-reclaimable orphan keeps the prior
+// behavior (held for retry, not dropped, not dead-lettered).
+func TestReclaimUnreclaimableWithoutDLTKeepsEntry(t *testing.T) {
+	st, mr := testStore(t)
+	ctx := context.Background()
+	_, err := st.Claim(ctx, ClaimParams{
+		JobID: "j-keep", Payload: []byte(`{"job_id":"j-keep"}`), Topic: "",
+		ConsumerID: "gone", LeaseTTL: time.Minute, StealGrace: -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	killConsumer(t, mr, "gone")
+	ageClaim(t, st, mr, "j-keep", time.Minute)
+
+	prod := producerFunc(func(_ context.Context, _, _ string, _ []byte) error { return nil })
+	res, err := st.ReclaimOrphans(ctx, prod, 10, time.Minute, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Reclaimed != 0 || res.Failed != 1 {
+		t.Fatalf("expected held-for-retry (Failed=1), got %+v", res)
+	}
+}

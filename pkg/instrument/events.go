@@ -302,3 +302,24 @@ func CallbackProduceFailed(batchID, outcome, errMsg string) {
 		"error_message": errMsg,
 	}, 0)
 }
+
+// WorksetPayloadMissing fires when a reclaim sweep finds aged workset index
+// entries whose job payload has already expired (lease TTL passed before the
+// consumer was declared dead). These jobs cannot be re-produced and are lost —
+// their Kafka offset was committed at claim. Alert on this: a non-zero count
+// means in-flight jobs were dropped (usually super_fetch_lease_ttl set below
+// liveness_ttl + the reclaim window).
+func WorksetPayloadMissing(count int) {
+	Emit("workset.payload_missing", map[string]interface{}{
+		"count": count,
+	}, 0)
+}
+
+// WorksetUnreclaimable fires when reclaim dead-letters a payload it can never
+// re-run (undecodable, unencodable, or missing its source topic) instead of
+// letting it TTL-expire into a silent loss. reason is decode|encode|missing_topic.
+func WorksetUnreclaimable(reason string) {
+	Emit("workset.unreclaimable", map[string]interface{}{
+		"reason": reason,
+	}, 0)
+}

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"time"
+
+	"github.com/y-shashank/kafka-batch-go/pkg/instrument"
 )
 
 // Producer re-publishes reclaimed job payloads.
@@ -82,20 +84,19 @@ func (s *Store) reclaimOne(ctx context.Context, prod Producer, e Entry) error {
 
 	rawPayload, err := PayloadForReclaim(&e)
 	if err != nil {
+		// Deterministic failure — retrying every sweep will never succeed and the
+		// entry just TTL-expires into a silent loss. Dead-letter it instead.
 		log.Printf("[kbatch-workset] reclaim decode job_id=%s: %v", e.JobID, err)
-		_ = s.AbortReclaim(ctx, e.JobID)
-		return err
+		return s.deadLetterUnreclaimable(ctx, prod, e, "decode", err)
 	}
 	body, err := markReclaimPayload(rawPayload)
 	if err != nil {
 		log.Printf("[kbatch-workset] reclaim encode job_id=%s: %v", e.JobID, err)
-		_ = s.AbortReclaim(ctx, e.JobID)
-		return err
+		return s.deadLetterUnreclaimable(ctx, prod, e, "encode", err)
 	}
 	if e.Topic == "" {
-		log.Printf("[kbatch-workset] reclaim missing topic job_id=%s — abort", e.JobID)
-		_ = s.AbortReclaim(ctx, e.JobID)
-		return errMissingTopic
+		log.Printf("[kbatch-workset] reclaim missing topic job_id=%s", e.JobID)
+		return s.deadLetterUnreclaimable(ctx, prod, e, "missing_topic", errMissingTopic)
 	}
 	if err := prod.Produce(ctx, e.Topic, e.JobID, body); err != nil {
 		log.Printf("[kbatch-workset] reclaim produce job_id=%s topic=%s: %v", e.JobID, e.Topic, err)
@@ -117,6 +118,51 @@ func (s *Store) reclaimOne(ctx context.Context, prod Producer, e Entry) error {
 		log.Printf("[kbatch-workset] reclaim finish job_id=%s: %v (produced marker kept)", e.JobID, err)
 		return err
 	}
+	return nil
+}
+
+// deadLetterUnreclaimable parks a payload that can never be reclaimed (undecodable,
+// unencodable, or missing its source topic) onto the dead-letter topic and removes
+// the workset entry, instead of retrying it every sweep until the lease TTL expires
+// and the job is silently lost. When no DLT topic is configured it falls back to the
+// prior behavior (keep the entry for retry). Returns nil once the job is safely
+// parked (so the sweep counts it handled), or the original cause otherwise.
+func (s *Store) deadLetterUnreclaimable(ctx context.Context, prod Producer, e Entry, reason string, cause error) error {
+	if s.dltTopic == "" {
+		_ = s.AbortReclaim(ctx, e.JobID)
+		return cause
+	}
+	errMsg := ""
+	if cause != nil {
+		errMsg = cause.Error()
+	}
+	dlt := map[string]interface{}{
+		"job_id":            e.JobID,
+		"dlt_type":          "workset_unreclaimable",
+		"dlt_reason":        reason,
+		"dlt_error_message": errMsg,
+		"topic":             e.Topic,
+	}
+	if decoded, derr := PayloadForReclaim(&e); derr == nil {
+		dlt["dlt_raw_payload"] = string(decoded)
+	} else {
+		dlt["dlt_raw_payload"] = string(e.Payload)
+	}
+	raw, merr := json.Marshal(dlt)
+	if merr != nil {
+		_ = s.AbortReclaim(ctx, e.JobID)
+		return cause
+	}
+	if perr := prod.Produce(ctx, s.dltTopic, e.JobID, raw); perr != nil {
+		log.Printf("[kbatch-workset] reclaim dead-letter produce job_id=%s: %v — keeping entry for retry", e.JobID, perr)
+		_ = s.AbortReclaim(ctx, e.JobID)
+		return cause
+	}
+	instrument.WorksetUnreclaimable(reason)
+	if ferr := s.finishReclaimChecked(ctx, e); ferr != nil {
+		log.Printf("[kbatch-workset] reclaim dead-letter finish job_id=%s: %v (entry may retry once more)", e.JobID, ferr)
+	}
+	log.Printf("[kbatch-workset] reclaim dead-lettered job_id=%s reason=%s → topic=%s", e.JobID, reason, s.dltTopic)
 	return nil
 }
 
