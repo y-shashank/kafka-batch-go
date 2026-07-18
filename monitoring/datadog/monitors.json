@@ -1,0 +1,78 @@
+[
+  {
+    "name": "[kbatch] completions dropped — batch count loss / stuck batches",
+    "type": "query alert",
+    "query": "sum(last_5m):sum:kafka_batch.completion_dropped.count{*}.as_count() > 0",
+    "message": "One or more job completion events could not be applied to their batch (reason: not_found/invalid). The count is permanently lost, so the batch will never reach total and gets stuck below completion.\n\nMost common cause: the daemon reads a **different Redis** than the producer that created the batch, or a mismatched **topic_prefix / events_topic** between worker and daemon; also a batch whose TTL expired.\n\nRunbook:\n1. Check daemon logs for `[kbatch-event] DROPPED completion reason=...` (includes batch_id/batch_seq/job_id).\n2. Verify brokers / redis_url / topic_prefix / events_topic match across producer, worker, and daemon.\n3. Inspect the batch: `HGETALL kafka_batch:b:<batch_id>` — expect completed+failed < total.\n\n{{#is_alert}}Dropped completions detected in the last 5m.{{/is_alert}}\n@CHANGE_ME",
+    "tags": ["service:kafka-batch", "source:kafka-batch", "managed-by:kafka-batch-apply"],
+    "options": {
+      "thresholds": { "critical": 0 },
+      "notify_no_data": false,
+      "renotify_interval": 60,
+      "include_tags": true,
+      "new_group_delay": 60,
+      "escalation_message": "Still dropping completions — batches are accumulating in a stuck state."
+    },
+    "priority": 1
+  },
+  {
+    "name": "[kbatch] callback produce failed — parked on dead-letter",
+    "type": "query alert",
+    "query": "sum(last_5m):sum:kafka_batch.callback_produce_failed.count{*}.as_count() > 0",
+    "message": "A completed batch's callback could not be produced to the callbacks topic after retries and was parked on the dead-letter topic (dlt_type=callback_produce_failed). The batch finished correctly but its on_complete/on_success callback did not fire until replayed.\n\nRunbook:\n1. Check daemon logs for `[kbatch-event] callback produce failed batch_id=...`.\n2. Confirm the callbacks topic is healthy (broker/partition availability).\n3. Replay the parked callback payloads from the dead-letter topic once the topic recovers.\n\n{{#is_alert}}Callback(s) dead-lettered in the last 5m.{{/is_alert}}\n@CHANGE_ME",
+    "tags": ["service:kafka-batch", "source:kafka-batch", "managed-by:kafka-batch-apply"],
+    "options": {
+      "thresholds": { "critical": 0 },
+      "notify_no_data": false,
+      "renotify_interval": 120,
+      "include_tags": true,
+      "new_group_delay": 60
+    },
+    "priority": 2
+  },
+  {
+    "name": "[kbatch] recurring schedule stale — not firing on cadence",
+    "type": "query alert",
+    "query": "sum(last_10m):sum:kafka_batch.cron_stale.count{*} by {schedule}.as_count() > 0",
+    "message": "A recurring (cron) schedule has been idle longer than its staleness threshold (default 2x its own interval) — it is enabled but not firing. This is the 'the scheduler silently stopped for this schedule' alarm.\n\nRunbook:\n1. Check daemon logs for `[kbatch-cron] STALE schedule={{schedule.name}} ...`.\n2. Confirm the recurring scheduler holds the leader lock and is ticking (see the heartbeat monitor).\n3. Inspect the schedule: `./bin/schedule list` — check enabled, next_run, last_fire; verify the cron/timezone are valid.\n\n{{#is_alert}}Schedule {{schedule.name}} is stale.{{/is_alert}}\n@CHANGE_ME",
+    "tags": ["service:kafka-batch", "source:kafka-batch", "component:recurring", "managed-by:kafka-batch-apply"],
+    "options": {
+      "thresholds": { "critical": 0 },
+      "notify_no_data": false,
+      "renotify_interval": 60,
+      "include_tags": true,
+      "new_group_delay": 60
+    },
+    "priority": 2
+  },
+  {
+    "name": "[kbatch] recurring scheduler heartbeat missing — ticker stopped",
+    "type": "query alert",
+    "query": "sum(last_15m):sum:kafka_batch.cron_heartbeat.count{*}.as_count() < 1",
+    "message": "The recurring (cron) scheduler has not emitted a heartbeat in 15 minutes. The leader-elected ticker is likely down or wedged, so NO recurring schedules are firing (the per-schedule stale monitor may not fire if nothing is sweeping).\n\nRunbook:\n1. Confirm at least one process has `recurring_scheduler_enabled: true` and is running.\n2. Check the Redis leader lock `kafka_batch:cron:leader_lock` — a dead holder should expire within its TTL.\n3. Check daemon/worker logs for `[kbatch-cron] recurring scheduler ...`.\n\n{{#is_alert}}No recurring-scheduler heartbeat in 15m.{{/is_alert}}\n{{#is_no_data}}No recurring-scheduler heartbeat data at all.{{/is_no_data}}\n@CHANGE_ME",
+    "tags": ["service:kafka-batch", "source:kafka-batch", "component:recurring", "managed-by:kafka-batch-apply"],
+    "options": {
+      "thresholds": { "critical": 1 },
+      "notify_no_data": true,
+      "no_data_timeframe": 20,
+      "renotify_interval": 30,
+      "include_tags": true
+    },
+    "priority": 1
+  },
+  {
+    "name": "[kbatch] batch push rejected — sealed/cancelled batch (create-sealed race)",
+    "type": "query alert",
+    "query": "sum(last_15m):sum:kafka_batch.batch_push_rejected.count{*}.as_count() > 0",
+    "message": "A job could not be added to a batch because the batch was already sealed/terminal or cancelled. Usually the 'create-sealed-then-push' race: a batch created without a block form finalized after the first job, so later PushJob calls were rejected and those jobs were dropped.\n\nRunbook:\n1. Prefer the block form of CreateBatch (seal only after all jobs are enqueued).\n2. Check the producer for ignored BatchClosedError around the affected batch_id/job_type.\n\n{{#is_alert}}Push rejections observed in the last 15m.{{/is_alert}}\n@CHANGE_ME",
+    "tags": ["service:kafka-batch", "source:kafka-batch", "managed-by:kafka-batch-apply"],
+    "options": {
+      "thresholds": { "critical": 0 },
+      "notify_no_data": false,
+      "renotify_interval": 0,
+      "include_tags": true,
+      "new_group_delay": 60
+    },
+    "priority": 3
+  }
+]
