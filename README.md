@@ -138,6 +138,31 @@ go get github.com/y-shashank/kafka-batch-go/pkg/worker
 go get github.com/y-shashank/kafka-batch-go/pkg/kbatch
 ```
 
+## Build
+
+The Go side ships **one binary — `kbatch`** — that runs the two server tiers as
+subcommands. **Tier 1 (client) is a library you import, not a binary.**
+
+```bash
+# Build the kbatch binary (covers Tier 2 control plane + Tier 3 execution):
+go build -o kbatch ./cmd/kbatch
+
+# ...or install it onto $GOPATH/bin:
+go install github.com/y-shashank/kafka-batch-go/cmd/kbatch@latest
+```
+
+How to build/run each tier:
+
+| Tier | Build / import | Run |
+|------|----------------|-----|
+| 1 — Client (producer) | `go get .../pkg/client` (library — no binary) | import `pkg/client` in your app; see [Tier 1](#tier-1--client-library) |
+| 2 — Control plane | `go build -o kbatch ./cmd/kbatch` | `kbatch daemon --config config/daemon.yml --manifest config/kafka_batch_handlers.yml` |
+| 3 — Job execution | `go build -o kbatch ./cmd/kbatch` | `kbatch worker --config config/daemon.yml --manifest config/kafka_batch_handlers.yml` |
+
+Both server tiers come from the **same** `kbatch` build — you deploy the one
+binary and pick the tier at runtime via the subcommand. Run `kbatch help` for all
+subcommands (`daemon`, `worker`, `topics`, `reconcile`, `version`).
+
 ## Tier 1 — Client library
 
 ```go
