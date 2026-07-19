@@ -88,6 +88,18 @@ func newGroupConsumerClient(brokers []string, fetch config.ConsumerFetchSettings
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
 		kgo.BlockRebalanceOnPoll(),
 		kgo.AutoCommitMarks(),
+		kgo.OnPartitionsRevoked(func(ctx context.Context, cl *kgo.Client, revoked map[string][]int32) {
+			// Overriding the default revoke callback disables franz-go's implicit
+			// commit-on-revoke, so we must commit marks ourselves before the
+			// partitions move. We also drop deferred-pause state for the revoked
+			// partitions so a later re-assignment cannot inherit a stale min-offset
+			// that suppresses the synchronous yield rewind (silent-drop guard).
+			cc.dropDeferredForRevoked(revoked)
+			if err := cl.CommitMarkedOffsets(ctx); err != nil {
+				log.Printf("[kbatch-daemon] group=%s member=%s commit-on-revoke error: %v",
+					group, memberLabel, err)
+			}
+		}),
 		kgo.OnPartitionsCallbackBlocked(func(context.Context, *kgo.Client) {
 			log.Printf("[kbatch-daemon] group=%s member=%s rebalance waiting — aborting in-flight processing",
 				group, memberLabel)

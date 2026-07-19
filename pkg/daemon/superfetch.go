@@ -12,6 +12,7 @@ import (
 
 	"github.com/y-shashank/kafka-batch-go/pkg/config"
 	"github.com/y-shashank/kafka-batch-go/pkg/control/job"
+	"github.com/y-shashank/kafka-batch-go/pkg/instrument"
 	"github.com/y-shashank/kafka-batch-go/pkg/protocol"
 	"github.com/y-shashank/kafka-batch-go/pkg/workset"
 )
@@ -296,16 +297,24 @@ func (e *SuperFetchExecutor) perform(ctx context.Context, rec *kgo.Record, jobID
 	// Apply BEFORE the fence check (Ruby SuperFetch parity). If the workset
 	// entry expired or was reclaimed while #perform ran, skipping Apply would
 	// permanently lose the job: Kafka already acked at Claim, and reclaim has
-	// nothing left to re-produce. Batch bitmap / DLT paths are idempotent.
+	// nothing left to re-produce. Event emit parks on DLT when events_topic
+	// is down; Complete runs only after Apply returns nil.
+	var lastApplyErr error
 	for attempt := 1; ; attempt++ {
 		if err := e.Apply(ctx, out); err == nil {
 			break
 		} else {
+			lastApplyErr = err
 			log.Printf("[kbatch-superfetch] apply error group=%s job_id=%s attempt=%d: %v — retrying (renew kept)",
 				group, jobID, attempt, err)
 		}
 		if !sleepOrDone(ctx, retryBackoff(attempt)) {
-			log.Printf("[kbatch-superfetch] apply aborted group=%s job_id=%s — leaving in workset for reclaim",
+			batchID := ""
+			if out.Event != nil {
+				batchID = out.Event.BatchID
+			}
+			instrument.JobApplyAborted(jobID, batchID, group, lastApplyErr)
+			log.Printf("[kbatch-superfetch] apply aborted group=%s job_id=%s — leaving in workset for reclaim (Complete skipped)",
 				group, jobID)
 			return
 		}

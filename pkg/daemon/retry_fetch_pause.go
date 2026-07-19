@@ -130,14 +130,34 @@ func (c *consumerClient) pauseDeferredPartition(topic string, partition int32, o
 	if c.deferredPaused[topic] == nil {
 		c.deferredPaused[topic] = map[int32]int64{}
 	}
+	rewind := false
 	if existing, ok := c.deferredPaused[topic][partition]; !ok || offset < existing {
 		c.deferredPaused[topic][partition] = offset
+		rewind = true
 	}
 	c.pauseMu.Unlock()
 	if p != nil {
 		partitionDeferPauseMu.Lock()
 		p.PauseFetchPartitions(map[string][]int32{topic: {partition}})
 		partitionDeferPauseMu.Unlock()
+	}
+	// Rewind the consume cursor to the polled-but-unmarked record NOW, on the
+	// poll goroutine (this is always called from the poll/process callback,
+	// never a timer). Two reasons this must be synchronous, not deferred to the
+	// resume timer:
+	//  1. franz-go forbids SetOffsets concurrent with PollFetches; the old timer
+	//     path called it from a side goroutine (a contract violation).
+	//  2. PollRecords already advanced the consume cursor past these records.
+	//     Leaving the rewind until the timer fires means that for the whole
+	//     yield window the cursor sits ahead of an un-marked record — if a
+	//     rebalance revokes the partition (or a later record is marked) in that
+	//     window, franz-go commits past the deferred record and it is silently
+	//     dropped (never redelivered, no DLT). Resetting here keeps the commit
+	//     floor at the deferred offset so at worst the record is reprocessed.
+	if rewind && c.Client != nil {
+		c.SetOffsets(map[string]map[int32]kgo.EpochOffset{
+			topic: {partition: {Offset: offset}},
+		})
 	}
 }
 
@@ -146,11 +166,11 @@ func (c *consumerClient) clearDeferredPartitionPause(topic string, partition int
 		return
 	}
 	c.pauseMu.Lock()
-	offset, ok := int64(0), false
+	ok := false
 	if c.deferredPaused != nil {
 		if parts, exists := c.deferredPaused[topic]; exists {
-			offset, ok = parts[partition]
-			if ok {
+			if _, has := parts[partition]; has {
+				ok = true
 				delete(parts, partition)
 				if len(parts) == 0 {
 					delete(c.deferredPaused, topic)
@@ -162,18 +182,45 @@ func (c *consumerClient) clearDeferredPartitionPause(topic string, partition int
 	if !ok {
 		return
 	}
-	// Rewind past the Polled-but-unmarked record so Resume redelivers it. Without
-	// SetOffsets, franz-go resumes fetching at the next offset and the message stalls
-	// until a revoke/restart.
-	if c.Client != nil {
-		c.SetOffsets(map[string]map[int32]kgo.EpochOffset{
-			topic: {partition: {Offset: offset}},
-		})
-	}
+	// Resume only. The consume cursor was already rewound to the deferred offset
+	// synchronously in pauseDeferredPartition (on the poll goroutine), so franz-go
+	// re-fetches the deferred record on resume. We must NOT call SetOffsets here —
+	// this runs on a timer goroutine and SetOffsets concurrent with PollFetches is
+	// unsafe (it was the source of silently dropped low-priority records when a
+	// rebalance raced the timer).
 	if p := c.pauser(); p != nil {
 		partitionDeferPauseMu.Lock()
 		p.ResumeFetchPartitions(map[string][]int32{topic: {partition}})
 		partitionDeferPauseMu.Unlock()
+	}
+}
+
+// dropDeferredForRevoked forgets deferred-pause state for partitions revoked in a
+// rebalance. Without this, a stale min-offset entry left behind by a revoke would
+// make pauseDeferredPartition treat a later (higher-offset) yield on the same
+// partition as "not a new minimum" and skip the synchronous rewind — reopening the
+// silent-drop hole. Franz-go clears its own fetch-pause for revoked partitions, so
+// we only need to clear our bookkeeping.
+func (c *consumerClient) dropDeferredForRevoked(revoked map[string][]int32) {
+	if c == nil || len(revoked) == 0 {
+		return
+	}
+	c.pauseMu.Lock()
+	defer c.pauseMu.Unlock()
+	if c.deferredPaused == nil {
+		return
+	}
+	for topic, parts := range revoked {
+		pp, ok := c.deferredPaused[topic]
+		if !ok {
+			continue
+		}
+		for _, p := range parts {
+			delete(pp, p)
+		}
+		if len(pp) == 0 {
+			delete(c.deferredPaused, topic)
+		}
 	}
 }
 

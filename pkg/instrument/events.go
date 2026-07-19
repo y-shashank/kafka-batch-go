@@ -60,6 +60,22 @@ func JobEmitRetried(jobID, batchID string, attempt int, err error) {
 	}, 0)
 }
 
+// JobApplyAborted fires when SuperFetch gives up Apply (event/retry/DLT produce)
+// because the job lifetime context ended. The Kafka offset is already claimed;
+// the workset entry is left for reclaim.
+func JobApplyAborted(jobID, batchID, group string, err error) {
+	errMsg := ""
+	if err != nil {
+		errMsg = err.Error()
+	}
+	Emit("job.apply_aborted", map[string]interface{}{
+		"job_id":         jobID,
+		"batch_id":       batchID,
+		"consumer_group": group,
+		"error_message":  errMsg,
+	}, 0)
+}
+
 func JobUniqSkipped(workerClass string, payload map[string]interface{}, jobID, batchID string) {
 	Emit("job.uniq_skipped", map[string]interface{}{
 		"worker_class": workerClass,
@@ -180,10 +196,10 @@ func ConsumerPriorityYielded(consumerClass, p0Topic, consumerGroup string, pause
 
 func ReconcilerRan(staleCount, lostCount int, duration time.Duration, triggeredBy string) {
 	Emit("reconciler.ran", map[string]interface{}{
-		"stale_count":    staleCount,
-		"lost_count":     lostCount,
-		"duration":       duration.Seconds(),
-		"triggered_by":   triggeredBy,
+		"stale_count":  staleCount,
+		"lost_count":   lostCount,
+		"duration":     duration.Seconds(),
+		"triggered_by": triggeredBy,
 	}, 0)
 }
 

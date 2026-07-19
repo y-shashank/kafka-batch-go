@@ -47,6 +47,68 @@ func produceEventWithRetry(ctx context.Context, cfg config.Daemon, prod kafkaPro
 	}
 }
 
+// parkFailedEventEmit writes a recoverable DLT payload when the events topic
+// reject completion emits after retries. SuperFetch has already acked the job
+// offset, so without this park the completion is silently lost.
+func parkFailedEventEmit(ctx context.Context, cfg config.Daemon, prod kafkaProducer, ev *protocol.EventMessage, emitErr error) error {
+	if ev == nil {
+		return nil
+	}
+	if cfg.DeadLetterTopic == "" {
+		return fmt.Errorf("dead_letter_topic not configured")
+	}
+	errMsg := ""
+	if emitErr != nil {
+		errMsg = emitErr.Error()
+	}
+	dlt := map[string]interface{}{
+		"dlt_type":          "event_emit_failed",
+		"dlt_error_message": errMsg,
+		"batch_id":          ev.BatchID,
+		"job_id":            ev.JobID,
+		"batch_seq":         ev.BatchSeq,
+		"status":            ev.Status,
+		"worker_class":      ev.WorkerClass,
+		"src_topic":         ev.SrcTopic,
+		"src_partition":     ev.SrcPartition,
+		"src_offset":        ev.SrcOffset,
+		"occurred_at":       ev.OccurredAt,
+		"event":             ev,
+	}
+	raw, err := json.Marshal(dlt)
+	if err != nil {
+		return fmt.Errorf("marshal event_emit_failed DLT: %w", err)
+	}
+	key := ev.BatchID
+	if key == "" {
+		key = ev.JobID
+	}
+	if key == "" {
+		key = "event_emit_failed"
+	}
+	if err := prod.Produce(ctx, cfg.DeadLetterTopic, key, raw); err != nil {
+		return err
+	}
+	instrument.DLTPublished(ev.JobID, ev.BatchID, "event_emit_failed", ev.SrcTopic)
+	log.Printf("[kbatch] event emit failed — parked on DLT batch_id=%s job_id=%s seq=%d err=%v",
+		ev.BatchID, ev.JobID, ev.BatchSeq, emitErr)
+	return nil
+}
+
+// emitEventOrPark tries events_topic, then parks on DLT. Returns nil only when
+// the completion is durable on events OR DLT (never silently drop).
+func emitEventOrPark(ctx context.Context, cfg config.Daemon, prod kafkaProducer, ev *protocol.EventMessage) error {
+	if ev == nil {
+		return nil
+	}
+	if err := produceEventWithRetry(ctx, cfg, prod, ev); err != nil {
+		if dltErr := parkFailedEventEmit(ctx, cfg, prod, ev, err); dltErr != nil {
+			return fmt.Errorf("event emit failed (%v) and DLT park failed: %w", err, dltErr)
+		}
+	}
+	return nil
+}
+
 func applyJobOutcome(ctx context.Context, cfg config.Daemon, prod kafkaProducer, out job.Outcome) error {
 	if err := applyJobSideEffects(ctx, cfg, prod, out); err != nil {
 		return err
@@ -69,7 +131,7 @@ func applyJobSideEffects(ctx context.Context, cfg config.Daemon, prod kafkaProdu
 	defer cancel()
 
 	if out.Event != nil {
-		if err := produceEventWithRetry(produceCtx, cfg, prod, out.Event); err != nil {
+		if err := emitEventOrPark(produceCtx, cfg, prod, out.Event); err != nil {
 			return err
 		}
 	}
@@ -93,7 +155,7 @@ const (
 
 func applyRetryOutcome(ctx context.Context, cfg config.Daemon, prod kafkaProducer, out retry.Outcome, src protocol.SourceCoords) error {
 	if out.Event != nil {
-		if err := produceEventWithRetry(ctx, cfg, prod, out.Event); err != nil {
+		if err := emitEventOrPark(ctx, cfg, prod, out.Event); err != nil {
 			return err
 		}
 	}

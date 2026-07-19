@@ -94,7 +94,8 @@ func (hangProducer) Produce(ctx context.Context, _, _ string, _ []byte) error {
 }
 
 func TestApplyJobSideEffectsHonorsProduceTimeout(t *testing.T) {
-	cfg := config.Daemon{EventsTopic: "events", EventEmitRetries: 0}
+	// hangProducer never succeeds on events OR DLT, so emitEventOrPark still errors.
+	cfg := config.Daemon{EventsTopic: "events", DeadLetterTopic: "dlt", EventEmitRetries: 0}
 	out := job.Outcome{
 		Event: &protocol.EventMessage{BatchID: "b", JobID: "j", SrcTopic: "jobs"},
 	}
@@ -108,6 +109,83 @@ func TestApplyJobSideEffectsHonorsProduceTimeout(t *testing.T) {
 	}
 	if time.Since(start) > 2*time.Second {
 		t.Fatalf("produce did not honor timeout: %v", time.Since(start))
+	}
+}
+
+// topicFailProducer fails every produce to failTopic, succeeds elsewhere.
+type topicFailProducer struct {
+	failTopic string
+	dltRaw    []byte
+	calls     map[string]int
+}
+
+func (p *topicFailProducer) Produce(_ context.Context, topic, _ string, payload []byte) error {
+	if p.calls == nil {
+		p.calls = map[string]int{}
+	}
+	p.calls[topic]++
+	if topic == p.failTopic {
+		return errors.New("events topic down")
+	}
+	if topic != "" {
+		p.dltRaw = append([]byte(nil), payload...)
+	}
+	return nil
+}
+
+func TestApplyJobSideEffectsParksEventOnDLTWhenEmitFails(t *testing.T) {
+	var dltType string
+	instrument.SetHandler(func(event string, payload map[string]interface{}, _ float64) {
+		if event == "dlt.published" {
+			dltType, _ = payload["dlt_type"].(string)
+		}
+	})
+	defer instrument.SetHandler(nil)
+
+	prod := &topicFailProducer{failTopic: "events"}
+	cfg := config.Daemon{
+		EventsTopic: "events", DeadLetterTopic: "dlt",
+		EventEmitRetries: 1, EventEmitBackoff: 0,
+	}
+	out := job.Outcome{
+		Event: &protocol.EventMessage{
+			BatchID: "b1", JobID: "j1", BatchSeq: 7, Status: "success", SrcTopic: "jobs",
+		},
+	}
+	if err := applyJobSideEffects(context.Background(), cfg, prod, out); err != nil {
+		t.Fatal(err)
+	}
+	if prod.calls["events"] < 1 {
+		t.Fatalf("expected events produce attempts, calls=%v", prod.calls)
+	}
+	if prod.calls["dlt"] != 1 {
+		t.Fatalf("expected one DLT produce, calls=%v", prod.calls)
+	}
+	if dltType != "event_emit_failed" {
+		t.Fatalf("dlt_type=%q", dltType)
+	}
+	var parked map[string]interface{}
+	if err := json.Unmarshal(prod.dltRaw, &parked); err != nil {
+		t.Fatal(err)
+	}
+	if parked["dlt_type"] != "event_emit_failed" || parked["batch_id"] != "b1" {
+		t.Fatalf("parked=%v", parked)
+	}
+}
+
+func TestApplyJobSideEffectsErrorsWhenEventAndDLTFail(t *testing.T) {
+	cfg := config.Daemon{
+		EventsTopic: "events", DeadLetterTopic: "dlt",
+		EventEmitRetries: 0, EventEmitBackoff: 0,
+	}
+	out := job.Outcome{
+		Event: &protocol.EventMessage{BatchID: "b", JobID: "j", SrcTopic: "jobs"},
+	}
+	// countingProducer fails every call (failures starts high).
+	prod := &countingProducer{failures: 100}
+	err := applyJobSideEffects(context.Background(), cfg, prod, out)
+	if err == nil {
+		t.Fatal("expected error when event emit and DLT both fail")
 	}
 }
 
