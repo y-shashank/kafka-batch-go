@@ -121,6 +121,53 @@ func TestSyncConsumptionFetchPauseTopic(t *testing.T) {
 	}
 }
 
+func TestSetPriorityTopicPauseAndKillswitchCoexist(t *testing.T) {
+	pause := &mockPauseChecker{paused: map[string]bool{}}
+	fp := &recordingFetchPauser{}
+	cc := &consumerClient{
+		topics:      []string{"go_fast_p1"},
+		topicPaused: map[string]bool{},
+		partPaused:  map[string][]int32{},
+		pauseOps:    fp,
+	}
+
+	// Priority yields → topic paused once, and repeat is a no-op.
+	if !cc.setPriorityTopicPause("go_fast_p1", true) {
+		t.Fatal("expected first priority pause to change state")
+	}
+	if cc.setPriorityTopicPause("go_fast_p1", true) {
+		t.Fatal("expected repeat priority pause to be a no-op")
+	}
+	if len(fp.topicPaused) != 1 || fp.topicPaused[0] != "go_fast_p1" {
+		t.Fatalf("topicPaused=%v", fp.topicPaused)
+	}
+
+	// Killswitch also wants it paused: must NOT double-pause or resume.
+	pause.paused["g\x1fgo_fast_p1"] = true
+	cc.syncConsumptionFetchPause(context.Background(), pause, "g")
+	if len(fp.topicPaused) != 1 || len(fp.topicResumed) != 0 {
+		t.Fatalf("killswitch clobbered priority pause: paused=%v resumed=%v", fp.topicPaused, fp.topicResumed)
+	}
+
+	// Priority stops yielding, but killswitch still holds it → stays paused.
+	if cc.setPriorityTopicPause("go_fast_p1", false) {
+		t.Fatal("priority resume must not change applied state while killswitch holds it")
+	}
+	if len(fp.topicResumed) != 0 || !cc.anyTopicPaused() {
+		t.Fatalf("topic resumed while killswitch still active: resumed=%v", fp.topicResumed)
+	}
+
+	// Killswitch clears too → now the topic is finally resumed.
+	pause.paused["g\x1fgo_fast_p1"] = false
+	cc.syncConsumptionFetchPause(context.Background(), pause, "g")
+	if len(fp.topicResumed) != 1 || fp.topicResumed[0] != "go_fast_p1" {
+		t.Fatalf("expected resume once both intents clear: resumed=%v", fp.topicResumed)
+	}
+	if cc.anyTopicPaused() {
+		t.Fatal("expected no paused topics after both intents clear")
+	}
+}
+
 func TestPollWaitCtxBoundsWhenPaused(t *testing.T) {
 	cc := &consumerClient{topicPaused: map[string]bool{"jobs": true}}
 	parent := context.Background()

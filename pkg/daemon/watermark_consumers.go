@@ -237,8 +237,9 @@ func runWatermarkPriorityOnce(
 		pauseCtl:    pauseCtl,
 		live:        live,
 		onPoll:      func(context.Context) { wm.FlushMarks(cl.Client) },
+		onPrePoll:   priorityPrePollHook(cl, gate, specByTopic, weightedTicks, yieldSleep),
 	}, func(ctx context.Context, recs []*kgo.Record) error {
-		ready := filterPriorityRecords(ctx, cl, pc, gate, pauseCtl, live, specByTopic, yieldSleep, weightedTicks, recs)
+		ready := filterPriorityRecords(ctx, cl, pc, pauseCtl, live, specByTopic, recs)
 		if len(ready) == 0 {
 			return nil
 		}

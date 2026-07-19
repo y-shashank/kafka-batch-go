@@ -393,8 +393,9 @@ func runPriorityOnce(
 		health:      health,
 		pauseCtl:    pauseCtl,
 		live:        live,
+		onPrePoll:   priorityPrePollHook(cl, gate, specByTopic, weightedTicks, yieldSleep),
 	}, func(ctx context.Context, recs []*kgo.Record) error {
-		ready := filterPriorityRecords(ctx, cl, pc, gate, pauseCtl, live, specByTopic, yieldSleep, weightedTicks, recs)
+		ready := filterPriorityRecords(ctx, cl, pc, pauseCtl, live, specByTopic, recs)
 		if len(ready) == 0 {
 			return nil
 		}
@@ -403,22 +404,69 @@ func runPriorityOnce(
 	})
 }
 
+// priorityPrePollHook returns a pre-poll hook that proactively pauses lower-ranked
+// topics whose higher-ranked topics still have lag, and resumes them when the
+// backlog clears. Because a paused topic is never fetched, its records are never
+// consumed or marked — so a stall/rebalance/reconnect can never commit an offset
+// past an un-performed low-priority record and silently drop it (the old
+// poll-then-SetOffsets-rewind was not durable across a force-close). Strict mode
+// pauses while any higher topic has lag; weighted mode lets one poll batch through
+// every WeightedInterleave cycles.
+func priorityPrePollHook(
+	cl *consumerClient,
+	gate *priority.Gate,
+	specByTopic map[string]priority.TopicSpec,
+	weightedTicks map[string]int,
+	yieldSleep time.Duration,
+) func(context.Context) {
+	return func(pctx context.Context) {
+		for _, spec := range specByTopic {
+			if spec.Rank == 0 || len(spec.HigherTopics) == 0 {
+				continue
+			}
+			want := gate.HigherTopicsHaveLag(pctx, spec.ConsumerGroup, spec.HigherTopics, false)
+			if want && spec.Mode == priority.ModeWeighted {
+				every := spec.WeightedInterleave
+				if every < 1 {
+					every = 4
+				}
+				weightedTicks[spec.Topic]++
+				if weightedTicks[spec.Topic]%every == 0 {
+					want = false // let this poll's batch of low-priority records through
+				}
+			}
+			if cl.setPriorityTopicPause(spec.Topic, want) && want {
+				p0 := ""
+				if len(spec.HigherTopics) > 0 {
+					p0 = spec.HigherTopics[0]
+				}
+				instrument.ConsumerPriorityYielded(
+					"kbatch.priority", p0, spec.ConsumerGroup,
+					yieldSleep.Milliseconds(), string(spec.Mode), spec.Rank, spec.HigherTopics,
+				)
+			}
+		}
+	}
+}
+
+// filterPriorityRecords applies the consumption killswitch and liveness heartbeat,
+// then dispatches everything else. Priority yielding is now handled proactively in
+// the pre-poll hook (paused low-priority topics are never fetched), so any record
+// that reaches here is meant to run — including the rare low-priority record that
+// was buffered before its topic was paused. Processing that straggler is safe
+// (priority is a soft ordering) and, crucially, never drops it.
 func filterPriorityRecords(
 	ctx context.Context,
 	cl *consumerClient,
 	pc priority.Config,
-	gate *priority.Gate,
 	pauseCtl pauseChecker,
 	live *liveness.Reporter,
 	specByTopic map[string]priority.TopicSpec,
-	yieldSleep time.Duration,
-	weightedTicks map[string]int,
 	recs []*kgo.Record,
 ) []*kgo.Record {
 	ready := make([]*kgo.Record, 0, len(recs))
 	for _, rec := range recs {
-		spec, ok := specByTopic[rec.Topic]
-		if !ok {
+		if _, ok := specByTopic[rec.Topic]; !ok {
 			continue
 		}
 		if pauseCtl != nil && pauseCtl.Paused(ctx, pc.ConsumerGroup, rec.Topic, rec.Partition) {
@@ -430,21 +478,6 @@ func filterPriorityRecords(
 		if live != nil {
 			live.Heartbeat(ctx, rec.Topic)
 		}
-		tick := weightedTicks[rec.Topic]
-		if yield, _ := priority.ShouldYield(spec, gate, &tick, ctx); yield {
-			weightedTicks[rec.Topic] = tick
-			p0 := ""
-			if len(spec.HigherTopics) > 0 {
-				p0 = spec.HigherTopics[0]
-			}
-			instrument.ConsumerPriorityYielded(
-				"kbatch.priority", p0, spec.ConsumerGroup,
-				yieldSleep.Milliseconds(), string(spec.Mode), spec.Rank, spec.HigherTopics,
-			)
-			deferClientPartitionPause(cl, rec, yieldSleep)
-			continue
-		}
-		weightedTicks[rec.Topic] = tick
 		ready = append(ready, rec)
 	}
 	return ready

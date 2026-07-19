@@ -19,17 +19,12 @@ func (c *consumerClient) syncConsumptionFetchPause(ctx context.Context, pauseCtl
 	c.pauseMu.Lock()
 	defer c.pauseMu.Unlock()
 
+	if c.killswitchWant == nil {
+		c.killswitchWant = map[string]bool{}
+	}
 	for _, topic := range c.topics {
-		wantPause := pauseCtl.Paused(ctx, group, topic, 0)
-		hadPause := c.topicPaused[topic]
-		switch {
-		case wantPause && !hadPause:
-			p.PauseFetchTopics(topic)
-			c.topicPaused[topic] = true
-		case !wantPause && hadPause:
-			p.ResumeFetchTopics(topic)
-			c.topicPaused[topic] = false
-		}
+		c.killswitchWant[topic] = pauseCtl.Paused(ctx, group, topic, 0)
+		c.applyTopicPauseLocked(topic)
 	}
 
 	// Only sync killswitch partition pauses. Deferred retry/yield pauses live in
@@ -78,6 +73,47 @@ func (c *consumerClient) pollWaitCtx(parent context.Context) (context.Context, c
 		return parent, func() {}
 	}
 	return context.WithTimeout(parent, 500*time.Millisecond)
+}
+
+// applyTopicPauseLocked reconciles the franz-go fetch-pause for a topic to the OR
+// of its two independent pause intents (killswitch + priority). Caller holds
+// pauseMu. topicPaused tracks the currently-applied franz-go state.
+func (c *consumerClient) applyTopicPauseLocked(topic string) {
+	p := c.pauser()
+	if p == nil {
+		return
+	}
+	want := c.killswitchWant[topic] || c.priorityWant[topic]
+	if want == c.topicPaused[topic] {
+		return
+	}
+	if want {
+		p.PauseFetchTopics(topic)
+	} else {
+		p.ResumeFetchTopics(topic)
+	}
+	c.topicPaused[topic] = want
+}
+
+// setPriorityTopicPause records the priority-yield pause intent for a topic and
+// reconciles the franz-go fetch-pause. Returns true when the applied state
+// changed. Safe to call from the poll goroutine's pre-poll hook. Proactively
+// pausing (instead of polling then rewinding) is what makes priority yielding
+// stall/rebalance-safe: a never-fetched record can't have its offset committed
+// past it, so it is always redelivered.
+func (c *consumerClient) setPriorityTopicPause(topic string, want bool) bool {
+	if c == nil {
+		return false
+	}
+	c.pauseMu.Lock()
+	defer c.pauseMu.Unlock()
+	if c.priorityWant == nil {
+		c.priorityWant = map[string]bool{}
+	}
+	before := c.topicPaused[topic]
+	c.priorityWant[topic] = want
+	c.applyTopicPauseLocked(topic)
+	return c.topicPaused[topic] != before
 }
 
 func (c *consumerClient) pauseConsumptionPartition(topic string, partition int32) {

@@ -35,6 +35,10 @@ type pollLoopConfig struct {
 	pauseCtl     pauseChecker
 	live         *liveness.Reporter
 	onPoll       func(context.Context)
+	// onPrePoll runs after the killswitch fetch-pause sync and BEFORE PollRecords,
+	// so a consumer can proactively pause/resume topics (e.g. priority yielding)
+	// and never fetch records it would otherwise have to un-consume.
+	onPrePoll func(context.Context)
 }
 
 type consumerClient struct {
@@ -53,6 +57,13 @@ type consumerClient struct {
 	// bounds PollRecords while a single-partition assignment is fetch-paused.
 	enginePaused map[string]map[int32]struct{}
 	pauseOps     fetchPauser // tests only; nil uses embedded Client
+
+	// killswitchWant/priorityWant are the two independent reasons a whole topic may
+	// be fetch-paused. The applied franz-go state (topicPaused) is the OR of the
+	// two, so the consumption killswitch and priority yielding never clobber each
+	// other's pause. See applyTopicPauseLocked.
+	killswitchWant map[string]bool
+	priorityWant   map[string]bool
 
 	// deferGen / deferLife cancel outstanding deferred-pause timers on client close
 	// so SetOffsets/Resume cannot run against a restarted or closed client.
@@ -143,6 +154,9 @@ func runGroupPollLoop(
 
 		cl.AllowRebalance()
 		cl.syncConsumptionFetchPause(loopCtx, cfg.pauseCtl, cfg.group)
+		if cfg.onPrePoll != nil {
+			cfg.onPrePoll(loopCtx)
+		}
 
 		touch()
 		pollCtx, endPollWait := cl.pollWaitCtx(loopCtx)
