@@ -66,13 +66,33 @@ func (c *consumerClient) anyTopicPaused() bool {
 	return len(c.partPaused) > 0 || len(c.deferredPaused) > 0 || len(c.enginePaused) > 0
 }
 
-// pollWaitCtx bounds PollRecords while topics/partitions are fetch-paused so the
-// loop can re-sync the killswitch. When nothing is paused, returns parent as-is.
+// pausedPollWait bounds the poll while a partition/topic is fetch-paused so the
+// loop re-syncs the killswitch and notices async deferred resumes promptly.
+const pausedPollWait = 500 * time.Millisecond
+
+// idlePollWait bounds the poll when nothing is fetch-paused. franz-go's
+// PollFetches/PollRecords blocks until a record is available (an empty broker
+// fetch response does NOT return the poll) — so an idle-but-assigned consumer
+// would sit inside a single poll call indefinitely, never reaching the loop's
+// touch() calls, and the stall watchdog (defaultConsumerStallTimeout) would
+// force-close the client and trigger a needless reconnect + group rebalance.
+// That rebalance thrash was dropping/​delaying control events (e.g. a batch's
+// terminal success/failed event landing while the events consumer was mid-
+// reconnect), leaving batches stuck below total. Bounding the idle poll keeps
+// the loop cycling well under the stall timeout so the watchdog only fires on a
+// genuinely wedged poll. A record still returns the poll immediately, so this
+// does not add latency to live traffic.
+const idlePollWait = 5 * time.Second
+
+// pollWaitCtx bounds PollRecords/PollFetches so the loop keeps making progress:
+// a short bound while paused (re-sync the killswitch / notice deferred resumes)
+// and a longer bound while idle (keep touching the stall watchdog). It never
+// returns an unbounded context — an unbounded idle poll trips a false stall.
 func (c *consumerClient) pollWaitCtx(parent context.Context) (context.Context, context.CancelFunc) {
 	if !c.anyTopicPaused() {
-		return parent, func() {}
+		return context.WithTimeout(parent, idlePollWait)
 	}
-	return context.WithTimeout(parent, 500*time.Millisecond)
+	return context.WithTimeout(parent, pausedPollWait)
 }
 
 // applyTopicPauseLocked reconciles the franz-go fetch-pause for a topic to the OR

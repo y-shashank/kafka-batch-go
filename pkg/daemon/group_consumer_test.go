@@ -176,11 +176,32 @@ func TestPollWaitCtxBoundsWhenPaused(t *testing.T) {
 	if ctx == parent {
 		t.Fatal("expected bounded poll ctx while paused")
 	}
-	cc.topicPaused["jobs"] = false
-	ctx2, cancel2 := cc.pollWaitCtx(parent)
-	defer cancel2()
-	if ctx2 != parent {
-		t.Fatal("expected parent poll ctx when nothing paused")
+	if dl, ok := ctx.Deadline(); !ok || time.Until(dl) > pausedPollWait+time.Second {
+		t.Fatalf("expected paused poll bound ~%s, got deadline ok=%v", pausedPollWait, ok)
+	}
+}
+
+// An idle-but-assigned consumer must still get a bounded poll: franz-go blocks
+// PollFetches until a record arrives, so without a bound the loop never reaches
+// its touch() calls and the stall watchdog force-closes the client on a
+// perfectly healthy idle consumer (needless reconnect + rebalance).
+func TestPollWaitCtxBoundsWhenIdle(t *testing.T) {
+	cc := &consumerClient{topicPaused: map[string]bool{"jobs": false}}
+	parent := context.Background()
+	ctx, cancel := cc.pollWaitCtx(parent)
+	defer cancel()
+	if ctx == parent {
+		t.Fatal("expected bounded poll ctx when idle (unbounded idle poll trips a false stall)")
+	}
+	dl, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("expected idle poll ctx to have a deadline")
+	}
+	if wait := time.Until(dl); wait <= 0 || wait > idlePollWait+time.Second {
+		t.Fatalf("expected idle poll bound ~%s, got %s", idlePollWait, wait)
+	}
+	if idlePollWait >= defaultConsumerStallTimeout {
+		t.Fatalf("idlePollWait %s must stay under stall timeout %s", idlePollWait, defaultConsumerStallTimeout)
 	}
 }
 
