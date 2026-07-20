@@ -112,7 +112,9 @@ func StartLivenessHeartbeatLoop(ctx context.Context, live *liveness.Reporter) {
 }
 
 func attachIngestLag(settings fairness.Settings, lag fairness.IngestLagCounter) fairness.Settings {
-	if settings.ActiveCountSource == "ingest_lag" && lag != nil {
+	// Wire the lag counter when it drives the active-count denominator, or when the
+	// idle vtime reset wants it as an extra "ingest drained" gate before resetting.
+	if lag != nil && (settings.ActiveCountSource == "ingest_lag" || settings.ResetVtimeWhenIdle) {
 		settings.IngestLag = lag
 	}
 	return settings

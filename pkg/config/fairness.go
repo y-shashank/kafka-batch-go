@@ -23,6 +23,10 @@ func (c Daemon) FairnessTimeSettings() fairness.Settings {
 		s.ActiveCountTTL = c.FairnessActiveCountTTL
 	}
 	s.ActiveCountSource = c.FairnessActiveCountSource
+	s.ResetVtimeWhenIdle = c.FairnessResetVtimeWhenIdle
+	if c.FairnessVtimeIdleResetDebounce > 0 {
+		s.VtimeIdleResetDebounce = c.FairnessVtimeIdleResetDebounce
+	}
 	s.DispatchConsumerGroup = c.DispatchConsumerGroup("time")
 	s.IngestTopic = c.FairnessTimeIngest
 	return s

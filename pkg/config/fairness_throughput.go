@@ -23,6 +23,10 @@ func (c Daemon) FairnessThroughputSettings() fairness.Settings {
 		s.ActiveCountTTL = c.FairnessActiveCountTTL
 	}
 	s.ActiveCountSource = c.FairnessActiveCountSource
+	s.ResetVtimeWhenIdle = c.FairnessResetVtimeWhenIdle
+	if c.FairnessVtimeIdleResetDebounce > 0 {
+		s.VtimeIdleResetDebounce = c.FairnessVtimeIdleResetDebounce
+	}
 	s.DispatchConsumerGroup = c.DispatchConsumerGroup("throughput")
 	s.IngestTopic = c.FairnessThroughputIngest
 	return s

@@ -733,6 +733,8 @@ Fairness admission is capped by control-plane `fairness_global_concurrency` (YAM
 
 **Hot tenants (fair ingest):** `fairness_dynamic_tenant_partitions` defaults to **true** so each tenant gets an exclusive ingest partition (avoids hash collisions under partition-serial dispatch). Override whales with `fairness_tenant_partitions`, or set dynamic to `false` for murmur2 key-hash only. Weighted checkout always passes a positive weight-sum hint (`shint`) so Redis does not full-scan the tenant ring.
 
+**Virtual-time (vtime) fairness:** checkout serves the ready tenant with the smallest vtime; a returning idle tenant is re-admitted at the current frontier (`max(its vtime, min ring vtime)`) so it cannot burst ahead of busy tenants. `fairness_reset_vtime_when_idle` (default **true**) clears the vtime ledger (weights preserved) once a lane is fully quiescent — empty ring, no live leases, no pending forwards, zero ingest lag — for `fairness_vtime_idle_reset_debounce` seconds (default 15). This yields fresh fairness per active period and bounds vtime growth; the reset is atomic under a ring-empty guard and never fires mid-run. Mirrors the Ruby gem's behavior.
+
 #### Tuning profiles
 
 **32 partitions per topic** (typical production):
@@ -1048,6 +1050,8 @@ fairness_default_weight: 1.0
 fairness_weighted_concurrency: true
 fairness_active_count_ttl: 5             # sec
 fairness_active_count_source: inflight_plus_ready  # | inflight
+fairness_reset_vtime_when_idle: true     # clear vtime ledger (weights kept) once a lane is idle
+fairness_vtime_idle_reset_debounce: 15   # sec a lane must stay idle before the reset fires
 fairness_dynamic_tenant_partitions: true
 fairness_tenant_partition_cache_ttl: 30  # sec
 # fairness_tenant_partitions:

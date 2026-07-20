@@ -29,6 +29,16 @@ type Settings struct {
 	ForwardingRecoveryGrace float64
 	SlotDedupTTL            int
 	WeightCacheTTL          time.Duration
+
+	// ResetVtimeWhenIdle enables clearing the virtual-time ledger (weights kept)
+	// once the lane goes fully quiescent — empty ring, no live leases, empty
+	// forwarding buffer, and zero ingest lag — for a sustained debounce window.
+	// This yields fresh per-active-period fairness and bounds vtime growth without
+	// the mid-run disruption a fixed-interval reset would cause.
+	ResetVtimeWhenIdle bool
+	// VtimeIdleResetDebounce is how long the lane must stay quiescent before the
+	// idle vtime reset fires, preventing resets during transient empty-ring lulls.
+	VtimeIdleResetDebounce time.Duration
 }
 
 func DefaultSettings(lane Lane) Settings {
@@ -44,7 +54,17 @@ func DefaultSettings(lane Lane) Settings {
 		ForwardingRecoveryGrace: 5.0,
 		SlotDedupTTL:            0,
 		WeightCacheTTL:          60 * time.Second,
+		ResetVtimeWhenIdle:      true,
+		VtimeIdleResetDebounce:  15 * time.Second,
 	}
+}
+
+// EffectiveVtimeIdleResetDebounce returns the configured debounce or a safe floor.
+func (s Settings) EffectiveVtimeIdleResetDebounce() time.Duration {
+	if s.VtimeIdleResetDebounce >= time.Second {
+		return s.VtimeIdleResetDebounce
+	}
+	return 15 * time.Second
 }
 
 func (s Settings) EffectiveLeaseTTL() float64 {

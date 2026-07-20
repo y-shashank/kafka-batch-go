@@ -364,6 +364,46 @@ func (s *Scheduler) Stats(ctx context.Context) (Stats, error) {
 	}, nil
 }
 
+// ResetVtimeIfQuiescent clears the per-tenant virtual-time ledger (preserving
+// weights) iff the lane is fully quiescent on the Redis side: empty ring, no live
+// leases, and an empty forwarding buffer. The check and delete run atomically in
+// one script, so a tenant enqueuing mid-check cannot have its freshly-seeded vtime
+// wiped. Returns true when the reset was applied.
+//
+// This gives "fresh fairness per active period" — once a lane drains completely,
+// the next burst of work starts every tenant even, so a busy period does not carry
+// virtual-time debt/credit into the next one. It also bounds unbounded vtime growth
+// over long uptimes. The caller is responsible for gating this on a debounce and
+// (optionally) zero ingest lag so it never fires during a transient lull.
+func (s *Scheduler) ResetVtimeIfQuiescent(ctx context.Context) (bool, error) {
+	if err := ValidateLane(s.Lane); err != nil {
+		return false, err
+	}
+	now := float64(time.Now().UnixNano()) / 1e9
+	n, err := s.Client.Eval(ctx, ResetVtimeIfQuiescentLua,
+		[]string{ringKey(s.Lane), vtimeKey(s.Lane), leasesKey(s.Lane), forwardingKey(s.Lane)},
+		fmt.Sprintf("%f", now),
+	).Int()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// IngestPending reports whether the lane's ingest topic still has undispatched
+// backlog (any partition with consumer-group lag > 0). When no ingest-lag counter
+// is configured it returns false, so callers fall back to Redis-only quiescence.
+func (s *Scheduler) IngestPending(ctx context.Context) (bool, error) {
+	if s.Settings.IngestLag == nil {
+		return false, nil
+	}
+	n, err := s.Settings.IngestLag.IngestActiveCount(ctx, s.Settings.DispatchConsumerGroup, s.Settings.IngestTopic)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 func (s *Scheduler) Vtime(ctx context.Context, tenantID string) (float64, error) {
 	v, err := s.Client.HGet(ctx, vtimeKey(s.Lane), tenantID).Float64()
 	if err == redis.Nil {

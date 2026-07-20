@@ -30,12 +30,17 @@ type Forwarder struct {
 
 	lastLeaseReclaim   time.Time
 	lastForwardReclaim time.Time
+
+	lastIdleCheck  time.Time
+	quiescentSince time.Time
+	vtimeResetDone bool
 }
 
 const (
-	defaultIdleSleep = 50 * time.Millisecond
-	defaultBurst     = 50
-	reclaimInterval  = 30 * time.Second
+	defaultIdleSleep  = 50 * time.Millisecond
+	defaultBurst      = 50
+	reclaimInterval   = 30 * time.Second
+	idleCheckInterval = 5 * time.Second
 )
 
 // forwardOutcome distinguishes idle ready-list from transient forward failures so
@@ -150,6 +155,7 @@ func (f *Forwarder) Run(ctx context.Context) {
 		}
 		n, empty, failed := f.drainBurst(ctx, burst)
 		f.maybeReclaim(ctx)
+		f.maybeResetVtimeIdle(ctx)
 		switch {
 		case n == burst && !empty && !failed:
 			// Full burst with more ready work likely remaining — keep draining.
@@ -214,6 +220,81 @@ func (f *Forwarder) maybeReclaim(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// maybeResetVtimeIdle clears the lane's virtual-time ledger (weights preserved)
+// once the lane has been fully quiescent for the configured debounce window.
+//
+// "Quiescent" means no active or in-flight work anywhere: no active tenants (empty
+// ring), nothing in flight (no live leases), no in-progress forwards, and — when an
+// ingest-lag counter is wired — zero ingest backlog. Because the ready ring is
+// continuously fed from ingest, a ring that stays empty across the debounce already
+// implies ingest has drained; the ingest-lag gate is an extra guard.
+//
+// The check is cheap (a pooled Redis snapshot + optional lag read) and rate-limited
+// to idleCheckInterval. The final DEL is done atomically under a ring-empty guard in
+// ResetVtimeIfQuiescent, so this can never wipe a tenant that just re-enqueued. The
+// reset fires at most once per idle period (vtimeResetDone) and re-arms as soon as
+// any activity is observed.
+func (f *Forwarder) maybeResetVtimeIdle(ctx context.Context) {
+	if f.Scheduler == nil || !f.Scheduler.Settings.ResetVtimeWhenIdle {
+		return
+	}
+	now := time.Now()
+	if now.Sub(f.lastIdleCheck) < idleCheckInterval {
+		return
+	}
+	f.lastIdleCheck = now
+
+	// Cheap Redis snapshot only: any active/in-flight work re-arms the debounce for
+	// the next idle period (and clears the once-per-idle reset latch).
+	redisIdle, err := f.redisIdle(ctx)
+	if err != nil || !redisIdle {
+		f.quiescentSince = time.Time{}
+		f.vtimeResetDone = false
+		return
+	}
+	// Already reset for this idle period — nothing to do until activity resumes.
+	if f.vtimeResetDone {
+		return
+	}
+	if f.quiescentSince.IsZero() {
+		f.quiescentSince = now
+		return
+	}
+	if now.Sub(f.quiescentSince) < f.Scheduler.Settings.EffectiveVtimeIdleResetDebounce() {
+		return
+	}
+	// Final gate, evaluated only at the moment of reset (not every idle tick): if the
+	// ingest topic still has backlog the lane is not truly idle — keep waiting.
+	pending, err := f.Scheduler.IngestPending(ctx)
+	if err != nil {
+		return
+	}
+	if pending {
+		f.quiescentSince = time.Time{}
+		return
+	}
+	reset, err := f.Scheduler.ResetVtimeIfQuiescent(ctx)
+	if err != nil {
+		log.Printf("[kbatch-fair-forwarder] idle vtime reset lane=%s: %v", f.Lane, err)
+		return
+	}
+	f.vtimeResetDone = true
+	if reset {
+		log.Printf("[kbatch-fair-forwarder] reset virtual-time ledger on idle lane=%s (weights preserved)", f.Lane)
+	}
+}
+
+// redisIdle reports whether the lane currently shows no active tenants, no in-flight
+// leases, and no in-progress forwards. It is a fast, pooled Redis snapshot; the
+// authoritative atomic recheck happens inside ResetVtimeIfQuiescent.
+func (f *Forwarder) redisIdle(ctx context.Context) (bool, error) {
+	stats, err := f.Scheduler.Stats(ctx)
+	if err != nil {
+		return false, err
+	}
+	return stats.ActiveTenants == 0 && stats.InflightTotal == 0 && stats.ForwardingDepth == 0, nil
 }
 
 func (f *Forwarder) now() time.Time {

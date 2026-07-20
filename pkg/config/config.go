@@ -117,6 +117,8 @@ type Daemon struct {
 	FairnessTenantPartitions          map[string]int32
 	FairnessDynamicTenantPartitions   bool
 	FairnessTenantPartitionCacheTTL   time.Duration
+	FairnessResetVtimeWhenIdle        bool
+	FairnessVtimeIdleResetDebounce    time.Duration
 	Store                             string
 	StoreMySQLDSN                     string
 	LivenessEnabled                   bool
@@ -223,6 +225,10 @@ func DefaultDaemon() Daemon {
 		// Default on — large tenant fleets rarely maintain a manual pin map.
 		FairnessDynamicTenantPartitions: true,
 		FairnessTenantPartitionCacheTTL: 30 * time.Second,
+		// Reset the per-tenant virtual-time ledger (weights kept) once a lane goes
+		// fully idle, so each active period starts fair and vtime cannot grow forever.
+		FairnessResetVtimeWhenIdle:     true,
+		FairnessVtimeIdleResetDebounce: 15 * time.Second,
 		LivenessTTL:                     180 * time.Second,
 		LivenessHeartbeatInterval:       20 * time.Second,
 		LivenessHTTPAddr:                ":8080",
@@ -490,6 +496,8 @@ func LoadDaemon(path string) (Daemon, error) {
 		FairnessTenantPartitions             map[string]int32 `yaml:"fairness_tenant_partitions"`
 		FairnessDynamicTenantPartitions      *bool            `yaml:"fairness_dynamic_tenant_partitions"`
 		FairnessTenantPartitionCacheTTLSec   float64          `yaml:"fairness_tenant_partition_cache_ttl"`
+		FairnessResetVtimeWhenIdle           *bool            `yaml:"fairness_reset_vtime_when_idle"`
+		FairnessVtimeIdleResetDebounceSec    float64          `yaml:"fairness_vtime_idle_reset_debounce"`
 		Store                                string           `yaml:"store"`
 		StoreMySQLDSN                        string           `yaml:"store_mysql_dsn"`
 		LivenessEnabled                      bool             `yaml:"liveness_enabled"`
@@ -721,6 +729,12 @@ func LoadDaemon(path string) (Daemon, error) {
 	}
 	if doc.FairnessTenantPartitionCacheTTLSec > 0 {
 		cfg.FairnessTenantPartitionCacheTTL = time.Duration(doc.FairnessTenantPartitionCacheTTLSec * float64(time.Second))
+	}
+	if doc.FairnessResetVtimeWhenIdle != nil {
+		cfg.FairnessResetVtimeWhenIdle = *doc.FairnessResetVtimeWhenIdle
+	}
+	if doc.FairnessVtimeIdleResetDebounceSec > 0 {
+		cfg.FairnessVtimeIdleResetDebounce = time.Duration(doc.FairnessVtimeIdleResetDebounceSec * float64(time.Second))
 	}
 	if doc.Store != "" {
 		cfg.Store = doc.Store

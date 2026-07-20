@@ -162,6 +162,10 @@ fairness_enabled: true
 # fairness_weighted_concurrency: true   # false = equal cap per active tenant
 # fairness_active_count_ttl: 5          # sec — in-flight count cache TTL
 # fairness_active_count_source: inflight_plus_ready   # inflight_plus_ready | inflight
+# fairness_reset_vtime_when_idle: true    # clear virtual-time ledger (weights kept) once a
+#                                         # lane is fully idle → fresh fairness per active
+#                                         # period + bounded vtime growth (no mid-run reset)
+# fairness_vtime_idle_reset_debounce: 15  # sec — lane must stay idle this long before reset
 # fairness_tenant_partition_cache_ttl: 30  # sec — in-process tenant→partition cache
 # fairness_dynamic_tenant_partitions: true  # default on — exclusive ingest partitions per tenant
 # fairness_tenant_partitions:               # static pins win over dynamic checkout

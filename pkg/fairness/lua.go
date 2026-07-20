@@ -292,3 +292,26 @@ redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
 redis.call('ZADD', KEYS[2], ARGV[2], ARGV[1])
 return 1
 `
+
+// ResetVtimeIfQuiescentLua deletes the per-tenant virtual-time hash (KEYS[2])
+// ONLY when the lane's Redis state proves there is no active or in-flight work:
+//   - ring (KEYS[1]) has no tenants (no ready backlog),
+//   - leases (KEYS[3]) has no live entry (score > now == ARGV[1]),
+//   - forwarding buffer (KEYS[4]) is empty (no in-progress checkout→confirm).
+//
+// Weights (a separate key) are intentionally preserved. Checking + deleting in
+// one script closes the race where a tenant enqueues (and seeds its vtime) between
+// a Go-side quiescence check and the DEL — if the ring is non-empty we skip. It
+// returns 1 when vtime was reset, 0 otherwise.
+const ResetVtimeIfQuiescentLua = `
+local ring   = KEYS[1]
+local vth    = KEYS[2]
+local leases = KEYS[3]
+local fwd    = KEYS[4]
+local now    = ARGV[1]
+if redis.call('ZCARD', ring) > 0 then return 0 end
+if redis.call('ZCOUNT', leases, '(' .. now, '+inf') > 0 then return 0 end
+if redis.call('HLEN', fwd) > 0 then return 0 end
+redis.call('DEL', vth)
+return 1
+`
