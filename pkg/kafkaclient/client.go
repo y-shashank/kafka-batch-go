@@ -49,6 +49,9 @@ func New(brokers []string, opts ...Option) (*Client, error) {
 		kgo.SeedBrokers(brokers...),
 		kgo.RequiredAcks(cfg.requiredAcks),
 		kgo.AllowAutoTopicCreation(),
+		// Honor explicit Record.Partition (fairness tenant->partition routing);
+		// fall back to key-hash otherwise. Default franz-go ignores Partition.
+		kgo.RecordPartitioner(explicitOrHashPartitioner()),
 	)
 	if err != nil {
 		return nil, err
@@ -78,7 +81,8 @@ func (c *Client) ProduceMany(ctx context.Context, reqs ...ProduceRequest) error 
 	}
 	recs := make([]*kgo.Record, len(reqs))
 	for i, r := range reqs {
-		recs[i] = &kgo.Record{Topic: r.Topic, Key: []byte(r.Key), Value: r.Value}
+		// Partition -1 = route by key-hash (see explicitOrHashPartitioner).
+		recs[i] = &kgo.Record{Topic: r.Topic, Key: []byte(r.Key), Value: r.Value, Partition: -1}
 	}
 	results := c.inner.ProduceSync(ctx, recs...)
 	for _, res := range results {

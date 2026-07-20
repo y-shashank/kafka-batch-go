@@ -14,7 +14,7 @@ type Delivery struct {
 
 // ProduceSync produces one record and returns delivery coordinates.
 func (c *Client) ProduceSync(ctx context.Context, topic, key string, payload []byte, partition *int32) (Delivery, error) {
-	r := kgo.Record{Topic: topic, Key: []byte(key), Value: payload}
+	r := kgo.Record{Topic: topic, Key: []byte(key), Value: payload, Partition: -1}
 	if partition != nil && *partition >= 0 {
 		r.Partition = *partition
 	}
@@ -37,7 +37,7 @@ func (c *Client) ProduceManySync(ctx context.Context, records []ProduceRecord) (
 	}
 	krecs := make([]*kgo.Record, len(records))
 	for i, pr := range records {
-		r := &kgo.Record{Topic: pr.Topic, Key: []byte(pr.Key), Value: pr.Payload}
+		r := &kgo.Record{Topic: pr.Topic, Key: []byte(pr.Key), Value: pr.Payload, Partition: -1}
 		if pr.Partition != nil && *pr.Partition >= 0 {
 			r.Partition = *pr.Partition
 		}
