@@ -124,6 +124,23 @@ while Time.now < deadline
     warn "[ruby-drain] consume error: #{e.class}: #{e.message}"
   end
 
+  # The default (SuperFetch) executor performs jobs on background threads and
+  # only clears its in-process in-flight set once a perform finishes. A low- or
+  # zero-delay retry re-enqueues the SAME job_id to the worker topic almost
+  # immediately; if we poll it before the prior attempt's perform has finished,
+  # SuperFetch silently drops it as a duplicate in-process redelivery and the
+  # retry (its success / exhaustion + DLT) is lost. Wait for the perform pool to
+  # go idle after each message so retried job_ids are claimable and their
+  # completion events are emitted before we poll again.
+  executor = KafkaBatch.job_executor
+  if executor.respond_to?(:wait_for_idle)
+    begin
+      executor.wait_for_idle(timeout: options[:timeout])
+    rescue StandardError => e
+      warn "[ruby-drain] wait_for_idle error: #{e.class}: #{e.message}"
+    end
+  end
+
   if committed
     rd.commit
     processed += 1
