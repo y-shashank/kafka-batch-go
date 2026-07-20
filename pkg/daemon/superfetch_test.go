@@ -17,6 +17,35 @@ import (
 	"github.com/y-shashank/kafka-batch-go/pkg/workset"
 )
 
+func TestUndispatchedRewindOffsets(t *testing.T) {
+	// A batch whose tail was not dispatched (rebalance/stall abort). Rewind must
+	// target the LOWEST un-dispatched offset per partition so franz-go re-fetches
+	// exactly the abandoned tail (never past a record that was handled).
+	recs := []*kgo.Record{
+		{Topic: "jobs", Partition: 0, Offset: 105},
+		{Topic: "jobs", Partition: 0, Offset: 106},
+		{Topic: "jobs", Partition: 1, Offset: 900},
+		{Topic: "jobs", Partition: 0, Offset: 104}, // out-of-order guard: min wins
+		{Topic: "other", Partition: 3, Offset: 7},
+	}
+	got := undispatchedRewindOffsets(recs)
+	if got["jobs"][0].Offset != 104 {
+		t.Fatalf("jobs/0 rewind offset = %d, want 104", got["jobs"][0].Offset)
+	}
+	if got["jobs"][1].Offset != 900 {
+		t.Fatalf("jobs/1 rewind offset = %d, want 900", got["jobs"][1].Offset)
+	}
+	if got["other"][3].Offset != 7 {
+		t.Fatalf("other/3 rewind offset = %d, want 7", got["other"][3].Offset)
+	}
+	if got["jobs"][0].Epoch != -1 {
+		t.Fatalf("epoch = %d, want -1 (no epoch)", got["jobs"][0].Epoch)
+	}
+	if undispatchedRewindOffsets(nil) != nil {
+		t.Fatal("empty input must return nil (no SetOffsets call)")
+	}
+}
+
 type sfMarker struct {
 	mu     sync.Mutex
 	marked []*kgo.Record

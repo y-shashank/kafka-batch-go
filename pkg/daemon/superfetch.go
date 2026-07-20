@@ -209,12 +209,22 @@ func (e *SuperFetchExecutor) DispatchClaimsAndAcks(ctx context.Context, cl *kgo.
 	}
 	life := e.life()
 	e.StartHeartbeatLoop(life)
-	for _, rec := range recs {
+	for i, rec := range recs {
 		if !e.accepting.Load() {
+			rewindUndispatched(cl, recs[i:])
 			return
 		}
 		select {
 		case <-ctx.Done():
+			// Aborted mid-batch (rebalance / stall). PollFetches already advanced
+			// franz-go's fetch cursor past every record in this batch; for a
+			// partition this member KEEPS through a cooperative rebalance the
+			// un-dispatched tail would otherwise never be re-fetched, and later
+			// marks would commit past it — a silent drop. Rewind the consume
+			// position to the first un-dispatched offset per partition so those
+			// records are redelivered. (For revoked partitions this is a no-op;
+			// the new owner resumes from the committed marks.)
+			rewindUndispatched(cl, recs[i:])
 			return
 		case e.ClaimWindow <- struct{}{}:
 		}
@@ -411,6 +421,55 @@ func (e *SuperFetchExecutor) processMissingJobID(ctx context.Context, cl *kgo.Cl
 		return
 	}
 	cl.MarkCommitRecords(rec)
+}
+
+// rewindUndispatched resets the consume position to the lowest offset per
+// partition among the given (un-dispatched) records, so franz-go re-fetches them
+// instead of skipping them. Called on an aborted dispatch (rebalance/stall)
+// BEFORE AllowRebalance, on the poll goroutine — the only safe place to move
+// offsets. Records already dispatched (claimed+marked) or acked (dedup/lost) are
+// not included, so this never rewinds over work that was actually handled.
+func rewindUndispatched(cl *kgo.Client, recs []*kgo.Record) {
+	if cl == nil {
+		return
+	}
+	offsets := undispatchedRewindOffsets(recs)
+	if len(offsets) == 0 {
+		return
+	}
+	cl.SetOffsets(offsets)
+}
+
+// undispatchedRewindOffsets returns the lowest offset per partition among recs,
+// as the SetOffsets map used to rewind the consume position so un-dispatched
+// records are redelivered. Epoch -1 means "no epoch" (consume from the offset).
+func undispatchedRewindOffsets(recs []*kgo.Record) map[string]map[int32]kgo.EpochOffset {
+	if len(recs) == 0 {
+		return nil
+	}
+	min := map[string]map[int32]int64{}
+	for _, r := range recs {
+		if r == nil {
+			continue
+		}
+		if min[r.Topic] == nil {
+			min[r.Topic] = map[int32]int64{}
+		}
+		if o, ok := min[r.Topic][r.Partition]; !ok || r.Offset < o {
+			min[r.Topic][r.Partition] = r.Offset
+		}
+	}
+	if len(min) == 0 {
+		return nil
+	}
+	offsets := make(map[string]map[int32]kgo.EpochOffset, len(min))
+	for t, ps := range min {
+		offsets[t] = make(map[int32]kgo.EpochOffset, len(ps))
+		for p, o := range ps {
+			offsets[t][p] = kgo.EpochOffset{Epoch: -1, Offset: o}
+		}
+	}
+	return offsets
 }
 
 func extractJobID(raw []byte) string {
