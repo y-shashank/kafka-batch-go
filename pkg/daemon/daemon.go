@@ -13,6 +13,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/twmb/franz-go/pkg/kgo"
 
+	"github.com/y-shashank/kafka-batch-go/pkg/alerts"
 	"github.com/y-shashank/kafka-batch-go/pkg/cancellation"
 	"github.com/y-shashank/kafka-batch-go/pkg/config"
 	"github.com/y-shashank/kafka-batch-go/pkg/control/event"
@@ -174,6 +175,12 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	})
 	reconciler.RunScheduler(ctx, cfg, st, prod, func() {
 		loopHealth.RecordTick("reconciler")
+	})
+	// Health alerts evaluator (Ruby /alerts UI settings in Redis). Control-plane
+	// only — kbatch worker does not start this. Shared NX lock + open/notify
+	// dedupe with Ruby so Slack/webhook fire once per open/resolve.
+	alerts.RunScheduler(ctx, cfg, rdb, func() {
+		loopHealth.RecordTick("alerts")
 	})
 	// Guardrail: the workset reclaim loop recovers orphaned SuperFetch in-flight
 	// jobs from Redis. Watermark mode owns durability via Kafka offset commits and

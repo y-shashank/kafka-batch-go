@@ -156,6 +156,27 @@ type Daemon struct {
 	ReconcilerLockTTL            time.Duration
 	MaxReconcilePerRun           int
 
+	// ── Health alerts (control-plane evaluator; Redis settings / Ruby UI) ───
+	// Shares kafka_batch:alerts:* with Ruby. UI Send-test stays Ruby-only.
+	// Daemon always hosts the loop (control plane); each tick no-ops unless
+	// effective enabled (library/env ← Redis wins).
+	AlertsEnabled                    bool
+	AIEncryptionSalt                 string // decrypt Slack/webhook/email secrets (Ruby ai_encryption_salt)
+	AlertsIntervalSec                int
+	AlertsForTicks                   int
+	AlertsResolveTicks               int
+	AlertsCooldownSeconds            int
+	AlertsLagThreshold               int
+	AlertsLagGrowthMin               int
+	AlertsRTTAvgMs                   float64
+	AlertsRTTMaxMs                   float64
+	AlertsRTTErrorRate               float64
+	AlertsReconcilerMaxAge           int
+	AlertsSchedulePendingMax         int
+	AlertsDLTPerMinute               int
+	AlertsFairnessIngestLag          int
+	AlertsFairnessReadyMaxWhenStuck  int
+
 	// ── Recurring (cron) scheduler (Go daemon only) ─────────────────────────
 	// Fires a registered manifest job on a repeating cron schedule. Rows live in
 	// kafka_batch_recurring_schedules; exactly-once emission is guarded by the
@@ -239,6 +260,21 @@ func DefaultDaemon() Daemon {
 		ReconciliationInterval:          300 * time.Second,
 		ReconcilerLockTTL:               600 * time.Second,
 		MaxReconcilePerRun:              100,
+		AlertsEnabled:                   false,
+		AlertsIntervalSec:               60,
+		AlertsForTicks:                  3,
+		AlertsResolveTicks:              2,
+		AlertsCooldownSeconds:           900,
+		AlertsLagThreshold:              1000,
+		AlertsLagGrowthMin:              100,
+		AlertsRTTAvgMs:                  50,
+		AlertsRTTMaxMs:                  200,
+		AlertsRTTErrorRate:              0.25,
+		AlertsReconcilerMaxAge:          900,
+		AlertsSchedulePendingMax:        10_000,
+		AlertsDLTPerMinute:              50,
+		AlertsFairnessIngestLag:         5000,
+		AlertsFairnessReadyMaxWhenStuck: 10,
 		RecurringWindow:                 30 * time.Second,
 		RecurringLockTTL:                60 * time.Second,
 		RecurringBatchSize:              100,
@@ -512,6 +548,22 @@ func LoadDaemon(path string) (Daemon, error) {
 		ReconciliationIntervalSec            float64          `yaml:"reconciliation_interval"`
 		ReconcilerLockTTLSec                 float64          `yaml:"reconciler_lock_ttl"`
 		MaxReconcilePerRun                   int              `yaml:"max_reconcile_per_run"`
+		AlertsEnabled                        bool             `yaml:"alerts_enabled"`
+		AIEncryptionSalt                     string           `yaml:"ai_encryption_salt"`
+		AlertsIntervalSec                    int              `yaml:"alerts_interval"`
+		AlertsForTicks                       int              `yaml:"alerts_for_ticks"`
+		AlertsResolveTicks                   int              `yaml:"alerts_resolve_ticks"`
+		AlertsCooldownSeconds                int              `yaml:"alerts_cooldown_seconds"`
+		AlertsLagThreshold                   int              `yaml:"alerts_lag_threshold"`
+		AlertsLagGrowthMin                   int              `yaml:"alerts_lag_growth_min"`
+		AlertsRTTAvgMs                       float64          `yaml:"alerts_rtt_avg_ms"`
+		AlertsRTTMaxMs                       float64          `yaml:"alerts_rtt_max_ms"`
+		AlertsRTTErrorRate                   float64          `yaml:"alerts_rtt_error_rate"`
+		AlertsReconcilerMaxAge               int              `yaml:"alerts_reconciler_max_age"`
+		AlertsSchedulePendingMax             int              `yaml:"alerts_schedule_pending_max"`
+		AlertsDLTPerMinute                   int              `yaml:"alerts_dlt_per_minute"`
+		AlertsFairnessIngestLag              int              `yaml:"alerts_fairness_ingest_lag"`
+		AlertsFairnessReadyMaxWhenStuck      int              `yaml:"alerts_fairness_ready_max_when_stuck"`
 		RecurringSchedulerEnabled            bool             `yaml:"recurring_scheduler_enabled"`
 		RecurringWindowSec                   float64          `yaml:"recurring_window"`
 		RecurringLockTTLSec                  float64          `yaml:"recurring_lock_ttl"`
@@ -784,6 +836,54 @@ func LoadDaemon(path string) (Daemon, error) {
 	if doc.MaxReconcilePerRun > 0 {
 		cfg.MaxReconcilePerRun = doc.MaxReconcilePerRun
 	}
+	if doc.AlertsEnabled {
+		cfg.AlertsEnabled = true
+	}
+	if doc.AIEncryptionSalt != "" {
+		cfg.AIEncryptionSalt = doc.AIEncryptionSalt
+	}
+	if doc.AlertsIntervalSec > 0 {
+		cfg.AlertsIntervalSec = doc.AlertsIntervalSec
+	}
+	if doc.AlertsForTicks > 0 {
+		cfg.AlertsForTicks = doc.AlertsForTicks
+	}
+	if doc.AlertsResolveTicks > 0 {
+		cfg.AlertsResolveTicks = doc.AlertsResolveTicks
+	}
+	if doc.AlertsCooldownSeconds > 0 {
+		cfg.AlertsCooldownSeconds = doc.AlertsCooldownSeconds
+	}
+	if doc.AlertsLagThreshold > 0 {
+		cfg.AlertsLagThreshold = doc.AlertsLagThreshold
+	}
+	if doc.AlertsLagGrowthMin > 0 {
+		cfg.AlertsLagGrowthMin = doc.AlertsLagGrowthMin
+	}
+	if doc.AlertsRTTAvgMs > 0 {
+		cfg.AlertsRTTAvgMs = doc.AlertsRTTAvgMs
+	}
+	if doc.AlertsRTTMaxMs > 0 {
+		cfg.AlertsRTTMaxMs = doc.AlertsRTTMaxMs
+	}
+	if doc.AlertsRTTErrorRate > 0 {
+		cfg.AlertsRTTErrorRate = doc.AlertsRTTErrorRate
+	}
+	if doc.AlertsReconcilerMaxAge > 0 {
+		cfg.AlertsReconcilerMaxAge = doc.AlertsReconcilerMaxAge
+	}
+	if doc.AlertsSchedulePendingMax > 0 {
+		cfg.AlertsSchedulePendingMax = doc.AlertsSchedulePendingMax
+	}
+	if doc.AlertsDLTPerMinute > 0 {
+		cfg.AlertsDLTPerMinute = doc.AlertsDLTPerMinute
+	}
+	if doc.AlertsFairnessIngestLag > 0 {
+		cfg.AlertsFairnessIngestLag = doc.AlertsFairnessIngestLag
+	}
+	if doc.AlertsFairnessReadyMaxWhenStuck > 0 {
+		cfg.AlertsFairnessReadyMaxWhenStuck = doc.AlertsFairnessReadyMaxWhenStuck
+	}
 	if doc.RecurringSchedulerEnabled {
 		cfg.RecurringSchedulerEnabled = true
 	}
@@ -881,6 +981,37 @@ func applyEnv(cfg *Daemon) {
 	}
 	if v := os.Getenv("KAFKA_BATCH_METRICS_STATSD_ADDR"); v != "" {
 		cfg.MetricsStatsDAddr = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("KAFKA_BATCH_ALERTS_ENABLED"); v == "1" || strings.EqualFold(v, "true") {
+		cfg.AlertsEnabled = true
+	}
+	if v := os.Getenv("KAFKA_BATCH_AI_ENCRYPTION_SALT"); v != "" {
+		cfg.AIEncryptionSalt = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("KAFKA_BATCH_ALERTS_INTERVAL"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			cfg.AlertsIntervalSec = n
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_ALERTS_FOR_TICKS"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			cfg.AlertsForTicks = n
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_ALERTS_RESOLVE_TICKS"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			cfg.AlertsResolveTicks = n
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_ALERTS_COOLDOWN_SECONDS"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			cfg.AlertsCooldownSeconds = n
+		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_ALERTS_LAG_THRESHOLD"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			cfg.AlertsLagThreshold = n
+		}
 	}
 	if v := os.Getenv("KAFKA_BATCH_PERFORMANCE_METRICS_ENABLED"); v == "1" || strings.EqualFold(v, "true") {
 		cfg.PerformanceMetricsEnabled = true

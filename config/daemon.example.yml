@@ -223,6 +223,19 @@ fairness_enabled: true
 # performance_metrics_bucket_seconds: 60      # advanced — default 1 min
 # performance_metrics_sample_rate: 1.0        # (0, 1.0] — lower to cut Redis write volume at very high throughput
 
+# ── Health alerts (control-plane evaluator; Ruby /alerts UI) ──────────────────
+# Shares kafka_batch:alerts:* with Ruby. Redis settings (UI Save) win over YAML.
+# Notify once per open + once per resolve (no reminders). kbatch worker does not
+# run this — only kbatch daemon. UI Send-test stays on the Ruby dashboard.
+# Prefer enabling channels/thresholds in the UI; set salt to decrypt secrets.
+
+# alerts_enabled: false
+# ai_encryption_salt: ""                     # same as Ruby config.ai_encryption_salt
+# alerts_interval: 60
+# alerts_for_ticks: 3
+# alerts_resolve_ticks: 2
+# Or: KAFKA_BATCH_ALERTS_ENABLED=true KAFKA_BATCH_AI_ENCRYPTION_SALT=...
+
 # ── Code defaults not exposed in YAML (change requires code / future YAML keys) ─
 # retry_jitter: 0.1                    # unused in Go retry scheduling today
 # batch_ttl: 604800                    # sec — Redis batch hash TTL (7 days)

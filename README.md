@@ -1091,9 +1091,17 @@ performance_metrics_bucket_seconds: 60
 performance_metrics_sample_rate: 1.0
 redis_rtt_probe_interval: 15             # sec
 redis_rtt_probe_timeout: 0.2             # sec (200ms)
+
+# ── Health alerts (Ruby /alerts UI; shared Redis) ─────────────────────────────
+# Daemon hosts the evaluator; worker does not. Redis UI settings win after save.
+alerts_enabled: false
+# ai_encryption_salt: ""                 # decrypt Slack/webhook/email secrets
+# alerts_interval: 60
 ```
 
 Code-only defaults (not YAML today): `batch_ttl` = 7d, `event_emit_retries` = 3, `event_emit_backoff` = 1s, `retry_jitter` = 0.1.
+
+**Health alerts:** `kbatch daemon` starts `pkg/alerts` (same Redis keys / NX lock as Ruby). Enable via UI `/alerts` or `alerts_enabled` / `KAFKA_BATCH_ALERTS_ENABLED`. Set `ai_encryption_salt` (or `KAFKA_BATCH_AI_ENCRYPTION_SALT`) to use channel secrets saved from the Ruby dashboard. Slack/webhook fire **once per open** and **once per resolve** (no reminder spam; shared with Ruby).
 
 ### Full `kafka_batch_handlers.yml` (all handler fields)
 
