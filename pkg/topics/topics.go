@@ -35,17 +35,19 @@ type Failure struct {
 	Error string
 }
 
-// DefaultPartitions mirrors lib/kafka_batch/topics.rb.
+// DefaultPartitions mirrors lib/kafka_batch/topics.rb. Every category defaults to
+// 16 partitions except the fairness ingest and ready lanes, which default to 64
+// (higher tenant/pod fan-out). Replication factor defaults to 1 (see Specs).
 var DefaultPartitions = map[string]int32{
-	"jobs":        768,
-	"priority":    768,
-	"events":      48,
-	"callbacks":   6,
-	"retry":       12,
-	"scheduled":   48,
-	"dead_letter": 3,
-	"ingest":      300,
-	"ready":       768,
+	"jobs":        16,
+	"priority":    16,
+	"events":      16,
+	"callbacks":   16,
+	"retry":       16,
+	"scheduled":   16,
+	"dead_letter": 16,
+	"ingest":      64,
+	"ready":       64,
 }
 
 // ClientTopics is the produce/client configuration used to derive topic specs.

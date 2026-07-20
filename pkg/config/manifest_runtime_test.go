@@ -60,7 +60,6 @@ func TestValidateTopicRuntimeExclusivity(t *testing.T) {
 
 func TestFairReadyForRuntime(t *testing.T) {
 	cfg := DefaultDaemon()
-	cfg.FairnessTimeReady = "legacy"
 	cfg.FairnessTimeReadyGo = "ready.go"
 	cfg.FairnessTimeReadyRuby = "ready.ruby"
 
@@ -69,6 +68,9 @@ func TestFairReadyForRuntime(t *testing.T) {
 	}
 	if got := cfg.FairReadyForRuntime("time", RuntimeRuby); got != "ready.ruby" {
 		t.Fatalf("ruby ready = %q", got)
+	}
+	if got := cfg.FairReadyForRuntime("time", "unknown"); got != "" {
+		t.Fatalf("unknown runtime should have no ready topic, got %q", got)
 	}
 }
 

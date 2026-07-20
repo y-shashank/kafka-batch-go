@@ -391,15 +391,8 @@ func workerFairReadyTopics(cfg config.Daemon, manifest config.Manifest) []fairRe
 		if !manifest.HasFairHandlersForRuntime(config.RuntimeGo, lane) {
 			continue
 		}
-		topics := cfg.FairReadyTopics(lane)
-		if cfg.RuntimeSplitFairReady(lane) {
-			if topics.Go != "" {
-				out = append(out, fairReadySpec{lane: lane, topic: topics.Go})
-			}
-			continue
-		}
-		if topics.Legacy != "" {
-			out = append(out, fairReadySpec{lane: lane, topic: topics.Legacy})
+		if topic := cfg.FairReadyTopics(lane).Go; topic != "" {
+			out = append(out, fairReadySpec{lane: lane, topic: topic})
 		}
 	}
 	return out

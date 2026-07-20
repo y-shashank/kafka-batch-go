@@ -99,11 +99,9 @@ type Daemon struct {
 	ConsumptionControlRefreshInterval time.Duration
 	FairnessEnabled                   bool
 	FairnessTimeIngest                string
-	FairnessTimeReady                 string
 	FairnessTimeReadyGo               string
 	FairnessTimeReadyRuby             string
 	FairnessThroughputIngest          string
-	FairnessThroughputReady           string
 	FairnessThroughputReadyGo         string
 	FairnessThroughputReadyRuby       string
 	FairnessReadyWindow               int
@@ -207,11 +205,9 @@ func DefaultDaemon() Daemon {
 		PriorityWeightedInterleave:        4,
 		ConsumptionControlRefreshInterval: 30 * time.Second,
 		FairnessTimeIngest:                "kafka_batch.fair_time_ingest",
-		FairnessTimeReady:                 "kafka_batch.fair_time_ready",
 		FairnessTimeReadyGo:               "kafka_batch.fair_time_ready.go",
 		FairnessTimeReadyRuby:             "kafka_batch.fair_time_ready.ruby",
 		FairnessThroughputIngest:          "kafka_batch.fair_throughput_ingest",
-		FairnessThroughputReady:           "kafka_batch.fair_throughput_ready",
 		FairnessThroughputReadyGo:         "kafka_batch.fair_throughput_ready.go",
 		FairnessThroughputReadyRuby:       "kafka_batch.fair_throughput_ready.ruby",
 		FairnessReadyWindow:               100,
@@ -478,11 +474,9 @@ func LoadDaemon(path string) (Daemon, error) {
 		ConsumptionControlRefreshIntervalSec float64          `yaml:"consumption_control_refresh_interval"`
 		FairnessEnabled                      bool             `yaml:"fairness_enabled"`
 		FairnessTimeIngest                   string           `yaml:"fairness_time_ingest"`
-		FairnessTimeReady                    string           `yaml:"fairness_time_ready"`
 		FairnessTimeReadyGo                  string           `yaml:"fairness_time_ready_go"`
 		FairnessTimeReadyRuby                string           `yaml:"fairness_time_ready_ruby"`
 		FairnessThroughputIngest             string           `yaml:"fairness_throughput_ingest"`
-		FairnessThroughputReady              string           `yaml:"fairness_throughput_ready"`
 		FairnessThroughputReadyGo            string           `yaml:"fairness_throughput_ready_go"`
 		FairnessThroughputReadyRuby          string           `yaml:"fairness_throughput_ready_ruby"`
 		FairnessReadyWindow                  int              `yaml:"fairness_ready_window"`
@@ -676,9 +670,6 @@ func LoadDaemon(path string) (Daemon, error) {
 	if doc.FairnessTimeIngest != "" {
 		cfg.FairnessTimeIngest = doc.FairnessTimeIngest
 	}
-	if doc.FairnessTimeReady != "" {
-		cfg.FairnessTimeReady = doc.FairnessTimeReady
-	}
 	if doc.FairnessTimeReadyGo != "" {
 		cfg.FairnessTimeReadyGo = doc.FairnessTimeReadyGo
 	}
@@ -687,9 +678,6 @@ func LoadDaemon(path string) (Daemon, error) {
 	}
 	if doc.FairnessThroughputIngest != "" {
 		cfg.FairnessThroughputIngest = doc.FairnessThroughputIngest
-	}
-	if doc.FairnessThroughputReady != "" {
-		cfg.FairnessThroughputReady = doc.FairnessThroughputReady
 	}
 	if doc.FairnessThroughputReadyGo != "" {
 		cfg.FairnessThroughputReadyGo = doc.FairnessThroughputReadyGo
@@ -1026,11 +1014,9 @@ func (c *Daemon) prefixTopics() {
 	c.RetryTopicBase = prefixName(p, c.RetryTopicBase)
 	c.ScheduledTopic = prefixName(p, c.ScheduledTopic)
 	c.FairnessTimeIngest = prefixName(p, c.FairnessTimeIngest)
-	c.FairnessTimeReady = prefixName(p, c.FairnessTimeReady)
 	c.FairnessTimeReadyGo = prefixName(p, c.FairnessTimeReadyGo)
 	c.FairnessTimeReadyRuby = prefixName(p, c.FairnessTimeReadyRuby)
 	c.FairnessThroughputIngest = prefixName(p, c.FairnessThroughputIngest)
-	c.FairnessThroughputReady = prefixName(p, c.FairnessThroughputReady)
 	c.FairnessThroughputReadyGo = prefixName(p, c.FairnessThroughputReadyGo)
 	c.FairnessThroughputReadyRuby = prefixName(p, c.FairnessThroughputReadyRuby)
 	for i, t := range c.JobsTopics {

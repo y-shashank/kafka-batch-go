@@ -71,18 +71,18 @@ func TestWorkerFairReadyTopicsSplitRuntime(t *testing.T) {
 	}
 }
 
-func TestWorkerFairReadyTopicsLegacySingleReady(t *testing.T) {
+func TestWorkerFairReadyTopicsOmitsLaneWithoutGoReadyTopic(t *testing.T) {
+	// Fair ready topics are always the runtime-split .go / .ruby names; there is
+	// no legacy combined fallback. A lane whose go ready topic is unset yields no
+	// spec even if it has go fair handlers.
 	cfg := config.DefaultDaemon()
 	cfg.FairnessEnabled = true
-	cfg.FairnessTimeReady = "legacy.ready"
 	cfg.FairnessTimeReadyGo = ""
-	cfg.FairnessTimeReadyRuby = ""
 	manifest := config.Manifest{Handlers: map[string]config.HandlerEntry{
 		"go.fair": {Runtime: config.RuntimeGo, FairnessType: "time"},
 	}}
-	specs := workerFairReadyTopics(cfg, manifest)
-	if len(specs) != 1 || specs[0].topic != "legacy.ready" {
-		t.Fatalf("specs=%+v", specs)
+	if specs := workerFairReadyTopics(cfg, manifest); len(specs) != 0 {
+		t.Fatalf("expected no specs when go ready topic unset, got %+v", specs)
 	}
 }
 

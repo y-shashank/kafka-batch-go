@@ -142,15 +142,17 @@ schedule_store: redis                  # redis | mysql
 
 fairness_enabled: true
 
+# Ready topics are ALWAYS runtime-split (.go / .ruby). There is no combined
+# (non-suffixed) fair_*_ready topic — the forwarder routes every job to the
+# .go or .ruby ready topic by its handler runtime.
+
 # Time lane (weighted wall-clock)
 # fairness_time_ingest: kafka_batch.fair_time_ingest
-# fairness_time_ready: kafka_batch.fair_time_ready           # legacy combined ready topic
 # fairness_time_ready_go: kafka_batch.fair_time_ready.go
 # fairness_time_ready_ruby: kafka_batch.fair_time_ready.ruby
 
 # Throughput lane (weighted job count)
 # fairness_throughput_ingest: kafka_batch.fair_throughput_ingest
-# fairness_throughput_ready: kafka_batch.fair_throughput_ready
 # fairness_throughput_ready_go: kafka_batch.fair_throughput_ready.go
 # fairness_throughput_ready_ruby: kafka_batch.fair_throughput_ready.ruby
 

@@ -1034,12 +1034,11 @@ priority_weighted_interleave: 4
 
 # ── Fairness dispatch ─────────────────────────────────────────────────────────
 fairness_enabled: false
+# Ready topics are always runtime-split (.go / .ruby); no combined fair_*_ready topic.
 fairness_time_ingest: kafka_batch.fair_time_ingest
-fairness_time_ready: kafka_batch.fair_time_ready
 fairness_time_ready_go: kafka_batch.fair_time_ready.go
 fairness_time_ready_ruby: kafka_batch.fair_time_ready.ruby
 fairness_throughput_ingest: kafka_batch.fair_throughput_ingest
-fairness_throughput_ready: kafka_batch.fair_throughput_ready
 fairness_throughput_ready_go: kafka_batch.fair_throughput_ready.go
 fairness_throughput_ready_ruby: kafka_batch.fair_throughput_ready.ruby
 fairness_ready_window: 100

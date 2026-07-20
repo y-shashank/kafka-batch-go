@@ -9,13 +9,16 @@ const (
 )
 
 // FairnessReadyTopics holds per-runtime ready topic names for one fairness lane.
+// Fair ready topics are ALWAYS runtime-split (.go / .ruby); there is no combined
+// (non-suffixed) fallback topic.
 type FairnessReadyTopics struct {
-	Go     string
-	Ruby   string
-	Legacy string
+	Go   string
+	Ruby string
 }
 
-// RuntimeSplitFairReady reports whether go/ruby ready topics are configured for a lane.
+// RuntimeSplitFairReady reports whether both go and ruby ready topics are
+// configured for a lane. Ready topics are always runtime-split, so this is the
+// well-configured invariant (both non-empty), not an opt-in toggle.
 func (c Daemon) RuntimeSplitFairReady(lane string) bool {
 	switch strings.ToLower(lane) {
 	case "throughput":
@@ -27,40 +30,33 @@ func (c Daemon) RuntimeSplitFairReady(lane string) bool {
 	}
 }
 
-// FairReadyForRuntime resolves the ready topic for a handler runtime on a lane.
+// FairReadyForRuntime resolves the runtime-specific (.go / .ruby) ready topic for
+// a handler runtime on a lane. Returns "" for an unknown runtime; the caller
+// (fairReadyResolver) turns that into an explicit routing error.
 func (c Daemon) FairReadyForRuntime(lane, runtime string) string {
 	topics := c.FairReadyTopics(lane)
-	if c.RuntimeSplitFairReady(lane) {
-		switch strings.ToLower(strings.TrimSpace(runtime)) {
-		case RuntimeGo:
-			return topics.Go
-		case RuntimeRuby:
-			return topics.Ruby
-		}
-	}
-	if topics.Legacy != "" {
-		return topics.Legacy
-	}
-	if strings.EqualFold(runtime, RuntimeRuby) && topics.Ruby != "" {
+	switch strings.ToLower(strings.TrimSpace(runtime)) {
+	case RuntimeGo:
+		return topics.Go
+	case RuntimeRuby:
 		return topics.Ruby
+	default:
+		return ""
 	}
-	return topics.Go
 }
 
-// FairReadyTopics returns ready topic configuration for a fairness lane.
+// FairReadyTopics returns the per-runtime ready topic configuration for a lane.
 func (c Daemon) FairReadyTopics(lane string) FairnessReadyTopics {
 	switch strings.ToLower(lane) {
 	case "throughput":
 		return FairnessReadyTopics{
-			Go:     c.FairnessThroughputReadyGo,
-			Ruby:   c.FairnessThroughputReadyRuby,
-			Legacy: c.FairnessThroughputReady,
+			Go:   c.FairnessThroughputReadyGo,
+			Ruby: c.FairnessThroughputReadyRuby,
 		}
 	default:
 		return FairnessReadyTopics{
-			Go:     c.FairnessTimeReadyGo,
-			Ruby:   c.FairnessTimeReadyRuby,
-			Legacy: c.FairnessTimeReady,
+			Go:   c.FairnessTimeReadyGo,
+			Ruby: c.FairnessTimeReadyRuby,
 		}
 	}
 }
