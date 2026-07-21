@@ -111,6 +111,9 @@ func (s *RedisStore) WithReconcilerLock(ctx context.Context, ttl time.Duration, 
 		ttlSec = 1
 	}
 	acquired, err := s.client.Eval(ctx, acquireLockLua, []string{reconcilerLockKey}, token, ttlSec).Result()
+	if err == redis.Nil {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}

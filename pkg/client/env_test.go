@@ -45,3 +45,21 @@ func TestApplyEnvEmptyLeavesDefaults(t *testing.T) {
 		t.Fatalf("brokers changed: %v", cfg.Brokers)
 	}
 }
+
+func TestApplyEnvExpandsScheduleMySQLDSN(t *testing.T) {
+	t.Setenv("KB_MYSQL_URL", "user:pass@tcp(db)/sched")
+	t.Setenv("KAFKA_BATCH_SCHEDULE_MYSQL_DSN", "")
+	cfg := DefaultConfig()
+	cfg.ScheduleMySQLDSN = "${KB_MYSQL_URL}"
+	ApplyEnv(&cfg)
+	if cfg.ScheduleMySQLDSN != "user:pass@tcp(db)/sched" {
+		t.Fatalf("dsn=%q", cfg.ScheduleMySQLDSN)
+	}
+
+	t.Setenv("KAFKA_BATCH_SCHEDULE_MYSQL_DSN", "${KB_MYSQL_URL}")
+	cfg = DefaultConfig()
+	ApplyEnv(&cfg)
+	if cfg.ScheduleMySQLDSN != "user:pass@tcp(db)/sched" {
+		t.Fatalf("env dsn=%q", cfg.ScheduleMySQLDSN)
+	}
+}
