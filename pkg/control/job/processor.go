@@ -16,6 +16,7 @@ import (
 	"github.com/y-shashank/kafka-batch-go/pkg/protocol"
 	"github.com/y-shashank/kafka-batch-go/pkg/retrycancel"
 	"github.com/y-shashank/kafka-batch-go/pkg/store"
+	"github.com/y-shashank/kafka-batch-go/pkg/tenantguard"
 )
 // Producer publishes Kafka messages.
 type Producer interface {
@@ -170,6 +171,7 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 	}
 	p.releaseUniq(ctx, job)
 	emitJobProcessed(job, instrumentSince(started, p.now()))
+	p.recordTenantOutcome(ctx, job, tenantguard.OK)
 	return out, nil
 }
 
@@ -273,6 +275,7 @@ func (p *Processor) handleFailure(ctx context.Context, job protocol.JobMessage, 
 		p.releaseUniq(ctx, job)
 		emitJobFailed(job, job.Attempt, className(execErr), execErr.Error())
 		emitDLTPublished(job.JobID, deref(job.BatchID), "job", src.Topic)
+		p.recordTenantOutcome(ctx, job, tenantguard.Fail)
 		return out, nil
 	}
 
@@ -299,6 +302,7 @@ func (p *Processor) handleFailure(ctx context.Context, job protocol.JobMessage, 
 		out.RetryKey = job.JobID
 		out.RetryPayload = retryPayload
 		emitJobRetried(job, job.Attempt+1, out.RetryTopic)
+		p.recordTenantOutcome(ctx, job, tenantguard.Retry)
 		return out, nil
 	}
 
@@ -317,6 +321,7 @@ func (p *Processor) handleFailure(ctx context.Context, job protocol.JobMessage, 
 	p.releaseUniq(ctx, job)
 	emitJobFailed(job, job.Attempt, className(execErr), execErr.Error())
 	emitDLTPublished(job.JobID, deref(job.BatchID), "job", src.Topic)
+	p.recordTenantOutcome(ctx, job, tenantguard.Fail)
 	return out, nil
 }
 
@@ -412,6 +417,20 @@ func deref(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// recordTenantOutcome feeds the per-tenant error-rate window (tenant guard).
+// No-op unless the guard is enabled and the job carries a tenant_id (fairness
+// jobs only). Fire-and-forget — never affects the execution outcome.
+func (p *Processor) recordTenantOutcome(ctx context.Context, job protocol.JobMessage, outcome tenantguard.Outcome) {
+	if !p.Cfg.TenantGuardEnabled || p.Store == nil {
+		return
+	}
+	tid := deref(job.TenantID)
+	if tid == "" {
+		return
+	}
+	tenantguard.Record(ctx, p.Store.RawClient(), tid, outcome, p.Cfg.TenantGuardWindowSeconds, p.now())
 }
 
 func className(err error) string {
