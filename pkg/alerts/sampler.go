@@ -10,6 +10,8 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
+
+	"github.com/y-shashank/kafka-batch-go/pkg/tenantguard"
 )
 
 type Sample struct {
@@ -25,6 +27,17 @@ type Sample struct {
 	ScheduleInflight int64
 	DLTPerMinute    int
 	CronStale       []map[string]interface{}
+	TenantErrorRates []TenantErrorRow
+}
+
+// TenantErrorRow is one active tenant's windowed error rate (tenant guard).
+type TenantErrorRow struct {
+	TenantID string
+	Rate     float64
+	Samples  int64
+	OK       int64
+	Fail     int64
+	Retry    int64
 }
 
 type LagRow struct {
@@ -55,7 +68,34 @@ func collectSample(ctx context.Context, rdb *redis.Client, st *State, cfg Config
 	}
 	s.LagTopics, s.PendingTotal = collectLag(ctx, cfg)
 	s.Fairness = fairnessLanes(ctx, cfg, s.LagTopics)
+	s.TenantErrorRates = tenantErrorRates(ctx, rdb, cfg)
 	return s
+}
+
+// tenantErrorRates reads each active tenant's windowed error rate for the
+// tenant_error_rate rule. Empty unless the guard is enabled; each returned row
+// already meets min_samples so the rule only compares against the threshold.
+func tenantErrorRates(ctx context.Context, rdb *redis.Client, cfg Config) []TenantErrorRow {
+	if !cfg.TenantGuardEnabled || rdb == nil {
+		return nil
+	}
+	now := time.Now()
+	win := cfg.TenantGuardWindowSeconds
+	var out []TenantErrorRow
+	for _, tid := range tenantguard.ActiveTenants(ctx, rdb, win, now) {
+		rate, samples, ok := tenantguard.ErrorRate(
+			ctx, rdb, tid, win, cfg.TenantGuardMinSamples, cfg.TenantGuardIncludeRetries, now,
+		)
+		if !ok {
+			continue
+		}
+		c := tenantguard.WindowCounts(ctx, rdb, tid, win, now)
+		out = append(out, TenantErrorRow{
+			TenantID: tid, Rate: rate, Samples: samples,
+			OK: c.OK, Fail: c.Fail, Retry: c.Retry,
+		})
+	}
+	return out
 }
 
 func persistBaseline(ctx context.Context, st *State, sample Sample) {

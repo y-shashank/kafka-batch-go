@@ -27,6 +27,39 @@ func runRules(cfg Config, sample Sample) []Finding {
 	out = append(out, ruleDLT(cfg, sample)...)
 	out = append(out, ruleSchedule(cfg, sample)...)
 	out = append(out, ruleCron(cfg, sample)...)
+	out = append(out, ruleTenantErrorRate(cfg, sample)...)
+	return out
+}
+
+// ruleTenantErrorRate fires one finding per tenant whose windowed error rate
+// exceeds the tenant-guard threshold. Per-tenant fingerprint so each tenant
+// opens/resolves independently. Thresholds are guard-owned; the Sampler only
+// populates rows when the guard is enabled, so this is silent otherwise.
+func ruleTenantErrorRate(cfg Config, sample Sample) []Finding {
+	const id = "tenant_error_rate_high"
+	if !ruleEnabled(cfg, id) || len(sample.TenantErrorRates) == 0 {
+		return nil
+	}
+	threshold := cfg.TenantGuardErrorRatePct
+	var out []Finding
+	for _, row := range sample.TenantErrorRates {
+		if row.TenantID == "" || row.Rate < threshold {
+			continue
+		}
+		out = append(out, Finding{
+			RuleID:      id,
+			Fingerprint: "tenant_error_rate:" + row.TenantID,
+			Title:       "Tenant error rate high",
+			Severity:    ruleSeverity(cfg, id, "warning"),
+			Summary: fmt.Sprintf("tenant=%s error rate %.1f%% over %d samples (threshold %.1f%%).",
+				row.TenantID, row.Rate, row.Samples, threshold),
+			Link: "/tenant_guard",
+			Sample: map[string]interface{}{
+				"tenant_id": row.TenantID, "rate": row.Rate, "samples": row.Samples,
+				"ok": row.OK, "fail": row.Fail, "retry": row.Retry, "threshold": threshold,
+			},
+		})
+	}
 	return out
 }
 

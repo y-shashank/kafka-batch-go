@@ -33,6 +33,13 @@ type Config struct {
 	DLTPerMinute              int
 	FairnessIngestLag         int
 	FairnessReadyMaxWhenStuck int
+	// Tenant guard thresholds (sourced from daemon config; the runtime
+	// tenant_guard:settings page layers over these in a later phase).
+	TenantGuardEnabled        bool
+	TenantGuardWindowSeconds  int
+	TenantGuardMinSamples     int
+	TenantGuardErrorRatePct   float64
+	TenantGuardIncludeRetries bool
 	ChannelSlack              bool
 	ChannelWebhook            bool
 	ChannelEmail              bool
@@ -89,6 +96,11 @@ func loadEffective(ctx context.Context, rdb *redis.Client, cfg config.Daemon) Co
 		DLTPerMinute:              intField(raw, "dlt_per_minute", positiveOr(cfg.AlertsDLTPerMinute, 50)),
 		FairnessIngestLag:         intField(raw, "fairness_ingest_lag", positiveOr(cfg.AlertsFairnessIngestLag, 5000)),
 		FairnessReadyMaxWhenStuck: intField(raw, "fairness_ready_max_when_stuck", positiveOr(cfg.AlertsFairnessReadyMaxWhenStuck, 10)),
+		TenantGuardEnabled:        cfg.TenantGuardEnabled,
+		TenantGuardWindowSeconds:  positiveOr(cfg.TenantGuardWindowSeconds, 300),
+		TenantGuardMinSamples:     positiveOr(cfg.TenantGuardMinSamples, 50),
+		TenantGuardErrorRatePct:   positiveOrF(cfg.TenantGuardErrorRatePct, 25.0),
+		TenantGuardIncludeRetries: cfg.TenantGuardIncludeRetries,
 		ChannelSlack:              boolField(raw, "channel_slack", false),
 		ChannelWebhook:            boolField(raw, "channel_webhook", false),
 		ChannelEmail:              boolField(raw, "channel_email", false),
@@ -156,6 +168,7 @@ func defaultRules() map[string]RuleConf {
 	ids := []string{
 		"lag_stuck_growing", "redis_rtt_high", "no_live_consumers", "reconciler_stale",
 		"fairness_ingest_backed_up", "dlt_rate_high", "schedule_depth_high", "cron_stale",
+		"tenant_error_rate_high",
 	}
 	m := make(map[string]RuleConf, len(ids))
 	for _, id := range ids {

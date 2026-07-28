@@ -231,3 +231,33 @@ func TestFairnessLanes(t *testing.T) {
 		t.Fatalf("throughput %+v", lanes[1])
 	}
 }
+
+func TestRuleTenantErrorRateHigh(t *testing.T) {
+	cfg := Config{
+		TenantGuardErrorRatePct: 25.0,
+		Rules:                   defaultRules(),
+	}
+	sample := Sample{TenantErrorRates: []TenantErrorRow{
+		{TenantID: "acme", Rate: 40.0, Samples: 100, OK: 60, Fail: 40},
+		{TenantID: "globex", Rate: 10.0, Samples: 80, OK: 72, Fail: 8},
+	}}
+	got := ruleTenantErrorRate(cfg, sample)
+	if len(got) != 1 {
+		t.Fatalf("want 1 finding, got %d: %+v", len(got), got)
+	}
+	if got[0].Fingerprint != "tenant_error_rate:acme" {
+		t.Fatalf("fingerprint = %q, want tenant_error_rate:acme", got[0].Fingerprint)
+	}
+	// Empty rows ⇒ silent.
+	if out := ruleTenantErrorRate(cfg, Sample{}); len(out) != 0 {
+		t.Fatalf("want 0 findings for empty sample, got %d", len(out))
+	}
+	// Disabled rule ⇒ silent even with breaching rows.
+	cfgOff := cfg
+	rc := cfgOff.Rules["tenant_error_rate_high"]
+	rc.Enabled = false
+	cfgOff.Rules["tenant_error_rate_high"] = rc
+	if out := ruleTenantErrorRate(cfgOff, sample); len(out) != 0 {
+		t.Fatalf("want 0 findings when rule disabled, got %d", len(out))
+	}
+}
