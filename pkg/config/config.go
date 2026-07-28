@@ -177,6 +177,22 @@ type Daemon struct {
 	AlertsFairnessIngestLag          int
 	AlertsFairnessReadyMaxWhenStuck  int
 
+	// ── Tenant guard (per-tenant error-rate pause/throttle; fairness lanes only) ──
+	// Shares kafka_batch:tenant_guard:* + kafka_batch:tenant_errors:* with Ruby.
+	// The daemon feeds the per-tenant ok/fail error window and honors enforcement
+	// (existing partition pause + fairness weight). Effective thresholds are layered
+	// from the runtime settings (kafka_batch:tenant_guard:settings) over these.
+	TenantGuardEnabled            bool
+	TenantGuardWindowSeconds      int
+	TenantGuardMinSamples         int
+	TenantGuardErrorRatePct       float64
+	TenantGuardIncludeRetries     bool
+	TenantGuardMitigation         string // none|throttle|pause|throttle_then_pause
+	TenantGuardThrottleWeight     float64
+	TenantGuardAutoReleaseSeconds int    // 0 = manual only; page can override at runtime
+	TenantGuardGraceTicks         int
+	TenantGuardReconcileInterval  int
+
 	// ── Recurring (cron) scheduler (Go daemon only) ─────────────────────────
 	// Fires a registered manifest job on a repeating cron schedule. Rows live in
 	// kafka_batch_recurring_schedules; exactly-once emission is guarded by the
@@ -275,6 +291,16 @@ func DefaultDaemon() Daemon {
 		AlertsDLTPerMinute:              50,
 		AlertsFairnessIngestLag:         5000,
 		AlertsFairnessReadyMaxWhenStuck: 10,
+		TenantGuardEnabled:              false,
+		TenantGuardWindowSeconds:        300,
+		TenantGuardMinSamples:           50,
+		TenantGuardErrorRatePct:         25.0,
+		TenantGuardIncludeRetries:       false,
+		TenantGuardMitigation:           "throttle",
+		TenantGuardThrottleWeight:       0.1,
+		TenantGuardAutoReleaseSeconds:   900,
+		TenantGuardGraceTicks:           0,
+		TenantGuardReconcileInterval:    15,
 		RecurringWindow:                 30 * time.Second,
 		RecurringLockTTL:                60 * time.Second,
 		RecurringBatchSize:              100,
@@ -564,6 +590,16 @@ func LoadDaemon(path string) (Daemon, error) {
 		AlertsDLTPerMinute                   int              `yaml:"alerts_dlt_per_minute"`
 		AlertsFairnessIngestLag              int              `yaml:"alerts_fairness_ingest_lag"`
 		AlertsFairnessReadyMaxWhenStuck      int              `yaml:"alerts_fairness_ready_max_when_stuck"`
+		TenantGuardEnabled                   bool             `yaml:"tenant_guard_enabled"`
+		TenantGuardWindowSeconds             int              `yaml:"tenant_guard_window_seconds"`
+		TenantGuardMinSamples                int              `yaml:"tenant_guard_min_samples"`
+		TenantGuardErrorRatePct              float64          `yaml:"tenant_guard_error_rate_pct"`
+		TenantGuardIncludeRetries            bool             `yaml:"tenant_guard_include_retries"`
+		TenantGuardMitigation                string           `yaml:"tenant_guard_mitigation"`
+		TenantGuardThrottleWeight            float64          `yaml:"tenant_guard_throttle_weight"`
+		TenantGuardAutoReleaseSeconds        int              `yaml:"tenant_guard_auto_release_seconds"`
+		TenantGuardGraceTicks                int              `yaml:"tenant_guard_grace_ticks"`
+		TenantGuardReconcileInterval         int              `yaml:"tenant_guard_reconcile_interval"`
 		RecurringSchedulerEnabled            bool             `yaml:"recurring_scheduler_enabled"`
 		RecurringWindowSec                   float64          `yaml:"recurring_window"`
 		RecurringLockTTLSec                  float64          `yaml:"recurring_lock_ttl"`
@@ -884,6 +920,36 @@ func LoadDaemon(path string) (Daemon, error) {
 	if doc.AlertsFairnessReadyMaxWhenStuck > 0 {
 		cfg.AlertsFairnessReadyMaxWhenStuck = doc.AlertsFairnessReadyMaxWhenStuck
 	}
+	if doc.TenantGuardEnabled {
+		cfg.TenantGuardEnabled = true
+	}
+	if doc.TenantGuardWindowSeconds > 0 {
+		cfg.TenantGuardWindowSeconds = doc.TenantGuardWindowSeconds
+	}
+	if doc.TenantGuardMinSamples > 0 {
+		cfg.TenantGuardMinSamples = doc.TenantGuardMinSamples
+	}
+	if doc.TenantGuardErrorRatePct > 0 {
+		cfg.TenantGuardErrorRatePct = doc.TenantGuardErrorRatePct
+	}
+	if doc.TenantGuardIncludeRetries {
+		cfg.TenantGuardIncludeRetries = true
+	}
+	if doc.TenantGuardMitigation != "" {
+		cfg.TenantGuardMitigation = doc.TenantGuardMitigation
+	}
+	if doc.TenantGuardThrottleWeight > 0 {
+		cfg.TenantGuardThrottleWeight = doc.TenantGuardThrottleWeight
+	}
+	if doc.TenantGuardAutoReleaseSeconds > 0 {
+		cfg.TenantGuardAutoReleaseSeconds = doc.TenantGuardAutoReleaseSeconds
+	}
+	if doc.TenantGuardGraceTicks > 0 {
+		cfg.TenantGuardGraceTicks = doc.TenantGuardGraceTicks
+	}
+	if doc.TenantGuardReconcileInterval > 0 {
+		cfg.TenantGuardReconcileInterval = doc.TenantGuardReconcileInterval
+	}
 	if doc.RecurringSchedulerEnabled {
 		cfg.RecurringSchedulerEnabled = true
 	}
@@ -984,6 +1050,9 @@ func applyEnv(cfg *Daemon) {
 	}
 	if v := os.Getenv("KAFKA_BATCH_ALERTS_ENABLED"); v == "1" || strings.EqualFold(v, "true") {
 		cfg.AlertsEnabled = true
+	}
+	if v := os.Getenv("KAFKA_BATCH_TENANT_GUARD_ENABLED"); v == "1" || strings.EqualFold(v, "true") {
+		cfg.TenantGuardEnabled = true
 	}
 	if v := os.Getenv("KAFKA_BATCH_AI_ENCRYPTION_SALT"); v != "" {
 		cfg.AIEncryptionSalt = strings.TrimSpace(v)

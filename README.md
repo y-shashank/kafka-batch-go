@@ -1097,11 +1097,24 @@ redis_rtt_probe_timeout: 0.2             # sec (200ms)
 alerts_enabled: false
 # ai_encryption_salt: ""                 # decrypt Slack/webhook/email secrets
 # alerts_interval: 60
+
+# ── Tenant guard (per-tenant error-rate pause/throttle; fairness lanes only) ──
+# Shared kafka_batch:tenant_guard:* + kafka_batch:tenant_errors:* with Ruby.
+tenant_guard_enabled: false
+# tenant_guard_window_seconds: 300
+# tenant_guard_min_samples: 50
+# tenant_guard_error_rate_pct: 25.0
+# tenant_guard_mitigation: throttle      # none | throttle | pause | throttle_then_pause
+# tenant_guard_throttle_weight: 0.1
+# tenant_guard_auto_release_seconds: 900
+# tenant_guard_reconcile_interval: 15
 ```
 
 Code-only defaults (not YAML today): `batch_ttl` = 7d, `event_emit_retries` = 3, `event_emit_backoff` = 1s, `retry_jitter` = 0.1.
 
 **Health alerts:** `kbatch daemon` starts `pkg/alerts` (same Redis keys / NX lock as Ruby). Enable via UI `/alerts` or `alerts_enabled` / `KAFKA_BATCH_ALERTS_ENABLED`. Set `ai_encryption_salt` (or `KAFKA_BATCH_AI_ENCRYPTION_SALT`) to use channel secrets saved from the Ruby dashboard. Slack/webhook fire **once per open** and **once per resolve** (no reminder spam; shared with Ruby).
+
+**Tenant guard:** watches a sliding per-tenant error-rate window (`kafka_batch:tenant_errors:*`) and auto-mitigates a hot **fairness** tenant by throttling its weight and/or pausing its dedicated ingest partition — reusing the existing weight + consumption-pause levers, so batch counting and the job hot path are untouched. The **canonical contract (Redis keys, state model, error classification) lives in the Ruby `kafka-batch` README → "Tenant guard"**; keep both in lock-step. The Go daemon feeds the error window (`tenant_id` on `job.processed`/`job.failed`/`job.retried`) and honors enforcement; the dashboard + settings editing stay Ruby-only.
 
 ### Full `kafka_batch_handlers.yml` (all handler fields)
 

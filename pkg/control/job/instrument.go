@@ -42,6 +42,12 @@ func jobInstrumentPayload(job protocol.JobMessage, extra map[string]interface{})
 	if job.JobType != "" {
 		payload["job_type"] = job.JobType
 	}
+	// tenant_id drives the per-tenant error-rate window (tenant guard). It is only
+	// meaningful for fairness jobs (plain jobs carry no tenant), so an empty value
+	// is expected and simply omitted rather than recorded as a blank tenant.
+	if tid := deref(job.TenantID); tid != "" {
+		payload["tenant_id"] = tid
+	}
 	return payload
 }
 

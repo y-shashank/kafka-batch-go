@@ -236,6 +236,24 @@ fairness_enabled: true
 # alerts_resolve_ticks: 2
 # Or: KAFKA_BATCH_ALERTS_ENABLED=true KAFKA_BATCH_AI_ENCRYPTION_SALT=...
 
+# ── Tenant guard (per-tenant error-rate pause/throttle; fairness lanes only) ──
+# Shares kafka_batch:tenant_guard:* + kafka_batch:tenant_errors:* with Ruby. The
+# daemon feeds the per-tenant ok/fail window and honors enforcement (existing
+# partition pause + fairness weight); it never touches plain jobs. Manage live
+# thresholds and see/reset actions on the Ruby dashboard "Tenant guard" page —
+# the runtime settings there win over these YAML defaults.
+# tenant_guard_enabled: false
+# tenant_guard_window_seconds: 300
+# tenant_guard_min_samples: 50
+# tenant_guard_error_rate_pct: 25.0
+# tenant_guard_include_retries: false
+# tenant_guard_mitigation: throttle          # none | throttle | pause | throttle_then_pause
+# tenant_guard_throttle_weight: 0.1
+# tenant_guard_auto_release_seconds: 900      # auto-disengage after N sec (page can set manual-only)
+# tenant_guard_grace_ticks: 0
+# tenant_guard_reconcile_interval: 15
+# Or: KAFKA_BATCH_TENANT_GUARD_ENABLED=true
+
 # ── Code defaults not exposed in YAML (change requires code / future YAML keys) ─
 # retry_jitter: 0.1                    # unused in Go retry scheduling today
 # batch_ttl: 604800                    # sec — Redis batch hash TTL (7 days)
