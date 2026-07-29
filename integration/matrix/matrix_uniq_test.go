@@ -20,7 +20,7 @@ import (
 // runtime deduplicates against the same job enqueued from the other. Both
 // clients resolve job_type "integration.uniq_shared" to worker_class
 // "RubyUniqWorker", so they must compute an identical uniqueness fingerprint —
-// and therefore claim the SAME Redis lock (kafka_batch:uniq:<digest>).
+// and therefore claim the SAME Redis lock (kb:uniq:<digest>).
 //
 // The payload deliberately contains '<', '>', '&' and non-ASCII. Before the
 // encoding/json HTML-escape fix in pkg/uniq, Go serialized those characters as

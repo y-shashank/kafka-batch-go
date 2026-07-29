@@ -13,9 +13,13 @@ import (
 )
 
 // KeyPrefix is the Redis key prefix for uniqueness locks (wire-compatible with the Ruby
-// gem's KafkaBatch::Uniqueness keys). Exported so callers that need to build/inspect the
-// key directly (e.g. tests) don't have to hardcode the literal.
-const KeyPrefix = "kafka_batch:uniq:"
+// gem's KafkaBatch::Uniqueness::KEY_PREFIX). Exported so callers that need to build/inspect
+// the key directly (e.g. tests) don't have to hardcode the literal.
+//
+// MUST stay byte-identical to the Ruby constant — both runtimes share this keyspace, so a
+// mismatch would break cross-runtime dedup/release. Change the two in lock-step. Shortened
+// from "kafka_batch:uniq:" to trim ~16 bytes of RAM per lock.
+const KeyPrefix = "kb:uniq:"
 
 const keyPrefix = KeyPrefix
 
