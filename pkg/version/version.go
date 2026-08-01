@@ -1,4 +1,4 @@
 package version
 
-// Version is the kafka-batch-go release (keep in sync with git tag v0.0.17).
-const Version = "0.0.17"
+// Version is the kafka-batch-go release (keep in sync with git tag v0.0.18).
+const Version = "0.0.18"

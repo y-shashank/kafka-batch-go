@@ -3,7 +3,7 @@ package version
 import "testing"
 
 func TestVersion(t *testing.T) {
-	if Version != "0.0.17" {
-		t.Fatalf("Version = %q, want 0.0.17", Version)
+	if Version != "0.0.18" {
+		t.Fatalf("Version = %q, want 0.0.18", Version)
 	}
 }
