@@ -60,8 +60,25 @@ func (c *Control) snapshot(ctx context.Context) Snapshot {
 	}
 	c.mu.Unlock()
 
-	topics, _ := c.Client.SMembers(ctx, topicsKey).Result()
-	parts, _ := c.Client.SMembers(ctx, partitionsKey).Result()
+	topics, terr := c.Client.SMembers(ctx, topicsKey).Result()
+	parts, perr := c.Client.SMembers(ctx, partitionsKey).Result()
+	if terr != nil || perr != nil {
+		// Redis read failed. NEVER cache an empty "nothing paused" snapshot —
+		// that silently un-pauses a genuinely-paused topic for a full refresh
+		// interval (the pause set is a killswitch). Retain the last good snapshot
+		// and do NOT stamp lastLoad, so the next call retries immediately.
+		// Mirrors Ruby ConsumptionControl's @last_good_snapshot.
+		c.mu.Lock()
+		s := c.snap
+		loaded := !c.lastLoad.IsZero()
+		c.mu.Unlock()
+		if loaded {
+			return s
+		}
+		// No last-good yet: return empty but do not stamp, so we retry next call
+		// instead of latching unpaused for the whole interval.
+		return Snapshot{Topics: map[string]struct{}{}, Partitions: map[string]struct{}{}}
+	}
 	snap := Snapshot{
 		Topics:     toSet(topics),
 		Partitions: toSet(parts),

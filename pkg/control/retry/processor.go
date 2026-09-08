@@ -39,7 +39,11 @@ type Outcome struct {
 func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.SourceCoords) (Outcome, error) {
 	out := Outcome{CommitOffset: true}
 	var m map[string]interface{}
-	if err := json.Unmarshal(raw, &m); err != nil {
+	if err := json.Unmarshal(raw, &m); err != nil || m == nil {
+		// A literal JSON `null` (or a null Kafka value) unmarshals WITHOUT error
+		// into a nil map. Treat it as malformed like an unmarshal error — routing
+		// via dltRaw (which preserves the raw bytes) — so it can't reach dltMap's
+		// nil-map write and panic → poison-pill the whole retry partition.
 		dlt, key := dltRaw(raw, src.Topic)
 		out.DLTPayload = dlt
 		out.DLTKey = key
@@ -134,6 +138,11 @@ func dltRaw(raw []byte, topic string) ([]byte, string) {
 }
 
 func dltMap(m map[string]interface{}, raw []byte, topic string) ([]byte, string) {
+	if m == nil {
+		// Defensive: never write into a nil map (panics). Callers guard against
+		// this, but a null payload reaching here must degrade, not crash.
+		m = map[string]interface{}{}
+	}
 	m["dlt_type"] = "retry_routing"
 	m["dlt_source_topic"] = topic
 	m["dlt_raw_payload"] = string(raw)

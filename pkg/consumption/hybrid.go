@@ -40,7 +40,20 @@ func (c *HybridControl) snapshot(ctx context.Context) Snapshot {
 	}
 	c.mu.Unlock()
 
-	snap := c.loadSnapshot(ctx)
+	snap, ok := c.loadSnapshot(ctx)
+	if !ok {
+		// Both backends failed. Retain last-good and don't stamp lastLoad (same
+		// killswitch-safety reasoning as Control.snapshot); on the very first load
+		// return empty without stamping so the next call retries.
+		c.mu.Lock()
+		s := c.snap
+		loaded := !c.lastLoad.IsZero()
+		c.mu.Unlock()
+		if loaded {
+			return s
+		}
+		return Snapshot{Topics: map[string]struct{}{}, Partitions: map[string]struct{}{}}
+	}
 	c.mu.Lock()
 	c.snap = snap
 	c.lastLoad = now
@@ -48,20 +61,27 @@ func (c *HybridControl) snapshot(ctx context.Context) Snapshot {
 	return snap
 }
 
-func (c *HybridControl) loadSnapshot(ctx context.Context) Snapshot {
+// loadSnapshot returns (snapshot, ok). ok is false only when every configured
+// backend failed — the caller then keeps the last good snapshot rather than
+// caching an empty "nothing paused" result.
+func (c *HybridControl) loadSnapshot(ctx context.Context) (Snapshot, bool) {
 	if c.Redis != nil {
 		if err := c.Redis.Ping(ctx).Err(); err == nil {
-			topics, _ := c.Redis.SMembers(ctx, topicsKey).Result()
-			parts, _ := c.Redis.SMembers(ctx, partitionsKey).Result()
-			return Snapshot{Topics: toSet(topics), Partitions: toSet(parts)}
+			topics, terr := c.Redis.SMembers(ctx, topicsKey).Result()
+			parts, perr := c.Redis.SMembers(ctx, partitionsKey).Result()
+			if terr == nil && perr == nil {
+				return Snapshot{Topics: toSet(topics), Partitions: toSet(parts)}, true
+			}
+			// Redis reachable but a read failed — fall through to the MySQL
+			// fallback rather than returning an empty (unpaused) snapshot.
 		}
 	}
 	if c.MySQL != nil {
 		if snap, err := c.MySQL.Snapshot(ctx); err == nil {
-			return snap
+			return snap, true
 		}
 	}
-	return Snapshot{Topics: map[string]struct{}{}, Partitions: map[string]struct{}{}}
+	return Snapshot{Topics: map[string]struct{}{}, Partitions: map[string]struct{}{}}, false
 }
 
 func (c *HybridControl) TopicLevelPaused(ctx context.Context, group, topic string) bool {

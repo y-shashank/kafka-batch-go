@@ -115,10 +115,16 @@ func (r *Reader) Read(ctx context.Context, byPartition map[int32][]int64) (ReadR
 		remaining += len(pr.want)
 	}
 
+	// Bound the read by the deadline and per-partition offset span ONLY — never a
+	// global record cap. A prior global `scanned < 1000` cap truncated wide-span
+	// batches (offsets reflect produce time, not due time, so a claimed batch can
+	// span >1000 physical offsets on a busy topic — and any schedule_batch_size >
+	// 1000 always) leaving high-offset due jobs unread → read-missed → dead-
+	// lettered. Ruby bounds per-partition span (max_offset + SCAN_SLACK) with no
+	// global count cap; match that. The 5s deadline caps worst-case scan time.
 	deadline := time.Now().Add(5 * time.Second)
-	scanned := 0
 	const scanSlack = 1000
-	for time.Now().Before(deadline) && remaining > 0 && scanned < scanSlack {
+	for time.Now().Before(deadline) && remaining > 0 {
 		fetches := readCl.PollFetches(ctx)
 		if errs := fetches.Errors(); len(errs) > 0 {
 			return out, fmt.Errorf("poll scheduled topic: %v", errs[0].Err)
@@ -132,10 +138,18 @@ func (r *Reader) Read(ctx context.Context, byPartition map[int32][]int64) (ReadR
 				if pr.partition != rec.Partition {
 					continue
 				}
-				if rec.Offset > pr.maxOff+scanSlack {
-					continue
+				if len(pr.want) == 0 {
+					break // partition already satisfied or abandoned
 				}
-				scanned++
+				if rec.Offset > pr.maxOff+scanSlack {
+					// Read past this partition's wanted span (+slack): the still-
+					// wanted offsets are unreachable (gap/compaction). Abandon them
+					// so the loop can terminate; they surface upstream as read
+					// misses instead of stalling the scan for the full deadline.
+					remaining -= len(pr.want)
+					pr.want = map[int64]struct{}{}
+					break
+				}
 				if _, ok := pr.want[rec.Offset]; ok {
 					key := BuildKey(pr.partition, rec.Offset)
 					out.Found[key] = append([]byte(nil), rec.Value...)
