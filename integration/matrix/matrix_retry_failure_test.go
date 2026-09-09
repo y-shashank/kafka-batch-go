@@ -97,6 +97,15 @@ func runRetryFailureStoreScenario(t *testing.T, combo Combo, mysql bool, mysqlDS
 	}
 	jobID = batchJobID(batch, jobID, runtime)
 
+	// Ruby execution is driven by a blocking drain loop — no persistent Ruby
+	// worker is started for Exec.Ruby (see startGoControl). It must run BEFORE
+	// waiting for batch success, or nothing consumes the job during the wait.
+	// The drain must be long enough to cover fail → Go-control retry re-enqueue
+	// (retry delay) → success, matching the runner's retry_then_success_ruby.
+	if combo.Exec.Ruby {
+		s.DrainRubyExecution(120 * time.Second)
+	}
+
 	// No per-job failure metadata is ever written to Redis, so only the
 	// MySQL variant has a failure-store lifecycle to observe here.
 	if mysql {
@@ -104,9 +113,6 @@ func runRetryFailureStoreScenario(t *testing.T, combo Combo, mysql bool, mysqlDS
 	}
 
 	s.WaitBatchTimeout(ctx, 90*time.Second, batch.ID(), "success")
-	if combo.Exec.Ruby {
-		s.DrainRubyExecution(60 * time.Second)
-	}
 	if m := s.WaitMarkerAt(markerPath, 45*time.Second); m != jobID {
 		t.Fatalf("marker = %q want %q", m, jobID)
 	}
