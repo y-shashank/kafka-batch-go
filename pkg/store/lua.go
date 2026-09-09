@@ -1,5 +1,7 @@
 package store
 
+import "github.com/redis/go-redis/v9"
+
 // Lua scripts mirror lib/kafka_batch/stores/redis_store.rb (wire-compatible).
 //
 // Sidekiq-style batch completion:
@@ -24,13 +26,33 @@ local bit = seq - 1
 local ttl = tonumber(ARGV[3])
 local now = ARGV[4]
 local score = tonumber(ARGV[5])
+-- finished_ttl: retention applied to the hash/bitmaps/seq once the batch is
+-- terminal. Defaults to ttl when absent (wire-compatible with older callers).
+local finished_ttl = tonumber(ARGV[6]) or ttl
+if not finished_ttl or finished_ttl < 1 then finished_ttl = ttl end
+
+-- LATE-EVENT GUARD (must precede every bitmap read). Once a batch is terminal
+-- its bitmaps may already have been released by the shorter finished-batch
+-- retention. A late duplicate event would then see GETBIT==0, RE-CREATE the
+-- bitmap and INFLATE touched/completed counters on a finished batch — silent
+-- count corruption. Terminal + missing touch bitmap ⇒ duplicate by definition:
+-- every seq was necessarily counted for the batch to reach terminal at all.
+if (status == 'success' or status == 'complete') and redis.call('EXISTS', KEYS[2]) == 0 then
+  return {0, 'duplicate'}
+end
+
+-- Never re-arm the full running-batch TTL on an event that arrives AFTER the
+-- batch finished: the old script restarted the 7-day clock at the last event,
+-- so a trickle of late duplicates kept dead ledgers alive indefinitely.
+local eff_ttl = ttl
+if status == 'success' or status == 'complete' then eff_ttl = finished_ttl end
 local touched_new = 0
 local success_new = 0
 local failed_new = 0
 
 if redis.call('GETBIT', KEYS[2], bit) == 0 then
   redis.call('SETBIT', KEYS[2], bit, 1)
-  redis.call('EXPIRE', KEYS[2], ttl)
+  redis.call('EXPIRE', KEYS[2], eff_ttl)
   redis.call('HINCRBY', KEYS[1], 'touched_count', 1)
   touched_new = 1
 elseif op == 'executed' then
@@ -40,16 +62,24 @@ end
 if op == 'success' then
   if redis.call('GETBIT', KEYS[6], bit) == 0 then
     redis.call('SETBIT', KEYS[6], bit, 1)
-    redis.call('EXPIRE', KEYS[6], ttl)
+    redis.call('EXPIRE', KEYS[6], eff_ttl)
     redis.call('HINCRBY', KEYS[1], 'completed_count', 1)
     success_new = 1
+    -- A seq counted terminal-failed can later succeed (a zombie consumer whose
+    -- retry pipeline already emitted the terminal failure). Swap the count
+    -- instead of double-counting, so completed+failed never exceeds touched —
+    -- double-counting fired callbacks early with another seq still running.
+    if redis.call('GETBIT', KEYS[7], bit) == 1 then
+      redis.call('SETBIT', KEYS[7], bit, 0)
+      redis.call('HINCRBY', KEYS[1], 'failed_count', -1)
+    end
   elseif touched_new == 0 then
     return {0, 'duplicate'}
   end
 elseif op == 'failed' then
   if redis.call('GETBIT', KEYS[7], bit) == 0 and redis.call('GETBIT', KEYS[6], bit) == 0 then
     redis.call('SETBIT', KEYS[7], bit, 1)
-    redis.call('EXPIRE', KEYS[7], ttl)
+    redis.call('EXPIRE', KEYS[7], eff_ttl)
     redis.call('HINCRBY', KEYS[1], 'failed_count', 1)
     failed_new = 1
   elseif touched_new == 0 then
@@ -63,7 +93,7 @@ if status == 'success' or status == 'complete' then
   end
 end
 
-redis.call('EXPIRE', KEYS[1], ttl)
+redis.call('EXPIRE', KEYS[1], eff_ttl)
 
 local total     = tonumber(redis.call('HGET', KEYS[1], 'total_jobs'))      or 0
 local touched   = tonumber(redis.call('HGET', KEYS[1], 'touched_count'))   or 0
@@ -89,7 +119,6 @@ if terminal then
   if cur == 'running' then
     redis.call('HSET', KEYS[1], 'status', terminal)
     redis.call('HSET', KEYS[1], 'finished_at', now)
-    redis.call('EXPIRE', KEYS[1], ttl)
     local batch_id = redis.call('HGET', KEYS[1], 'id')
     if batch_id then
       redis.call('ZREM', KEYS[3], batch_id)
@@ -97,6 +126,18 @@ if terminal then
     end
     redis.call('HINCRBY', KEYS[5], 'running', -1)
     redis.call('HINCRBY', KEYS[5], terminal, 1)
+    -- Terminal retention: the running-batch TTL keeps a batch alive while work
+    -- is in flight; a FINISHED batch only needs to outlive result reads and
+    -- late-duplicate suppression. Applying finished_ttl to the hash, the three
+    -- bitmaps and the seq allocator is the single largest ledger RAM lever
+    -- (bitmaps alone are 3 × total_jobs/8 bytes per batch). Safe because the
+    -- late-event guard above turns a post-expiry event into a duplicate
+    -- instead of re-creating bitmaps.
+    redis.call('EXPIRE', KEYS[1], finished_ttl)
+    redis.call('EXPIRE', KEYS[2], finished_ttl)
+    redis.call('EXPIRE', KEYS[6], finished_ttl)
+    redis.call('EXPIRE', KEYS[7], finished_ttl)
+    if KEYS[8] and KEYS[8] ~= '' then redis.call('EXPIRE', KEYS[8], finished_ttl) end
   end
   if redis.call('HSETNX', KEYS[1], 'complete_callback_dispatched_at', now) == 1 then
     redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', now)
@@ -250,9 +291,14 @@ if status == 'running' then
     if terminal == 'success' and redis.call('HSETNX', KEYS[1], 'success_callback_dispatched_at', ARGV[1]) == 1 then
       fire_success = 1
     end
-    if fire_success == 1 then return {1, 'success'} end
-    if fire_complete == 1 then return {1, terminal} end
-    return {1, terminal}
+    -- Mirror batch_done_job's claim-based outcomes exactly. A claim this call
+    -- did NOT win was already dispatched by a concurrent completion (or the
+    -- early-complete path) — returning {1, ...} for it would fire the same
+    -- callback twice.
+    if fire_success == 1 and fire_complete == 1 then return {1, 'success'} end
+    if fire_success == 1 then return {1, 'success_only'} end
+    if fire_complete == 1 then return {1, 'complete'} end
+    return {2, 'sealed'}
   end
   if touched >= total and total > 0 then
     if redis.call('HSETNX', KEYS[1], 'complete_callback_dispatched_at', ARGV[1]) == 1 then
@@ -295,6 +341,20 @@ redis.call('HINCRBY', KEYS[2], 'running', -1)
 redis.call('HINCRBY', KEYS[2], ARGV[1], 1)
 return 1
 `
+
+// Script wrappers so call sites use EVALSHA (with automatic EVAL fallback on
+// NOSCRIPT) instead of shipping the full Lua source on every invocation.
+var (
+	batchDoneJobScript          = redis.NewScript(batchDoneJobLua)
+	claimCallbackScript         = redis.NewScript(claimCallbackLua)
+	recordCallbackRunnerScript  = redis.NewScript(recordCallbackRunnerLua)
+	createBatchScript           = redis.NewScript(createBatchLua)
+	addJobsScript               = redis.NewScript(addJobsLua)
+	sealBatchScript             = redis.NewScript(sealBatchLua)
+	acquireLockScript           = redis.NewScript(acquireLockLua)
+	releaseLockScript           = redis.NewScript(releaseLockLua)
+	markFinishedIfRunningScript = redis.NewScript(markFinishedIfRunningLua)
+)
 
 func batchKey(id string) string     { return keyPrefix + ":" + id }
 func bitmapKey(id string) string    { return keyPrefix + ":bitmap:" + id }

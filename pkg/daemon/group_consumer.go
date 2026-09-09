@@ -14,9 +14,11 @@ import (
 	"github.com/y-shashank/kafka-batch-go/pkg/liveness"
 )
 
-// defaultDispatchPollRecords caps fair-dispatch polls at one record so backpressure
-// and AllowRebalance run per message (franz-go BlockRebalanceOnPoll guidance).
-const defaultDispatchPollRecords = 1
+// defaultDispatchPollRecords bounds fair-dispatch polls. Batching cuts the
+// dispatch path from one poll+enqueue round trip per message (~1/RTT msg/s
+// throughput ceiling) to one per batch; per-partition stop-on-failure in the
+// handler loop preserves the old one-at-a-time loss semantics.
+const defaultDispatchPollRecords = 64
 
 // defaultPriorityPollRecords bounds priority worker polls per franz-go guidance.
 const defaultPriorityPollRecords = 100

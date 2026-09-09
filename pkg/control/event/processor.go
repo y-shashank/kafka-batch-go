@@ -24,6 +24,16 @@ type BatchProducer interface {
 	ProduceMany(ctx context.Context, reqs ...kafkaclient.ProduceRequest) error
 }
 
+// SyncBatchProducer batches callback produces with per-record outcomes.
+// Preferred over BatchProducer: on partial failure only the records that
+// actually failed are retried. Preclaimed callbacks skip the consumer's
+// ClaimCallback dedup, so re-producing an already-delivered one invokes the
+// callback twice — and its claim is already stamped in Redis, so it cannot be
+// "demoted" to a claimed callback either.
+type SyncBatchProducer interface {
+	ProduceManySync(ctx context.Context, records []kafkaclient.ProduceRecord) ([]kafkaclient.ProduceOutcome, error)
+}
+
 // Processor applies completion events to the batch ledger.
 type Processor struct {
 	Cfg      config.Daemon
@@ -148,11 +158,47 @@ func (p *Processor) produceCallbacks(ctx context.Context, callbacks []protocol.C
 	if len(callbacks) == 0 {
 		return nil
 	}
-	// Fast path: try the batch produce once when supported. If it fails we do NOT
-	// retry the whole batch (a partial success would re-emit already-produced
-	// callbacks, and Preclaimed callbacks skip the consumer's ClaimCallback dedup
-	// → double-invoke). Instead fall back to per-item produce, which has
-	// unambiguous per-callback success so retries never double-produce.
+	// Preferred path: batch produce with per-record outcomes. Only the records
+	// that actually failed are retried (then dead-lettered) — never the whole
+	// batch: on a partial failure the successful records ARE durably in Kafka,
+	// and re-producing a Preclaimed callback double-invokes it (the consumer
+	// skips ClaimCallback dedup for preclaimed messages).
+	if sbp, ok := p.Producer.(SyncBatchProducer); ok {
+		records := make([]kafkaclient.ProduceRecord, 0, len(callbacks))
+		marshalled := true
+		for _, cb := range callbacks {
+			raw, err := json.Marshal(cb)
+			if err != nil {
+				marshalled = false
+				break
+			}
+			records = append(records, kafkaclient.ProduceRecord{Topic: p.Cfg.CallbacksTopic, Key: cb.BatchID, Payload: raw})
+		}
+		if marshalled {
+			outs, _ := sbp.ProduceManySync(ctx, records)
+			if len(outs) == len(callbacks) {
+				for i, cb := range callbacks {
+					if outs[i].Err == nil {
+						p.recordCallbackRunners(ctx, []protocol.CallbackMessage{cb})
+						continue
+					}
+					if err := p.produceOneCallback(ctx, cb); err != nil {
+						p.deadLetterCallback(ctx, cb, err)
+					} else {
+						p.recordCallbackRunners(ctx, []protocol.CallbackMessage{cb})
+					}
+				}
+				return nil
+			}
+			// Outcome shape mismatch: fall through to the per-item path, which
+			// re-produces everything but is the only option left.
+		}
+	}
+	// Legacy batch path for producers without per-record outcomes. All-or-nothing:
+	// on ANY error we cannot know which records are durable, so do NOT fall back
+	// to re-producing everything — go per-item only when the batch produce is
+	// certain to have written nothing... which we cannot know either. Producers
+	// should implement SyncBatchProducer; this path exists for custom test fakes.
 	if bp, ok := p.Producer.(BatchProducer); ok {
 		reqs := make([]kafkaclient.ProduceRequest, 0, len(callbacks))
 		marshalled := true

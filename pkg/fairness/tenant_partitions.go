@@ -11,6 +11,66 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+var tenantPartitionCheckoutScript = redis.NewScript(checkoutLua)
+
+var tenantPartitionWarmScript = redis.NewScript(warmLua)
+
+// warmLua reconciles a lane's free-partition set from the tenant→partition map
+// ATOMICALLY. The old Go/Ruby version computed `free` from an HGETALL snapshot
+// and then SADD'd the missing members in separate round trips: a checkout
+// (SPOP + HSET) landing in that window put the just-taken partition back into
+// the free set, so a second tenant could be assigned the same partition —
+// breaking per-tenant ingest isolation. Doing the read and the writes inside
+// one script closes the window.
+//
+// KEYS[1]=map hash KEYS[2]=free set KEYS[3]=meta (partition count)
+// ARGV[1]=live partition count
+// Returns the free-set size after reconciliation.
+const warmLua = `
+local count = tonumber(ARGV[1])
+if not count or count < 1 then return -1 end
+
+local taken = {}
+local raw = redis.call('HGETALL', KEYS[1])
+for i = 1, #raw, 2 do
+  local tenant = raw[i]
+  local p = tonumber(raw[i + 1])
+  if p and p >= 0 and p < count then
+    taken[p] = true
+  else
+    redis.call('HDEL', KEYS[1], tenant)
+  end
+end
+
+local stored = tonumber(redis.call('GET', KEYS[3]) or '-1')
+if stored ~= count then
+  -- Partition count changed (or first warm): rebuild the free set wholesale.
+  redis.call('DEL', KEYS[2])
+  for p = 0, count - 1 do
+    if not taken[p] then redis.call('SADD', KEYS[2], p) end
+  end
+  redis.call('SET', KEYS[3], count)
+  return redis.call('SCARD', KEYS[2])
+end
+
+-- Steady state: drop out-of-range members, add genuinely-free ones.
+local cur = {}
+for _, s in ipairs(redis.call('SMEMBERS', KEYS[2])) do
+  local p = tonumber(s)
+  if not p or p < 0 or p >= count then
+    redis.call('SREM', KEYS[2], s)
+  else
+    cur[p] = true
+  end
+end
+for p = 0, count - 1 do
+  if not taken[p] and not cur[p] then
+    redis.call('SADD', KEYS[2], p)
+  end
+end
+return redis.call('SCARD', KEYS[2])
+`
+
 const checkoutLua = `
 local tenant = ARGV[1]
 local count  = tonumber(ARGV[2])
@@ -43,15 +103,16 @@ type PartitionCounter interface {
 
 // TenantPartitions resolves tenant_id → fairness ingest partition (Ruby parity).
 type TenantPartitions struct {
-	rdb     *redis.Client
-	static  map[string]int32
-	dynamic bool
-	cacheTTL time.Duration
-	counter PartitionCounter
+	rdb         *redis.Client
+	static      map[string]int32
+	dynamic     bool
+	cacheTTL    time.Duration
+	counter     PartitionCounter
 	ingestTopic func(lane string) string
 
-	mu    sync.Mutex
-	cache map[cacheKey]cacheEntry
+	mu       sync.Mutex
+	cache    map[cacheKey]cacheEntry
+	lastWarm map[string]time.Time
 }
 
 type cacheKey struct {
@@ -66,11 +127,11 @@ type cacheEntry struct {
 
 // TenantPartitionsConfig configures dynamic checkout.
 type TenantPartitionsConfig struct {
-	Static                   map[string]int32
-	Dynamic                  bool
-	CacheTTL                 time.Duration
-	Counter                  PartitionCounter
-	IngestTopic              func(lane string) string
+	Static      map[string]int32
+	Dynamic     bool
+	CacheTTL    time.Duration
+	Counter     PartitionCounter
+	IngestTopic func(lane string) string
 }
 
 // NewTenantPartitions builds a resolver.
@@ -109,7 +170,7 @@ func (tp *TenantPartitions) Resolve(ctx context.Context, tenantID, lane string) 
 	if !tp.dynamic || tp.rdb == nil {
 		return nil
 	}
-	_ = tp.Warm(ctx, lane)
+	tp.warmThrottled(ctx, lane)
 	part, err := tp.checkout(ctx, lane, tenantID)
 	if err != nil || part == nil {
 		return nil
@@ -118,7 +179,8 @@ func (tp *TenantPartitions) Resolve(ctx context.Context, tenantID, lane string) 
 	return part
 }
 
-// Warm seeds the free-partition pool for a lane.
+// Warm seeds/reconciles the free-partition pool for a lane in one atomic Lua
+// call (see warmLua for the race it closes).
 func (tp *TenantPartitions) Warm(ctx context.Context, lane string) error {
 	if !tp.dynamic || tp.rdb == nil || tp.counter == nil {
 		return nil
@@ -128,60 +190,27 @@ func (tp *TenantPartitions) Warm(ctx context.Context, lane string) error {
 	if err != nil || count < 1 {
 		return err
 	}
+	return tenantPartitionWarmScript.Run(ctx, tp.rdb,
+		[]string{mapKey(lane), freeKey(lane), metaKey(lane)}, count).Err()
+}
 
-	mapKey := mapKey(lane)
-	freeKey := freeKey(lane)
-	metaKey := metaKey(lane)
-
-	raw, err := tp.rdb.HGetAll(ctx, mapKey).Result()
-	if err != nil {
-		return err
+// warmThrottled runs Warm at most once per cacheTTL per lane. Resolve used to
+// call Warm on EVERY cache miss — 4+ Redis round trips per cold tenant, on the
+// enqueue path — even though the free pool only changes when the topic is
+// repartitioned or a partition is released.
+func (tp *TenantPartitions) warmThrottled(ctx context.Context, lane string) {
+	tp.mu.Lock()
+	last, ok := tp.lastWarm[lane]
+	if ok && time.Since(last) < tp.cacheTTL {
+		tp.mu.Unlock()
+		return
 	}
-	valid := map[int]struct{}{}
-	for tenant, partStr := range raw {
-		p := atoi(partStr)
-		if p >= 0 && p < count {
-			valid[p] = struct{}{}
-			_ = tenant
-		} else {
-			_ = tp.rdb.HDel(ctx, mapKey, tenant).Err()
-		}
+	if tp.lastWarm == nil {
+		tp.lastWarm = map[string]time.Time{}
 	}
-	taken := make([]int, 0, len(valid))
-	for p := range valid {
-		taken = append(taken, p)
-	}
-	free := missingPartitions(count, taken)
-
-	stored, _ := tp.rdb.Get(ctx, metaKey).Int()
-	if stored != count {
-		_ = tp.rdb.Del(ctx, freeKey).Err()
-		if len(free) > 0 {
-			members := make([]interface{}, len(free))
-			for i, p := range free {
-				members[i] = p
-			}
-			_ = tp.rdb.SAdd(ctx, freeKey, members...).Err()
-		}
-		_ = tp.rdb.Set(ctx, metaKey, count, 0).Err()
-		return nil
-	}
-
-	current, _ := tp.rdb.SMembers(ctx, freeKey).Result()
-	curSet := map[int]struct{}{}
-	for _, s := range current {
-		p := atoi(s)
-		curSet[p] = struct{}{}
-		if p < 0 || p >= count {
-			_ = tp.rdb.SRem(ctx, freeKey, s).Err()
-		}
-	}
-	for _, p := range free {
-		if _, ok := curSet[p]; !ok {
-			_ = tp.rdb.SAdd(ctx, freeKey, p).Err()
-		}
-	}
-	return nil
+	tp.lastWarm[lane] = time.Now()
+	tp.mu.Unlock()
+	_ = tp.Warm(ctx, lane)
 }
 
 func (tp *TenantPartitions) checkout(ctx context.Context, lane, tenantID string) (*int32, error) {
@@ -190,7 +219,7 @@ func (tp *TenantPartitions) checkout(ctx context.Context, lane, tenantID string)
 	if err != nil || count < 1 {
 		return nil, err
 	}
-	res, err := tp.rdb.Eval(ctx, checkoutLua, []string{mapKey(lane), freeKey(lane)}, tenantID, count).Int()
+	res, err := tenantPartitionCheckoutScript.Run(ctx, tp.rdb, []string{mapKey(lane), freeKey(lane)}, tenantID, count).Int()
 	if err != nil {
 		return nil, err
 	}

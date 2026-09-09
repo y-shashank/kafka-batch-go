@@ -64,7 +64,7 @@ func (s *RedisStore) CreateBatch(ctx context.Context, p CreateBatchParams) (bool
 		lockedAt = now.Format(time.RFC3339)
 	}
 	ttlSec := strconv.Itoa(int(s.ttl.Seconds()))
-	res, err := s.client.Eval(ctx, createBatchLua, []string{batchKey(p.ID)},
+	res, err := createBatchScript.Run(ctx, s.client, []string{batchKey(p.ID)},
 		p.ID,
 		strconv.FormatInt(p.TotalJobs, 10),
 		p.OnSuccess,
@@ -101,7 +101,7 @@ func (s *RedisStore) AddJobs(ctx context.Context, id string, count int64) (AddJo
 		return out, fmt.Errorf("redis store not configured")
 	}
 	ttlSec := strconv.Itoa(int(s.ttl.Seconds()))
-	raw, err := s.client.Eval(ctx, addJobsLua,
+	raw, err := addJobsScript.Run(ctx, s.client,
 		[]string{batchKey(id), seqKey(id)},
 		strconv.FormatInt(count, 10), ttlSec,
 	).Result()
@@ -136,7 +136,7 @@ func (s *RedisStore) SealBatch(ctx context.Context, id string) (SealBatchResult,
 	now := time.Now().UTC()
 	ttlSec := strconv.Itoa(int(s.ttl.Seconds()))
 	score := fmt.Sprintf("%f", float64(now.UnixNano())/1e9)
-	raw, err := s.client.Eval(ctx, sealBatchLua,
+	raw, err := sealBatchScript.Run(ctx, s.client,
 		[]string{batchKey(id), countsKey, runningIndex, doneIndex, bitmapKey(id), okBitmapKey(id), failBitmapKey(id)},
 		now.Format(time.RFC3339), ttlSec, score,
 	).Slice()

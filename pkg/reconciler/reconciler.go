@@ -146,6 +146,12 @@ func reconcileRunning(ctx context.Context, st *store.RedisStore, prod Producer, 
 		return outcomeSkippedNotRunning
 	}
 	batch = fresh
+	// Recompute from the fresh read: the listing snapshot's total/done may
+	// predate jobs added since (AddJobs while running) — finalizing on stale
+	// counts would fire callbacks with jobs still in flight, and their later
+	// completions would be dropped as duplicates.
+	total = batch.TotalJobs
+	done = batch.CompletedCount + batch.FailedCount
 
 	if batch.LockedAt == "" {
 		log.Printf("[kbatch-reconciler] stuck-running batch_id=%s — still open (unlocked), skipping", id)

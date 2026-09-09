@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -9,44 +10,91 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/y-shashank/kafka-batch-go/pkg/config"
-	"github.com/y-shashank/kafka-batch-go/pkg/kafkaclient"
-	"github.com/y-shashank/kafka-batch-go/pkg/protocol"
 	"github.com/y-shashank/kafka-batch-go/pkg/store"
 	"github.com/y-shashank/kafka-batch-go/pkg/uniq"
 )
 
-func TestScheduleEntriesFrom(t *testing.T) {
-	runAt := time.Unix(1_700_000_000, 0).UTC()
-	msgs := []protocol.JobMessage{{JobID: "a"}, {JobID: "b"}}
-	dels := []kafkaclient.Delivery{{Partition: 1, Offset: 10}, {Partition: 2, Offset: 20}}
-	got := scheduleEntriesFrom(msgs, dels, runAt, "batch")
-	if len(got) != 2 {
-		t.Fatalf("len=%d", len(got))
+func TestProducedFlags(t *testing.T) {
+	if got := producedFlags(context.Canceled); got != nil {
+		t.Fatalf("non-partial error flags=%v", got)
 	}
-	if got[0].JobID != "a" || got[0].Partition != 1 || got[0].Offset != 10 || got[0].BatchID != "batch" {
-		t.Fatalf("entry0=%+v", got[0])
+	if got := producedFlags(&PartialProduceError{Message: "x"}); got != nil {
+		t.Fatalf("nil-flag partial error flags=%v", got)
 	}
-	if !got[1].RunAt.Equal(runAt) || got[1].JobID != "b" {
-		t.Fatalf("entry1=%+v", got[1])
+	flags := []bool{true, false, true}
+	pe := &PartialProduceError{Message: "x", ProducedCount: 2, Produced: flags}
+	if got := producedFlags(pe); len(got) != 3 || !got[0] || got[1] || !got[2] {
+		t.Fatalf("flags=%v", got)
 	}
 }
 
-func TestNextBatchSeq(t *testing.T) {
-	b := &Batch{}
-	if _, err := b.nextBatchSeq(); err == nil {
+func TestSeqWindowTake(t *testing.T) {
+	var empty seqWindow
+	if _, err := empty.take(); err == nil {
 		t.Fatal("expected no reserved slots")
 	}
-	b.seqCursor, b.seqEnd = 1, 2
-	seq, err := b.nextBatchSeq()
+	w := seqWindow{next: 1, end: 2}
+	seq, err := w.take()
 	if err != nil || seq != 1 {
 		t.Fatalf("seq=%d err=%v", seq, err)
 	}
-	seq, err = b.nextBatchSeq()
+	seq, err = w.take()
 	if err != nil || seq != 2 {
 		t.Fatalf("seq=%d err=%v", seq, err)
 	}
-	if _, err := b.nextBatchSeq(); err == nil {
+	if _, err := w.take(); err == nil {
 		t.Fatal("expected too few slots")
+	}
+}
+
+// Concurrent pushes into one *Batch must receive disjoint batch_seq values —
+// the old struct-level cursor was overwritten by every reserve, silently
+// reusing/skipping seqs and corrupting the completion bitmap.
+func TestConcurrentReserveWindowsAreDisjoint(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := store.NewRedisStore(rdb, time.Hour)
+	c := &Client{cfg: DefaultConfig(), store: st}
+	ctx := context.Background()
+	if ok, err := st.CreateBatch(ctx, store.CreateBatchParams{ID: "cw", Sealed: false}); err != nil || !ok {
+		t.Fatalf("create ok=%v err=%v", ok, err)
+	}
+	b := &Batch{client: c, id: "cw"}
+
+	const goroutines = 8
+	const perG = 25
+	seqs := make(chan int64, goroutines*perG)
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			win, err := b.reserve(ctx, perG)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			for i := 0; i < perG; i++ {
+				s, err := win.take()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				seqs <- s
+			}
+		}()
+	}
+	wg.Wait()
+	close(seqs)
+	seen := map[int64]bool{}
+	for s := range seqs {
+		if seen[s] {
+			t.Fatalf("batch_seq %d issued twice", s)
+		}
+		seen[s] = true
+	}
+	if len(seen) != goroutines*perG {
+		t.Fatalf("issued %d seqs, want %d", len(seen), goroutines*perG)
 	}
 }
 
@@ -156,9 +204,37 @@ func TestRollbackPlans(t *testing.T) {
 		{jobID: "j-keep", payload: payload, fp: fp},
 		{jobID: "j-drop", payload: map[string]interface{}{"x": 2}, fp: ""},
 	}
-	b.rollbackPlans(ctx, entry, "echo", plans, 1)
+	// Non-prefix flags: the produced plan is FIRST — rollback must skip it and
+	// only roll back the failed one (deliveries complete out of input order).
+	b.rollbackPlans(ctx, entry, "echo", plans, []bool{true, false})
 	row, _ := st.FindBatch(ctx, "rb")
 	if row == nil || row.TotalJobs != 1 {
+		t.Fatalf("row=%+v", row)
+	}
+	// The produced job's uniq lock must survive rollback: releasing it would
+	// let a duplicate enqueue while the job is still pending.
+	if ok, _ := c.uniq.Claim(ctx, "go:echo", payload, "j-other"); ok {
+		t.Fatal("produced plan's uniq lock was released during rollback")
+	}
+}
+
+func TestRollbackPlansNilRollsBackAll(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := store.NewRedisStore(rdb, time.Hour)
+	c := &Client{cfg: DefaultConfig(), uniq: uniq.NewLocker(rdb, time.Hour), store: st}
+	ctx := context.Background()
+	if ok, err := st.CreateBatch(ctx, store.CreateBatchParams{ID: "rb2", Sealed: false}); err != nil || !ok {
+		t.Fatalf("create ok=%v err=%v", ok, err)
+	}
+	if _, err := st.AddJobs(ctx, "rb2", 2); err != nil {
+		t.Fatal(err)
+	}
+	b := &Batch{client: c, id: "rb2"}
+	plans := []pushPlan{{jobID: "a"}, {jobID: "b"}}
+	b.rollbackPlans(ctx, config.HandlerEntry{}, "echo", plans, nil)
+	row, _ := st.FindBatch(ctx, "rb2")
+	if row == nil || row.TotalJobs != 0 {
 		t.Fatalf("row=%+v", row)
 	}
 }
@@ -198,19 +274,24 @@ func TestReserveStatuses(t *testing.T) {
 		t.Fatalf("create ok=%v err=%v", ok, err)
 	}
 	b = &Batch{client: c, id: "open"}
-	seq, err := b.reserve(ctx, 1)
+	win, err := b.reserve(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq, err := win.take()
 	if err != nil || seq < 1 {
 		t.Fatalf("seq=%d err=%v", seq, err)
 	}
-	if b.seqCursor == 0 || b.seqEnd == 0 {
-		t.Fatalf("seq window cursor=%d end=%d", b.seqCursor, b.seqEnd)
-	}
 
-	if _, err := b.reserve(ctx, 3); err != nil {
+	win3, err := b.reserve(ctx, 3)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if b.seqEnd-b.seqCursor+1 < 0 {
-		t.Fatalf("bad window cursor=%d end=%d", b.seqCursor, b.seqEnd)
+	if win3.end-win3.next+1 != 3 {
+		t.Fatalf("bad window next=%d end=%d", win3.next, win3.end)
+	}
+	if win3.next <= seq {
+		t.Fatalf("windows overlap: first seq=%d second window starts at %d", seq, win3.next)
 	}
 
 	ok, err = st.CreateBatch(ctx, store.CreateBatchParams{ID: "sealed", Sealed: true})

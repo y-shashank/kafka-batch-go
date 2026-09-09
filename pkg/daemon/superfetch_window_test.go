@@ -87,7 +87,7 @@ func TestDispatchClaimsAheadOfPerformPool(t *testing.T) {
 			t.Fatalf("claim %s: %+v %v", jobID, claim, err)
 		}
 		cl.MarkCommitRecords(rec)
-		stop := exec.startRenew(life, jobID, claim.Fence)
+		stop := exec.registerRenew(life, jobID, claim.Fence)
 		exec.inFlight.Store(jobID, struct{}{})
 		go exec.perform(life, rec, jobID, claim.Fence, "g", stop)
 	}

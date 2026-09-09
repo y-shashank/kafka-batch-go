@@ -142,7 +142,7 @@ func TestRollbackWorkerPlans(t *testing.T) {
 	_, _ = c.uniq.Claim(context.Background(), "Orders::ProcessWorker", payload, "j1")
 	c.rollbackWorkerPlans(entry, "Orders::ProcessWorker", []workerPushPlan{
 		{jobID: "j1", payload: payload, fp: ""},
-	}, 0)
+	}, nil)
 	ok, err := c.uniq.Claim(context.Background(), "Orders::ProcessWorker", payload, "j2")
 	if err != nil || !ok {
 		t.Fatalf("reclaim ok=%v err=%v", ok, err)
@@ -161,7 +161,7 @@ func TestRollbackWorkerPlans(t *testing.T) {
 	b.rollbackWorkerPlans(ctx, entry, "Orders::ProcessWorker", []workerPushPlan{
 		{jobID: "kept", payload: map[string]interface{}{"z": 9}, fp: "x"},
 		{jobID: "j-drop", payload: map[string]interface{}{"z": 2}, fp: ""},
-	}, 1)
+	}, []bool{true, false})
 	row, _ := c.store.FindBatch(ctx, "wb")
 	if row == nil || row.TotalJobs != 1 {
 		t.Fatalf("row=%+v", row)

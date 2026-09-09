@@ -114,6 +114,19 @@ func (r *Reporter) JobFinished(ctx context.Context, jobID string) {
 	_ = r.Client.Del(ctx, jobPrefix+r.ConsumerID+":"+jobID).Err()
 }
 
+// NoteTopic records the most recently consumed topic in memory only. Hot paths
+// (per-record / per-batch) must use this instead of Heartbeat: the heartbeat is
+// per consumer, not per job, and StartHeartbeatLoop publishes the noted topic
+// to Redis on its fixed interval.
+func (r *Reporter) NoteTopic(topic string) {
+	if r == nil || topic == "" {
+		return
+	}
+	r.mu.Lock()
+	r.lastTopic = topic
+	r.mu.Unlock()
+}
+
 func (r *Reporter) Heartbeat(ctx context.Context, topic string) {
 	if r == nil || r.Client == nil {
 		return

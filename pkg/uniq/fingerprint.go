@@ -10,6 +10,8 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/y-shashank/kafka-batch-go/pkg/instrument"
 )
 
 // KeyPrefix is the Redis key prefix for uniqueness locks (wire-compatible with the Ruby
@@ -29,6 +31,8 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
 end
 return 0
 `
+
+var releaseScript = redis.NewScript(releaseLua)
 
 // Locker manages per-worker uniqueness locks (Ruby KafkaBatch::Uniqueness).
 type Locker struct {
@@ -51,7 +55,9 @@ func (l *Locker) Claim(ctx context.Context, workerClassName string, payload map[
 	key := redisKey(workerClassName, payload)
 	ok, err := l.client.SetNX(ctx, key, jobID, l.ttl).Result()
 	if err != nil {
-		// Fail open like Ruby when Redis is unavailable.
+		// Fail open like Ruby when Redis is unavailable — but never silently:
+		// a retrying upstream mass-enqueues duplicates during the brownout.
+		instrument.UniqClaimFailedOpen(workerClassName, jobID, 1, err)
 		return true, nil
 	}
 	return ok, nil
@@ -87,6 +93,9 @@ func (l *Locker) ClaimMany(ctx context.Context, inputs []ClaimInput) []bool {
 		cmds[i] = pipe.SetNX(ctx, key, in.JobID, l.ttl)
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
+		// Fail open (Ruby parity) — but never silently: the whole batch is
+		// assumed claimed, so a retrying upstream duplicates all of it.
+		instrument.UniqClaimFailedOpen("", "", len(inputs), err)
 		for i := range out {
 			out[i] = true
 		}
@@ -95,6 +104,7 @@ func (l *Locker) ClaimMany(ctx context.Context, inputs []ClaimInput) []bool {
 	for i, cmd := range cmds {
 		ok, err := cmd.Result()
 		if err != nil {
+			instrument.UniqClaimFailedOpen(inputs[i].WorkerClassName, inputs[i].JobID, 1, err)
 			out[i] = true
 		} else {
 			out[i] = ok
@@ -127,7 +137,7 @@ func ReleaseLock(ctx context.Context, client *redis.Client, fpHex, jobID string)
 		return nil
 	}
 	key := keyPrefix + string(bin)
-	return client.Eval(ctx, releaseLua, []string{key}, jobID).Err()
+	return releaseScript.Run(ctx, client, []string{key}, jobID).Err()
 }
 
 // DigestHex returns the 32-char hex fingerprint for _uniq_fp on the wire.

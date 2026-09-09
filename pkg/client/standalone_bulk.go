@@ -45,9 +45,13 @@ func (c *Client) planStandalonePushes(ctx context.Context, jobType string, paylo
 	return entry, plans, jobIDs, nil
 }
 
-func (c *Client) rollbackStandalonePlans(entry config.HandlerEntry, jobType string, plans []pushPlan, produced int) {
-	for i := produced; i < len(plans); i++ {
-		p := plans[i]
+// rollbackStandalonePlans releases uniq locks for every plan NOT marked
+// produced. produced is indexed 1:1 with plans; nil rolls back everything.
+func (c *Client) rollbackStandalonePlans(entry config.HandlerEntry, jobType string, plans []pushPlan, produced []bool) {
+	for i, p := range plans {
+		if i < len(produced) && produced[i] {
+			continue
+		}
 		c.releaseUniq(entry, jobType, p.payload, p.jobID, p.fp)
 	}
 }
@@ -70,7 +74,7 @@ func (c *Client) EnqueueManyJobs(ctx context.Context, jobType string, payloads [
 	for _, p := range plans {
 		msg, err := c.buildMessage(entry, jobType, p.payload, p.jobID, nil, opts, nil)
 		if err != nil {
-			c.rollbackStandalonePlans(entry, jobType, plans, 0)
+			c.rollbackStandalonePlans(entry, jobType, plans, nil)
 			return nil, err
 		}
 		if tid != "" && msg.TenantID == nil {
@@ -78,7 +82,7 @@ func (c *Client) EnqueueManyJobs(ctx context.Context, jobType string, payloads [
 		}
 		raw, err := json.Marshal(msg)
 		if err != nil {
-			c.rollbackStandalonePlans(entry, jobType, plans, 0)
+			c.rollbackStandalonePlans(entry, jobType, plans, nil)
 			return nil, err
 		}
 		route := c.routeFor(entry, p.jobID, tid, nil)
@@ -112,7 +116,7 @@ func (c *Client) EnqueueManyJobsAt(ctx context.Context, runAt interface{}, jobTy
 	for _, p := range plans {
 		msg, err := c.buildMessage(entry, jobType, p.payload, p.jobID, nil, opts, nil)
 		if err != nil {
-			c.rollbackStandalonePlans(entry, jobType, plans, 0)
+			c.rollbackStandalonePlans(entry, jobType, plans, nil)
 			return nil, err
 		}
 		if tid != "" && msg.TenantID == nil {
@@ -122,11 +126,7 @@ func (c *Client) EnqueueManyJobsAt(ctx context.Context, runAt interface{}, jobTy
 	}
 
 	if err := c.scheduleMessages(ctx, messages, at, ""); err != nil {
-		produced := 0
-		if pe, ok := err.(*PartialProduceError); ok {
-			produced = pe.ProducedCount
-		}
-		c.rollbackStandalonePlans(entry, jobType, plans, produced)
+		c.rollbackStandalonePlans(entry, jobType, plans, producedFlags(err))
 		return nil, err
 	}
 	return jobIDs, nil

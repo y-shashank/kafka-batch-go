@@ -3,6 +3,7 @@ package schedule
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"math/rand"
 	"sort"
@@ -104,8 +105,17 @@ func (p *Poller) Tick(ctx context.Context) (int, error) {
 		if !ok {
 			misses, _ := p.Store.RecordReadMiss(ctx, item.member)
 			if misses >= maxReadMisses {
-				_ = p.Store.ClearReadMiss(ctx, item.member)
-				done = append(done, item.member)
+				// Never plain-delete: read misses are usually systemic (reader
+				// deadline / scan cap under a backlog, transient broker issues),
+				// not per-job — silently acking here permanently dropped due
+				// jobs. Park the index metadata on the DLT so the job stays
+				// operator-visible/replayable, and only ack once parked.
+				log.Printf("[kbatch-schedule] job_id=%s at %s/%s unread after %d attempts — parking on dead-letter",
+					item.JobID, p.Cfg.ScheduledTopic, loc, maxReadMisses)
+				if p.parkReadMiss(ctx, item.JobID, loc, misses) {
+					_ = p.Store.ClearReadMiss(ctx, item.member)
+					done = append(done, item.member)
+				}
 			}
 			continue
 		}
@@ -214,6 +224,35 @@ func (p *Poller) parkRouteError(ctx context.Context, jobID string, raw []byte, d
 	return true
 }
 
+// parkReadMiss publishes a persistently-unreadable scheduled job's index
+// metadata to the dead-letter topic. The payload itself could not be read from
+// the scheduled topic, so only the coordinates travel — enough for an operator
+// to locate/replay it. Returns false (leaving the index row leased for another
+// sweep) when the DLT is unset or the produce fails.
+func (p *Poller) parkReadMiss(ctx context.Context, jobID, location string, misses int64) bool {
+	if p.Cfg.DeadLetterTopic == "" || p.Producer == nil {
+		log.Printf("[kbatch-schedule] read-miss job_id=%s — leaving leased (no dead_letter_topic)", jobID)
+		return false
+	}
+	dlt := map[string]interface{}{
+		"job_id":            jobID,
+		"dlt_type":          "schedule_read_miss",
+		"dlt_error_message": fmt.Sprintf("scheduled payload unread after %d attempts at %s/%s", misses, p.Cfg.ScheduledTopic, location),
+		"scheduled_topic":   p.Cfg.ScheduledTopic,
+		"location":          location,
+	}
+	rawDLT, err := json.Marshal(dlt)
+	if err != nil {
+		return false
+	}
+	if err := p.Producer.Produce(ctx, p.Cfg.DeadLetterTopic, jobID, rawDLT); err != nil {
+		log.Printf("[kbatch-schedule] read-miss DLT produce failed job_id=%s: %v — leaving leased", jobID, err)
+		return false
+	}
+	instrument.DLTPublished(jobID, "", "schedule_read_miss", p.Cfg.ScheduledTopic)
+	return true
+}
+
 func (p *Poller) now() time.Time {
 	if p.Now != nil {
 		return p.Now()
@@ -248,7 +287,9 @@ func (p *Poller) Run(ctx context.Context) {
 		drained, err := p.drainDue(ctx)
 		if err != nil {
 			log.Printf("[kbatch-schedule] tick error: %v", err)
-			time.Sleep(p.jittered(wait))
+			if !sleepOrCancelled(ctx, p.jittered(wait)) {
+				return
+			}
 			wait = min(wait*2, cap)
 			continue
 		}
@@ -256,10 +297,29 @@ func (p *Poller) Run(ctx context.Context) {
 			wait = interval
 		}
 		// No more due work (or just finished draining) — resume poll wait.
-		time.Sleep(p.jittered(wait))
+		// ctx-aware: an idle backoff of up to SchedulePollMaxInterval must not
+		// stretch pod shutdown past the termination grace (SIGKILL mid-write).
+		if !sleepOrCancelled(ctx, p.jittered(wait)) {
+			return
+		}
 		if !drained {
 			wait = min(wait*2, cap)
 		}
+	}
+}
+
+// sleepOrCancelled sleeps for d; returns false when ctx was cancelled first.
+func sleepOrCancelled(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 

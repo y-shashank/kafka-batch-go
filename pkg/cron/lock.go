@@ -19,6 +19,8 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
 end
 return 0`
 
+var releaseLockScript = redis.NewScript(releaseLockLua)
+
 // Lock is a best-effort distributed lease. It is an optimization only: it keeps
 // one node ticking so the DB isn't polled N times per window. Correctness comes
 // from the (schedule_id, fire_at) unique key, not from this lock, so a brief
@@ -57,5 +59,5 @@ func (l *Lock) Release(ctx context.Context, token string) {
 	if token == "" {
 		return
 	}
-	_, _ = l.rdb.Eval(ctx, releaseLockLua, []string{l.key}, token).Result()
+	_, _ = releaseLockScript.Run(ctx, l.rdb, []string{l.key}, token).Result()
 }

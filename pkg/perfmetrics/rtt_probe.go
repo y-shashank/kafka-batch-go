@@ -29,6 +29,8 @@ redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
 return 1
 `
 
+var recordRTTScript = redis.NewScript(recordRTTLua)
+
 // RTTProbeConfig configures the cluster-wide Redis RTT sampler.
 type RTTProbeConfig struct {
 	Enabled  bool
@@ -153,7 +155,7 @@ func recordRTT(client *redis.Client, us int64, retention, bucket time.Duration) 
 	if retainSecs <= 0 {
 		retainSecs = int64(defaultRetain.Seconds())
 	}
-	if err := client.Eval(ctx, recordRTTLua, []string{key}, us, retainSecs).Err(); err != nil {
+	if err := recordRTTScript.Run(ctx, client, []string{key}, us, retainSecs).Err(); err != nil {
 		log.Printf("[kbatch-perfmetrics] rtt write failed: %v", err)
 	}
 }

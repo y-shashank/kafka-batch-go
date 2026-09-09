@@ -335,15 +335,42 @@ func drainWorkerWatermark(mu *sync.Mutex, wms *[]*daemon.WatermarkExecutor, time
 		wm.StopAccepting()
 	}
 	log.Printf("kbatch go-worker draining watermark in-flight timeout=%s members=%d", timeout, len(list))
-	remaining := 0
-	for _, wm := range list {
-		remaining += wm.WaitInFlight(timeout)
-	}
+	// Wait on all members concurrently against ONE shared deadline: waiting
+	// sequentially multiplied worst-case drain by member count (8 members ×
+	// 30s ≫ any pod termination grace → SIGKILL mid-perform).
+	remaining := waitAllInFlight(len(list), timeout, func(i int) int {
+		return list[i].WaitInFlight(timeout)
+	})
 	if remaining > 0 {
 		log.Printf("kbatch go-worker watermark drain timed out with %d in-flight job(s) — they re-run on restart", remaining)
 	} else {
 		log.Printf("kbatch go-worker watermark drain complete")
 	}
+}
+
+// waitAllInFlight runs n WaitInFlight calls concurrently against one shared
+// deadline and returns the total remaining. Sequential waits multiplied the
+// worst case by member count, so late members were still waiting when the pod's
+// termination grace expired and got SIGKILLed mid-perform.
+func waitAllInFlight(n int, timeout time.Duration, wait func(i int) int) int {
+	if n == 0 {
+		return 0
+	}
+	var wg sync.WaitGroup
+	remaining := make([]int, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			remaining[idx] = wait(idx)
+		}(i)
+	}
+	wg.Wait()
+	total := 0
+	for _, r := range remaining {
+		total += r
+	}
+	return total
 }
 
 // drainWorkerSuperFetch stops new claims, waits for in-flight #perform, then
@@ -359,10 +386,10 @@ func drainWorkerSuperFetch(work *workset.Store, mu *sync.Mutex, sfs *[]*daemon.S
 		sf.StopAccepting()
 	}
 	log.Printf("kbatch go-worker draining superfetch in-flight timeout=%s members=%d", timeout, len(list))
-	remaining := 0
-	for _, sf := range list {
-		remaining += sf.WaitInFlight(timeout)
-	}
+	// One shared deadline across members (see waitAllInFlight).
+	remaining := waitAllInFlight(len(list), timeout, func(i int) int {
+		return list[i].WaitInFlight(timeout)
+	})
 	instrument.SuperFetchDrained(remaining, timeout)
 	if remaining > 0 {
 		log.Printf("kbatch go-worker drain timed out with %d in-flight job(s) — leaving workset for reclaim", remaining)

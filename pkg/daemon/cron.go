@@ -26,6 +26,12 @@ func (e recurringEnqueuer) Enqueue(ctx context.Context, jobType string, payload 
 	return id, err
 }
 
+// HandlerUniq lets the ticker warn when a recurring schedule targets a handler
+// whose recovery re-enqueues would NOT be deduped (cron.UniqChecker).
+func (e recurringEnqueuer) HandlerUniq(jobType string) (bool, bool) {
+	return e.c.HandlerUniq(jobType)
+}
+
 // StartRecurringScheduler wires and launches the cron ticker. It returns a
 // cleanup func to release the produce client and schedule store on shutdown.
 func StartRecurringScheduler(ctx context.Context, cfg config.Daemon, rdb *redis.Client, loopHealth *LoopHealth) (func(), error) {

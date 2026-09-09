@@ -307,7 +307,7 @@ func (e *partitionEngine) runWorker(w *partitionWorker) {
 			}
 			ctx := e.currentProcCtx()
 			if e.cfg.live != nil {
-				e.cfg.live.Heartbeat(ctx, ftp.Topic)
+				e.cfg.live.NoteTopic(ftp.Topic)
 			}
 			if err := safeBatchHandle(ctx, e.cfg.handle, ftp.Records); err != nil {
 				if !isContextErr(err) {

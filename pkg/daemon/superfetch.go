@@ -48,6 +48,12 @@ type SuperFetchExecutor struct {
 
 	accepting atomic.Bool // false after StopAccepting — no new claims
 	inFlight  sync.Map    // job_id → struct{} while claimed/queued/performing locally
+
+	// One shared renew goroutine per executor pipelines all in-flight lease
+	// renewals (previously one goroutine + ticker + channel per job).
+	renewMu   sync.Mutex
+	renewSet  map[string]string // job_id → fence
+	renewOnce sync.Once
 }
 
 func NewSuperFetchExecutor(cfg config.Daemon, work *workset.Store, consumerID string,
@@ -194,13 +200,50 @@ func (e *SuperFetchExecutor) StartHeartbeatLoop(ctx context.Context) {
 	})
 }
 
+// dispatchClient is the subset of *kgo.Client the dispatch loop needs (mark
+// offsets + rewind the consume position). An interface — mirroring watermark's
+// recordMarker — so tests can assert exact marks/rewinds without a live broker.
+type dispatchClient interface {
+	MarkCommitRecords(rs ...*kgo.Record)
+	SetOffsets(setOffsets map[string]map[int32]kgo.EpochOffset)
+}
+
 // DispatchClaimsAndAcks claims each record, marks the Kafka offset, and starts
 // perform in the background. Blocks only on ClaimWindow (not perform Sem) so
 // rebalance is not held for the full #perform duration when window > Sem.
 //
 // ctx may be the poll-scoped procCtx (canceled when this function returns).
 // #perform uses BindLife's context so it is not canceled by endProc.
-func (e *SuperFetchExecutor) DispatchClaimsAndAcks(ctx context.Context, cl *kgo.Client, recs []*kgo.Record, group string) {
+// maxClaimPipeline bounds how many claims ride one Redis pipeline per flush.
+const maxClaimPipeline = 256
+
+type dispatchKind int
+
+const (
+	dispatchClaim dispatchKind = iota
+	dispatchDuplicate
+	dispatchMalformed
+)
+
+// dispatchItem is one record pending flush. Items in a chunk are contiguous
+// with the poll batch and have NO external effects (no marks, no Redis claims,
+// no DLT produce) until flushDispatchChunk processes them — in record order,
+// because franz-go marks are per-partition high-water, so marking record N+1
+// before N is handled would commit past N.
+type dispatchItem struct {
+	rec   *kgo.Record
+	jobID string
+	kind  dispatchKind
+	slot  bool
+}
+
+// DispatchClaimsAndAcks pipelines all claims of a poll batch through one Redis
+// round trip (previously one blocking EVAL per record on the poll goroutine —
+// the per-pod throughput ceiling), then marks/dispatches strictly in record
+// order. Loss semantics are identical to the sequential version: any item whose
+// outcome is unknown aborts the batch at that record, releases the untouched
+// tail's resources, and rewinds so redelivery retries.
+func (e *SuperFetchExecutor) DispatchClaimsAndAcks(ctx context.Context, cl dispatchClient, recs []*kgo.Record, group string) {
 	if e == nil || e.Work == nil {
 		return
 	}
@@ -209,65 +252,169 @@ func (e *SuperFetchExecutor) DispatchClaimsAndAcks(ctx context.Context, cl *kgo.
 	}
 	life := e.life()
 	e.StartHeartbeatLoop(life)
+
+	var chunk []dispatchItem
+	chunkStart := 0 // recs index of chunk[0]
+
+	// releaseChunkClaims returns resources for chunk items in [from, len):
+	// they either never ran or their Redis claim will be resumed on redelivery.
+	releaseChunkClaims := func(from int) {
+		for _, it := range chunk[from:] {
+			if it.kind != dispatchClaim {
+				continue
+			}
+			e.inFlight.Delete(it.jobID)
+			if it.slot {
+				<-e.ClaimWindow
+			}
+		}
+	}
+
+	flush := func() bool {
+		if len(chunk) == 0 {
+			return true
+		}
+		stop, ok := e.flushDispatchChunk(ctx, cl, life, chunk, group)
+		if !ok {
+			// chunk[stop] failed (resources already released by flush); items
+			// after it are unprocessed — release theirs and rewind from the
+			// failed record so redelivery retries the whole tail.
+			releaseChunkClaims(stop + 1)
+			rewindUndispatched(cl, recs[chunkStart+stop:])
+			return false
+		}
+		chunkStart += len(chunk)
+		chunk = chunk[:0]
+		return true
+	}
+
+	abortPending := func() {
+		// Nothing in the pending chunk has external effects yet: release its
+		// claim resources and rewind everything from the chunk start.
+		releaseChunkClaims(0)
+		rewindUndispatched(cl, recs[chunkStart:])
+	}
+
 	for i, rec := range recs {
 		if !e.accepting.Load() {
-			rewindUndispatched(cl, recs[i:])
+			abortPending()
 			return
-		}
-		select {
-		case <-ctx.Done():
-			// Aborted mid-batch (rebalance / stall). PollFetches already advanced
-			// franz-go's fetch cursor past every record in this batch; for a
-			// partition this member KEEPS through a cooperative rebalance the
-			// un-dispatched tail would otherwise never be re-fetched, and later
-			// marks would commit past it — a silent drop. Rewind the consume
-			// position to the first un-dispatched offset per partition so those
-			// records are redelivered. (For revoked partitions this is a no-op;
-			// the new owner resumes from the committed marks.)
-			rewindUndispatched(cl, recs[i:])
-			return
-		case e.ClaimWindow <- struct{}{}:
 		}
 		jobID := extractJobID(rec.Value)
-		if jobID == "" {
-			// Malformed — process synchronously for DLT then ack (no Redis claim).
-			e.processMissingJobID(ctx, cl, rec, group)
-			<-e.ClaimWindow
+		it := dispatchItem{rec: rec, jobID: jobID}
+		switch {
+		case jobID == "":
+			it.kind = dispatchMalformed
+		default:
+			if _, loaded := e.inFlight.LoadOrStore(jobID, struct{}{}); loaded {
+				it.kind = dispatchDuplicate
+			} else {
+				it.kind = dispatchClaim
+				// Acquire the ClaimWindow slot; if the window is full, flush the
+				// pending chunk first so held slots make progress, then block.
+				select {
+				case e.ClaimWindow <- struct{}{}:
+					it.slot = true
+				default:
+					// Window full: flush the pending chunk so held slots make
+					// progress, then block for a slot. On flush failure the
+					// rewind already covers this record (it is in the tail).
+					if !flush() {
+						e.inFlight.Delete(jobID)
+						return
+					}
+					select {
+					case <-ctx.Done():
+						// Rebalance/abort: the poll cursor already passed this
+						// batch; rewind so the un-dispatched tail redelivers
+						// (for kept partitions) instead of being committed past.
+						e.inFlight.Delete(jobID)
+						rewindUndispatched(cl, recs[i:])
+						return
+					case e.ClaimWindow <- struct{}{}:
+						it.slot = true
+					}
+				}
+			}
+		}
+		chunk = append(chunk, it)
+		if len(chunk) >= maxClaimPipeline {
+			if !flush() {
+				return
+			}
+		}
+	}
+	_ = flush()
+}
+
+// flushDispatchChunk applies a chunk's effects in record order. Returns
+// (stopIdx, false) when chunk[stopIdx]'s outcome is unknown — its own resources
+// are released; the caller rewinds from its record. Items before stopIdx are
+// fully processed.
+func (e *SuperFetchExecutor) flushDispatchChunk(ctx context.Context, cl dispatchClient, life context.Context, chunk []dispatchItem, group string) (int, bool) {
+	var params []workset.ClaimParams
+	for _, it := range chunk {
+		if it.kind != dispatchClaim {
 			continue
 		}
-		if _, loaded := e.inFlight.LoadOrStore(jobID, struct{}{}); loaded {
-			// Already claimed/performing in this process (kafka redelivery).
-			cl.MarkCommitRecords(rec)
-			<-e.ClaimWindow
-			continue
-		}
-		claim, err := e.Work.Claim(life, workset.ClaimParams{
-			JobID: jobID, Payload: rec.Value, Topic: rec.Topic,
-			Partition: rec.Partition, Offset: rec.Offset,
+		params = append(params, workset.ClaimParams{
+			JobID: it.jobID, Payload: it.rec.Value, Topic: it.rec.Topic,
+			Partition: it.rec.Partition, Offset: it.rec.Offset,
 			ConsumerID: e.ConsumerID, LeaseTTL: e.LeaseTTL,
 			HeartbeatTTL: e.HeartbeatTTL, StealGrace: e.OrphanGrace,
 		})
-		if err != nil {
-			log.Printf("[kbatch-superfetch] claim error group=%s job_id=%s: %v — leaving unacked",
-				group, jobID, err)
-			e.inFlight.Delete(jobID)
-			<-e.ClaimWindow
-			continue
-		}
-		if !claim.Won {
-			log.Printf("[kbatch-superfetch] claim lost group=%s job_id=%s — acking duplicate",
-				group, jobID)
-			cl.MarkCommitRecords(rec)
-			e.inFlight.Delete(jobID)
-			<-e.ClaimWindow
-			continue
-		}
-		// Durability: Redis owns the job before Kafka forgets it.
-		cl.MarkCommitRecords(rec)
-		// Renew from claim time so lease cannot expire while waiting for Sem.
-		stopRenew := e.startRenew(life, jobID, claim.Fence)
-		go e.perform(life, rec, jobID, claim.Fence, group, stopRenew)
 	}
+	var results []workset.ClaimResult
+	var errs []error
+	if len(params) > 0 {
+		results, errs = e.Work.ClaimMany(life, params)
+	}
+
+	ri := 0
+	for idx, it := range chunk {
+		switch it.kind {
+		case dispatchMalformed:
+			// Malformed — process synchronously for DLT then ack (no Redis claim).
+			if !e.processMissingJobID(ctx, cl, it.rec, group) {
+				return idx, false
+			}
+		case dispatchDuplicate:
+			// Already claimed/performing in this process (kafka redelivery).
+			cl.MarkCommitRecords(it.rec)
+		case dispatchClaim:
+			res, err := results[ri], errs[ri]
+			ri++
+			if err != nil {
+				// Unknown outcome (transient Redis failure). The record is not
+				// marked; committing past it via later marks would drop the job
+				// permanently — abort here so the caller rewinds. If the claim
+				// DID land in Redis, redelivery resumes it by fence.
+				log.Printf("[kbatch-superfetch] claim error group=%s job_id=%s: %v — rewinding undispatched tail",
+					group, it.jobID, err)
+				e.inFlight.Delete(it.jobID)
+				if it.slot {
+					<-e.ClaimWindow
+				}
+				return idx, false
+			}
+			if !res.Won {
+				log.Printf("[kbatch-superfetch] claim lost group=%s job_id=%s — acking duplicate",
+					group, it.jobID)
+				cl.MarkCommitRecords(it.rec)
+				e.inFlight.Delete(it.jobID)
+				if it.slot {
+					<-e.ClaimWindow
+				}
+				continue
+			}
+			// Durability: Redis owns the job before Kafka forgets it.
+			cl.MarkCommitRecords(it.rec)
+			// Renew from claim time so lease cannot expire while waiting for Sem.
+			stopRenew := e.registerRenew(life, it.jobID, res.Fence)
+			go e.perform(life, it.rec, it.jobID, res.Fence, group, stopRenew)
+		}
+	}
+	return 0, true
 }
 
 func (e *SuperFetchExecutor) perform(ctx context.Context, rec *kgo.Record, jobID, fence, group string, stopRenew func()) {
@@ -329,17 +476,17 @@ func (e *SuperFetchExecutor) perform(ctx context.Context, rec *kgo.Record, jobID
 			return
 		}
 	}
-	owned, err := e.Work.StillOwned(ctx, jobID, e.ConsumerID, fence)
-	if err != nil || !owned {
-		log.Printf("[kbatch-superfetch] lost fence group=%s job_id=%s owned=%v err=%v — apply already done, skip complete",
-			group, jobID, owned, err)
-		return
-	}
+	// Complete is fence-guarded in Lua (a lost fence is an atomic no-op), so the
+	// old StillOwned pre-check was a redundant GET+unmarshal per job — and on a
+	// transient error it skipped Complete entirely, leaving the entry to rot
+	// until lease expiry.
 	for i := 0; i < 5; i++ {
 		if err := e.Work.Complete(ctx, jobID, e.ConsumerID, fence); err != nil {
 			log.Printf("[kbatch-superfetch] complete error group=%s job_id=%s attempt=%d: %v",
 				group, jobID, i+1, err)
-			time.Sleep(time.Duration(i+1) * 50 * time.Millisecond)
+			if !sleepOrDone(ctx, time.Duration(i+1)*50*time.Millisecond) {
+				return
+			}
 			continue
 		}
 		return
@@ -375,52 +522,91 @@ func (e *SuperFetchExecutor) processWithSem(ctx context.Context, raw []byte, src
 	return e.Process(ctx, raw, src)
 }
 
-func (e *SuperFetchExecutor) startRenew(ctx context.Context, jobID, fence string) func() {
-	stop := make(chan struct{})
-	// Job-lease renew; member heartbeat is owned by StartHeartbeatLoop (every 20s).
-	interval := e.LeaseTTL / 3
-	if interval < 5*time.Second {
-		interval = 5 * time.Second
+// registerRenew adds a job lease to the shared renew loop and returns a func
+// that removes it (call when the job's terminal outcome is applied). Renew
+// cadence and failure semantics match the old per-job goroutine: transient
+// Redis errors keep the entry (retry next tick); a lost fence drops it.
+func (e *SuperFetchExecutor) registerRenew(ctx context.Context, jobID, fence string) func() {
+	e.renewMu.Lock()
+	if e.renewSet == nil {
+		e.renewSet = make(map[string]string)
 	}
-	go func() {
-		t := time.NewTicker(interval)
-		defer t.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				ok, err := e.Work.Renew(ctx, jobID, e.ConsumerID, fence, e.LeaseTTL)
-				if err != nil {
-					// Transient Redis errors must not stop renew — lease expiry
-					// after Kafka ack would drop the job with no reclaim path.
-					log.Printf("[kbatch-superfetch] renew error job_id=%s: %v — will retry", jobID, err)
-					continue
-				}
-				if !ok {
-					log.Printf("[kbatch-superfetch] renew lost fence job_id=%s — stop renew", jobID)
-					return
-				}
-			}
+	e.renewSet[jobID] = fence
+	e.renewMu.Unlock()
+	e.startRenewLoop(ctx)
+	return func() {
+		e.renewMu.Lock()
+		if e.renewSet[jobID] == fence {
+			delete(e.renewSet, jobID)
 		}
-	}()
-	return func() { close(stop) }
+		e.renewMu.Unlock()
+	}
 }
 
-func (e *SuperFetchExecutor) processMissingJobID(ctx context.Context, cl *kgo.Client, rec *kgo.Record, group string) {
+func (e *SuperFetchExecutor) startRenewLoop(ctx context.Context) {
+	e.renewOnce.Do(func() {
+		// Job-lease renew; member heartbeat is owned by StartHeartbeatLoop (every 20s).
+		interval := e.LeaseTTL / 3
+		if interval < 5*time.Second {
+			interval = 5 * time.Second
+		}
+		go func() {
+			t := time.NewTicker(interval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					e.renewMu.Lock()
+					entries := make([]workset.RenewEntry, 0, len(e.renewSet))
+					for id, f := range e.renewSet {
+						entries = append(entries, workset.RenewEntry{JobID: id, Fence: f})
+					}
+					e.renewMu.Unlock()
+					if len(entries) == 0 {
+						continue
+					}
+					ok, errs := e.Work.RenewMany(ctx, e.ConsumerID, entries, e.LeaseTTL)
+					for i, ent := range entries {
+						if errs[i] != nil {
+							// Transient Redis errors must not stop renew — lease
+							// expiry after Kafka ack would drop the job with no
+							// reclaim path. Keep the entry and retry next tick.
+							log.Printf("[kbatch-superfetch] renew error job_id=%s: %v — will retry", ent.JobID, errs[i])
+							continue
+						}
+						if !ok[i] {
+							log.Printf("[kbatch-superfetch] renew lost fence job_id=%s — stop renew", ent.JobID)
+							e.renewMu.Lock()
+							if e.renewSet[ent.JobID] == ent.Fence {
+								delete(e.renewSet, ent.JobID)
+							}
+							e.renewMu.Unlock()
+						}
+					}
+				}
+			}
+		}()
+	})
+}
+
+// processMissingJobID routes a malformed record (no job_id) to the DLT and acks
+// it. Returns false when routing failed and the record was NOT acked — the
+// caller must rewind so the record is redelivered rather than committed past.
+func (e *SuperFetchExecutor) processMissingJobID(ctx context.Context, cl dispatchClient, rec *kgo.Record, group string) bool {
 	src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
 	out, err := e.Process(ctx, rec.Value, src)
 	if err != nil {
 		log.Printf("[kbatch-superfetch] missing job_id process error group=%s: %v", group, err)
-		return
+		return false
 	}
 	if err := e.Apply(ctx, out); err != nil {
 		log.Printf("[kbatch-superfetch] missing job_id apply error group=%s: %v", group, err)
-		return
+		return false
 	}
 	cl.MarkCommitRecords(rec)
+	return true
 }
 
 // rewindUndispatched resets the consume position to the lowest offset per
@@ -429,7 +615,7 @@ func (e *SuperFetchExecutor) processMissingJobID(ctx context.Context, cl *kgo.Cl
 // BEFORE AllowRebalance, on the poll goroutine — the only safe place to move
 // offsets. Records already dispatched (claimed+marked) or acked (dedup/lost) are
 // not included, so this never rewinds over work that was actually handled.
-func rewindUndispatched(cl *kgo.Client, recs []*kgo.Record) {
+func rewindUndispatched(cl dispatchClient, recs []*kgo.Record) {
 	if cl == nil {
 		return
 	}

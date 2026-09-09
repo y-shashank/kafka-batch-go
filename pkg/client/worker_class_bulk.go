@@ -50,9 +50,13 @@ func (c *Client) planWorkerPushes(ctx context.Context, workerClass string, paylo
 	return jobType, entry, plans, jobIDs, nil
 }
 
-func (c *Client) rollbackWorkerPlans(entry config.HandlerEntry, workerClass string, plans []workerPushPlan, produced int) {
-	for i := produced; i < len(plans); i++ {
-		p := plans[i]
+// rollbackWorkerPlans releases uniq locks for every plan NOT marked produced.
+// produced is indexed 1:1 with plans; nil rolls back everything.
+func (c *Client) rollbackWorkerPlans(entry config.HandlerEntry, workerClass string, plans []workerPushPlan, produced []bool) {
+	for i, p := range plans {
+		if i < len(produced) && produced[i] {
+			continue
+		}
 		c.releaseUniqWorker(entry, workerClass, p.payload, p.jobID, p.fp)
 	}
 }
@@ -78,7 +82,7 @@ func (c *Client) EnqueueMany(ctx context.Context, workerClass string, payloads [
 		}
 		raw, err := json.Marshal(msg)
 		if err != nil {
-			c.rollbackWorkerPlans(entry, workerClass, plans, 0)
+			c.rollbackWorkerPlans(entry, workerClass, plans, nil)
 			return nil, err
 		}
 		route := c.routeFor(entry, p.jobID, tid, nil)
@@ -89,7 +93,6 @@ func (c *Client) EnqueueMany(ctx context.Context, workerClass string, payloads [
 		c.rollbackWorkerPlans(entry, workerClass, plans, produced)
 		return nil, err
 	}
-	_ = produced
 	return jobIDs, nil
 }
 
@@ -116,11 +119,7 @@ func (c *Client) EnqueueManyAt(ctx context.Context, runAt interface{}, workerCla
 		messages = append(messages, msg)
 	}
 	if err := c.scheduleMessages(ctx, messages, at, ""); err != nil {
-		produced := 0
-		if pe, ok := err.(*PartialProduceError); ok {
-			produced = pe.ProducedCount
-		}
-		c.rollbackWorkerPlans(entry, workerClass, plans, produced)
+		c.rollbackWorkerPlans(entry, workerClass, plans, producedFlags(err))
 		return nil, err
 	}
 	return jobIDs, nil
@@ -143,17 +142,18 @@ func (b *Batch) PushMany(ctx context.Context, workerClass string, payloads []map
 	if len(plans) == 0 {
 		return jobIDs, nil
 	}
-	if _, err := b.reserve(ctx, int64(len(plans))); err != nil {
-		b.client.rollbackWorkerPlans(entry, workerClass, plans, 0)
+	win, err := b.reserve(ctx, int64(len(plans)))
+	if err != nil {
+		b.client.rollbackWorkerPlans(entry, workerClass, plans, nil)
 		return nil, err
 	}
 
 	tid := opts.tenantID(b.tenantID)
 	records := make([]kafkaclient.ProduceRecord, 0, len(plans))
 	for _, p := range plans {
-		seq, err := b.nextBatchSeq()
+		seq, err := win.take()
 		if err != nil {
-			b.rollbackWorkerPlans(ctx, entry, workerClass, plans, 0)
+			b.rollbackWorkerPlans(ctx, entry, workerClass, plans, nil)
 			return nil, err
 		}
 		msg := b.client.buildWorkerMessage(entry, jobType, workerClass, p.payload, p.jobID, &b.id, opts, &seq)
@@ -162,7 +162,7 @@ func (b *Batch) PushMany(ctx context.Context, workerClass string, payloads []map
 		}
 		raw, err := json.Marshal(msg)
 		if err != nil {
-			b.rollbackWorkerPlans(ctx, entry, workerClass, plans, 0)
+			b.rollbackWorkerPlans(ctx, entry, workerClass, plans, nil)
 			return nil, err
 		}
 		route := b.client.routeFor(entry, p.jobID, tid, &b.id)
@@ -173,7 +173,6 @@ func (b *Batch) PushMany(ctx context.Context, workerClass string, payloads []map
 		b.rollbackWorkerPlans(ctx, entry, workerClass, plans, produced)
 		return nil, err
 	}
-	_ = produced
 	return jobIDs, nil
 }
 
@@ -189,8 +188,9 @@ func (b *Batch) PushManyAt(ctx context.Context, runAt interface{}, workerClass s
 	if len(plans) == 0 {
 		return jobIDs, nil
 	}
-	if _, err := b.reserve(ctx, int64(len(plans))); err != nil {
-		b.client.rollbackWorkerPlans(entry, workerClass, plans, 0)
+	win, err := b.reserve(ctx, int64(len(plans)))
+	if err != nil {
+		b.client.rollbackWorkerPlans(entry, workerClass, plans, nil)
 		return nil, err
 	}
 
@@ -198,9 +198,9 @@ func (b *Batch) PushManyAt(ctx context.Context, runAt interface{}, workerClass s
 	at := clampRunAt(runAt, b.client.cfg.MaxScheduleHorizon)
 	messages := make([]protocol.JobMessage, 0, len(plans))
 	for _, p := range plans {
-		seq, err := b.nextBatchSeq()
+		seq, err := win.take()
 		if err != nil {
-			b.rollbackWorkerPlans(ctx, entry, workerClass, plans, 0)
+			b.rollbackWorkerPlans(ctx, entry, workerClass, plans, nil)
 			return nil, err
 		}
 		msg := b.client.buildWorkerMessage(entry, jobType, workerClass, p.payload, p.jobID, &b.id, opts, &seq)
@@ -210,11 +210,7 @@ func (b *Batch) PushManyAt(ctx context.Context, runAt interface{}, workerClass s
 		messages = append(messages, msg)
 	}
 	if err := b.client.scheduleMessages(ctx, messages, at, b.id); err != nil {
-		produced := 0
-		if pe, ok := err.(*PartialProduceError); ok {
-			produced = pe.ProducedCount
-		}
-		b.rollbackWorkerPlans(ctx, entry, workerClass, plans, produced)
+		b.rollbackWorkerPlans(ctx, entry, workerClass, plans, producedFlags(err))
 		return nil, err
 	}
 	return jobIDs, nil
@@ -225,9 +221,15 @@ func (b *Batch) PushManyIn(ctx context.Context, d time.Duration, workerClass str
 	return b.PushManyAt(ctx, time.Now().Add(d), workerClass, payloads, opts)
 }
 
-func (b *Batch) rollbackWorkerPlans(ctx context.Context, entry config.HandlerEntry, workerClass string, plans []workerPushPlan, produced int) {
+func (b *Batch) rollbackWorkerPlans(ctx context.Context, entry config.HandlerEntry, workerClass string, plans []workerPushPlan, produced []bool) {
 	b.client.rollbackWorkerPlans(entry, workerClass, plans, produced)
-	unproduced := int64(len(plans) - produced)
+	unproduced := int64(0)
+	for i := range plans {
+		if i < len(produced) && produced[i] {
+			continue
+		}
+		unproduced++
+	}
 	if unproduced > 0 {
 		_, _ = b.client.store.AddJobs(ctx, b.id, -unproduced)
 	}

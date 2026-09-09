@@ -1,5 +1,7 @@
 package workset
 
+import "github.com/redis/go-redis/v9"
+
 // claimLua atomically claims a job.
 // KEYS[1]=job key KEYS[2]=by_consumer SET KEYS[3]=zindex KEYS[4]=live prefix
 // ARGV[1]=job_id ARGV[2]=consumer_id ARGV[3]=fence ARGV[4]=json
@@ -116,3 +118,12 @@ redis.call('DEL', KEYS[4])
 redis.call('DEL', KEYS[5])
 return 1
 `
+
+// Script wrappers so call sites use EVALSHA (with automatic EVAL fallback on
+// NOSCRIPT) instead of shipping the full Lua source on every invocation.
+var (
+	claimScript         = redis.NewScript(claimLua)
+	renewScript         = redis.NewScript(renewLua)
+	completeScript      = redis.NewScript(completeLua)
+	finishReclaimScript = redis.NewScript(finishReclaimLua)
+)

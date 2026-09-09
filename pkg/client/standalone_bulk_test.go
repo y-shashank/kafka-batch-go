@@ -77,7 +77,7 @@ func TestRollbackStandalonePlans(t *testing.T) {
 	entry := config.HandlerEntry{Uniq: true}
 	payload := map[string]interface{}{"a": 1}
 	_, _ = c.uniq.Claim(context.Background(), "go:echo", payload, "j1")
-	c.rollbackStandalonePlans(entry, "echo", []pushPlan{{jobID: "j1", payload: payload, fp: ""}}, 0)
+	c.rollbackStandalonePlans(entry, "echo", []pushPlan{{jobID: "j1", payload: payload, fp: ""}}, nil)
 	ok, err := c.uniq.Claim(context.Background(), "go:echo", payload, "j2")
 	if err != nil || !ok {
 		t.Fatalf("reclaim ok=%v err=%v", ok, err)

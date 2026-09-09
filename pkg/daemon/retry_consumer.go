@@ -61,36 +61,66 @@ func runRetryConsumerLoop(ctx context.Context, spec consumerSpec) error {
 		memberLabel: spec.memberLabel,
 		healthKey:   spec.healthKey,
 		topics:      spec.topics,
-		maxRecords:  1,
+		maxRecords:  retryPollRecords,
 		health:      spec.health,
 		loopHealth:  spec.loopHealth,
 		loopName:    spec.loopName,
 		pauseCtl:    spec.pauseCtl,
 		live:        spec.live,
 	}, func(ctx context.Context, recs []*kgo.Record) error {
-		processOneRetryRecord(ctx, cl, cl, spec.handle, recs[0], spec.group)
+		processRetryRecords(ctx, cl, cl, spec.handle, recs, spec.group)
 		return nil
 	})
+}
+
+// retryPollRecords bounds retry polls. Batching lifts retry drain from ~1
+// produce-RTT per message (a retry storm backed up behind PollRecords(1)) to a
+// partition-ordered batch; the first not-due or failed record per partition
+// pause-rewinds that partition, so a not-yet-due message still never commits.
+const retryPollRecords = 100
+
+// processRetryRecords handles a poll batch with per-partition stop-on-pause:
+// once a partition hits a not-due record (pause) or a handler error (backoff
+// pause), its remaining records this batch are skipped — the deferred pause
+// rewinds to the stopping offset, so they redeliver after resume.
+func processRetryRecords(ctx context.Context, commit recordCommitter, cl *consumerClient, handle func(*kgo.Record) error, recs []*kgo.Record, group string) {
+	type topicPartition struct {
+		topic     string
+		partition int32
+	}
+	stopped := map[topicPartition]bool{}
+	for _, rec := range recs {
+		key := topicPartition{rec.Topic, rec.Partition}
+		if stopped[key] {
+			continue
+		}
+		if !processOneRetryRecord(ctx, commit, cl, handle, rec, group) {
+			stopped[key] = true
+		}
+	}
 }
 
 // retryHandlerErrorBackoff pauses the partition after a non-pause handler failure so
 // transient produce/broker errors do not tight-loop PollRecords(1) on the same offset.
 const retryHandlerErrorBackoff = time.Second
 
-func processOneRetryRecord(ctx context.Context, commit recordCommitter, cl *consumerClient, handle func(*kgo.Record) error, rec *kgo.Record, group string) {
+// processOneRetryRecord handles one record; returns false when its partition
+// must stop for this batch (deferred pause armed, record unmarked).
+func processOneRetryRecord(ctx context.Context, commit recordCommitter, cl *consumerClient, handle func(*kgo.Record) error, rec *kgo.Record, group string) bool {
 	if err := safeHandle(handle, rec); err != nil {
 		var pe *retryPausedError
 		if errors.As(err, &pe) && pe.duration > 0 {
 			deferClientPartitionPause(cl, rec, pe.duration)
-			return
+			return false
 		}
 		log.Printf("[kbatch-daemon] retry handler error group=%s topic=%s partition=%d offset=%d: %v",
 			group, rec.Topic, rec.Partition, rec.Offset, err)
 		// Unmarked + deferred pause: redeliver after backoff (same seek-on-resume path).
 		deferClientPartitionPause(cl, rec, retryHandlerErrorBackoff)
-		return
+		return false
 	}
 	commit.MarkCommitRecords(rec)
+	return true
 }
 
 type recordCommitter interface {

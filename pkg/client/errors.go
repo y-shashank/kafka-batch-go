@@ -67,6 +67,12 @@ func (e UnknownHandlerError) Error() string {
 type PartialProduceError struct {
 	Message       string
 	ProducedCount int
+	// Produced marks, by input position, which messages were durably produced
+	// (and, for scheduled pushes, index-written). Deliveries complete out of
+	// input order, so failures are not a suffix — rollback must consult these
+	// flags, never assume the first ProducedCount inputs succeeded. nil means
+	// nothing was produced.
+	Produced []bool
 }
 
 func (e PartialProduceError) Error() string {

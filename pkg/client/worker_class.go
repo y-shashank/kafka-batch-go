@@ -211,7 +211,12 @@ func (b *Batch) Push(ctx context.Context, workerClass string, payload map[string
 		}
 		return "", err
 	}
-	seq, err := b.reserve(ctx, 1)
+	win, err := b.reserve(ctx, 1)
+	if err != nil {
+		b.client.releaseUniqWorker(entry, workerClass, payload, jobID, "")
+		return "", err
+	}
+	seq, err := win.take()
 	if err != nil {
 		b.client.releaseUniqWorker(entry, workerClass, payload, jobID, "")
 		return "", err
@@ -239,7 +244,12 @@ func (b *Batch) PushAt(ctx context.Context, runAt interface{}, workerClass strin
 		}
 		return "", err
 	}
-	seq, err := b.reserve(ctx, 1)
+	win, err := b.reserve(ctx, 1)
+	if err != nil {
+		b.client.releaseUniqWorker(entry, workerClass, payload, jobID, "")
+		return "", err
+	}
+	seq, err := win.take()
 	if err != nil {
 		b.client.releaseUniqWorker(entry, workerClass, payload, jobID, "")
 		return "", err

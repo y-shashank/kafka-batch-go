@@ -1,6 +1,15 @@
 package schedule
 
+import "github.com/redis/go-redis/v9"
+
 // Lua mirrors lib/kafka_batch/schedule/redis_store.rb.
+
+// Script wrappers so call sites use EVALSHA (with automatic EVAL fallback on
+// NOSCRIPT) instead of shipping the full Lua source on every invocation.
+var (
+	claimDueScript = redis.NewScript(claimDueLua)
+	reclaimScript  = redis.NewScript(reclaimLua)
+)
 
 const claimDueLua = `
 local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))

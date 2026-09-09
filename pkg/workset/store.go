@@ -144,7 +144,7 @@ func (s *Store) Claim(ctx context.Context, p ClaimParams) (ClaimResult, error) {
 	if err != nil {
 		return ClaimResult{}, err
 	}
-	res, err := s.client.Eval(ctx, claimLua,
+	res, err := claimScript.Run(ctx, s.client,
 		[]string{jobKey(p.JobID), byConsumerKey(p.ConsumerID), indexKey, liveConsumerPrefix},
 		p.JobID, p.ConsumerID, fence, string(raw),
 		int(ttl.Seconds()), now.Unix(), int(grace.Seconds()), int(hbTTL.Seconds()),
@@ -165,6 +165,218 @@ func (s *Store) Claim(ctx context.Context, p ClaimParams) (ClaimResult, error) {
 	default:
 		return ClaimResult{Won: false}, nil
 	}
+}
+
+// ClaimMany pipelines one claim per params entry and returns results and
+// per-entry errors, both indexed 1:1 with params. A per-entry error means that
+// claim's outcome is UNKNOWN (transport/script failure) — the caller must not
+// ack that record; results for other entries are still valid. Entries that
+// resumed a prior claim (crash between claim and Kafka ack) are resolved to
+// their existing fence exactly like Claim.
+func (s *Store) ClaimMany(ctx context.Context, params []ClaimParams) ([]ClaimResult, []error) {
+	results := make([]ClaimResult, len(params))
+	errs := make([]error, len(params))
+	if s == nil || s.client == nil {
+		for i := range errs {
+			errs[i] = fmt.Errorf("workset: nil store")
+		}
+		return results, errs
+	}
+	if len(params) == 0 {
+		return results, errs
+	}
+
+	now := time.Now().UTC()
+	entries := make([]*Entry, len(params))
+	type callArgs struct {
+		keys []string
+		argv []interface{}
+	}
+	calls := make([]callArgs, len(params))
+	for i, p := range params {
+		if p.JobID == "" {
+			errs[i] = fmt.Errorf("workset: empty job_id")
+			continue
+		}
+		ttl := p.LeaseTTL
+		if ttl <= 0 {
+			ttl = defaultLeaseTTL
+		}
+		hbTTL := p.HeartbeatTTL
+		if hbTTL <= 0 {
+			hbTTL = defaultHeartbeatTTL
+		}
+		grace := resolveGrace(p.StealGrace)
+		fence := uuid.NewString()
+		entry := &Entry{
+			JobID:         p.JobID,
+			Payload:       append([]byte(nil), p.Payload...),
+			Topic:         p.Topic,
+			Partition:     p.Partition,
+			Offset:        p.Offset,
+			ConsumerID:    p.ConsumerID,
+			Fence:         fence,
+			ClaimedAt:     now.Format(time.RFC3339Nano),
+			ClaimedAtUnix: now.Unix(),
+			Runtime:       "go",
+		}
+		raw, err := marshalEntryJSON(entry)
+		if err != nil {
+			errs[i] = err
+			continue
+		}
+		entries[i] = entry
+		calls[i] = callArgs{
+			keys: []string{jobKey(p.JobID), byConsumerKey(p.ConsumerID), indexKey, liveConsumerPrefix},
+			argv: []interface{}{p.JobID, p.ConsumerID, entry.Fence, string(raw),
+				int(ttl.Seconds()), now.Unix(), int(grace.Seconds()), int(hbTTL.Seconds())},
+		}
+	}
+
+	pipe := s.client.Pipeline()
+	cmds := make([]*redis.Cmd, len(params))
+	for i := range params {
+		if errs[i] != nil || entries[i] == nil {
+			continue
+		}
+		cmds[i] = claimScript.EvalSha(ctx, pipe, calls[i].keys, calls[i].argv...)
+	}
+	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil && !redis.HasErrorPrefix(err, "NOSCRIPT") {
+		for i := range params {
+			if errs[i] == nil && cmds[i] != nil && cmds[i].Err() != nil {
+				errs[i] = cmds[i].Err()
+			}
+		}
+	}
+	// NOSCRIPT (cold script cache): retry only the failed commands with EVAL,
+	// which caches the script server-side. Never re-run commands that
+	// succeeded — the claim script has side effects.
+	var retryIdx []int
+	for i, cmd := range cmds {
+		if cmd != nil && cmd.Err() != nil && redis.HasErrorPrefix(cmd.Err(), "NOSCRIPT") {
+			retryIdx = append(retryIdx, i)
+		}
+	}
+	if len(retryIdx) > 0 {
+		rpipe := s.client.Pipeline()
+		rcmds := make([]*redis.Cmd, len(retryIdx))
+		for j, i := range retryIdx {
+			rcmds[j] = claimScript.Eval(ctx, rpipe, calls[i].keys, calls[i].argv...)
+		}
+		if _, err := rpipe.Exec(ctx); err != nil && err != redis.Nil {
+			// Individual cmd errors below still decide per-entry outcomes.
+			_ = err
+		}
+		for j, i := range retryIdx {
+			cmds[i] = rcmds[j]
+		}
+	}
+
+	// Resolve results; resumed claims (code 2) need the existing entry's fence.
+	var resumeIdx []int
+	for i := range params {
+		if errs[i] != nil || cmds[i] == nil {
+			continue
+		}
+		res, err := cmds[i].Int()
+		if err != nil {
+			errs[i] = err
+			continue
+		}
+		switch res {
+		case 1:
+			results[i] = ClaimResult{Won: true, Fence: entries[i].Fence, Entry: entries[i]}
+		case 2:
+			resumeIdx = append(resumeIdx, i)
+		default:
+			results[i] = ClaimResult{Won: false}
+		}
+	}
+	if len(resumeIdx) > 0 {
+		gpipe := s.client.Pipeline()
+		gcmds := make([]*redis.StringCmd, len(resumeIdx))
+		for j, i := range resumeIdx {
+			gcmds[j] = gpipe.Get(ctx, jobKey(params[i].JobID))
+		}
+		if _, err := gpipe.Exec(ctx); err != nil && err != redis.Nil {
+			_ = err
+		}
+		for j, i := range resumeIdx {
+			raw, err := gcmds[j].Bytes()
+			if err == redis.Nil {
+				results[i] = ClaimResult{Won: false}
+				continue
+			}
+			if err != nil {
+				errs[i] = err
+				continue
+			}
+			var e Entry
+			if uerr := json.Unmarshal(raw, &e); uerr != nil {
+				errs[i] = uerr
+				continue
+			}
+			results[i] = ClaimResult{Won: true, Fence: e.Fence, Entry: &e}
+		}
+	}
+	return results, errs
+}
+
+// RenewEntry is one (jobID, fence) lease to extend.
+type RenewEntry struct {
+	JobID string
+	Fence string
+}
+
+// RenewMany pipelines lease renewals. ok[i] is false when the fence no longer
+// matches (entry stolen/completed); errs[i] carries transient failures (the
+// caller should keep renewing those).
+func (s *Store) RenewMany(ctx context.Context, consumerID string, entries []RenewEntry, ttl time.Duration) ([]bool, []error) {
+	ok := make([]bool, len(entries))
+	errs := make([]error, len(entries))
+	if s == nil || s.client == nil || len(entries) == 0 {
+		return ok, errs
+	}
+	if ttl <= 0 {
+		ttl = defaultLeaseTTL
+	}
+	pipe := s.client.Pipeline()
+	cmds := make([]*redis.Cmd, len(entries))
+	for i, e := range entries {
+		cmds[i] = renewScript.EvalSha(ctx, pipe, []string{jobKey(e.JobID)}, consumerID, e.Fence, int(ttl.Seconds()))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil && !redis.HasErrorPrefix(err, "NOSCRIPT") {
+		_ = err
+	}
+	var retryIdx []int
+	for i, cmd := range cmds {
+		if cmd.Err() != nil && redis.HasErrorPrefix(cmd.Err(), "NOSCRIPT") {
+			retryIdx = append(retryIdx, i)
+		}
+	}
+	if len(retryIdx) > 0 {
+		rpipe := s.client.Pipeline()
+		rcmds := make([]*redis.Cmd, len(retryIdx))
+		for j, i := range retryIdx {
+			e := entries[i]
+			rcmds[j] = renewScript.Eval(ctx, rpipe, []string{jobKey(e.JobID)}, consumerID, e.Fence, int(ttl.Seconds()))
+		}
+		if _, err := rpipe.Exec(ctx); err != nil && err != redis.Nil {
+			_ = err
+		}
+		for j, i := range retryIdx {
+			cmds[i] = rcmds[j]
+		}
+	}
+	for i, cmd := range cmds {
+		n, err := cmd.Int()
+		if err != nil {
+			errs[i] = err
+			continue
+		}
+		ok[i] = n == 1
+	}
+	return ok, errs
 }
 
 func (s *Store) getEntry(ctx context.Context, jobID string) (*Entry, error) {
@@ -190,7 +402,7 @@ func (s *Store) Renew(ctx context.Context, jobID, consumerID, fence string, ttl 
 	if ttl <= 0 {
 		ttl = defaultLeaseTTL
 	}
-	n, err := s.client.Eval(ctx, renewLua,
+	n, err := renewScript.Run(ctx, s.client,
 		[]string{jobKey(jobID)},
 		consumerID, fence, int(ttl.Seconds()),
 	).Int()
@@ -221,7 +433,7 @@ func (s *Store) Complete(ctx context.Context, jobID, consumerID, fence string) e
 	if s == nil || s.client == nil || jobID == "" {
 		return nil
 	}
-	_, err := s.client.Eval(ctx, completeLua,
+	_, err := completeScript.Run(ctx, s.client,
 		[]string{jobKey(jobID), byConsumerKey(consumerID), indexKey},
 		jobID, consumerID, fence,
 	).Result()
@@ -277,6 +489,14 @@ func (s *Store) ListOrphans(ctx context.Context, limit int, grace time.Duration)
 		}
 		var e Entry
 		if err := json.Unmarshal(raw, &e); err != nil {
+			// Poisoned entry: the value exists but cannot decode. Skipping
+			// WITHOUT pruning left it at the front of the aged window forever —
+			// ≥ 3×limit of these starve the sweep and real orphans behind them
+			// are never listed. Prune it like the missing-payload case (loudly:
+			// its job cannot be reclaimed).
+			log.Printf("[kbatch-workset] list_orphans: job %s payload does not decode (%v) — pruning from index; job NOT reclaimable", id, err)
+			instrument.WorksetPayloadMissing(1)
+			missing = append(missing, id)
 			continue
 		}
 		candidates = append(candidates, candidate{entry: e})
@@ -376,7 +596,7 @@ func (s *Store) FinishReclaim(ctx context.Context, e Entry) (int, error) {
 	if s == nil || s.client == nil {
 		return 1, nil
 	}
-	n, err := s.client.Eval(ctx, finishReclaimLua,
+	n, err := finishReclaimScript.Run(ctx, s.client,
 		[]string{jobKey(e.JobID), byConsumerKey(e.ConsumerID), indexKey, reclaimingKey(e.JobID), producedKey(e.JobID)},
 		e.JobID, e.Fence,
 	).Int()

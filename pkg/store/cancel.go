@@ -8,44 +8,49 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// updateStatusLua transitions a batch's status atomically. The old read-check-
+// write ran in separate round trips: two concurrent cancels (or a cancel racing
+// a terminal completion) both observed 'running' and double-decremented
+// kafka_batch:counts — and a cancel could clobber a just-set terminal status.
+// Transitions FROM a terminal status are rejected (code 3, idempotent no-op).
+const updateStatusLua = `
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+local old = redis.call('HGET', KEYS[1], 'status') or ''
+local new = ARGV[1]
+if old == new then return 2 end
+if old == 'success' or old == 'complete' or old == 'cancelled' then return 3 end
+redis.call('HSET', KEYS[1], 'status', new)
+if new == 'success' or new == 'complete' or new == 'cancelled' then
+  redis.call('ZREM', KEYS[3], ARGV[2])
+end
+if old ~= '' then redis.call('HINCRBY', KEYS[2], old, -1) end
+redis.call('HINCRBY', KEYS[2], new, 1)
+if new == 'cancelled' then
+  redis.call('ZADD', KEYS[4], tonumber(ARGV[3]), ARGV[2])
+end
+return 1
+`
+
+var updateStatusScript = redis.NewScript(updateStatusLua)
+
 // UpdateBatchStatus sets batch status (Ruby update_batch_status).
 func (s *RedisStore) UpdateBatchStatus(ctx context.Context, id, status string) error {
 	if s == nil || s.client == nil {
 		return fmt.Errorf("redis store not configured")
 	}
-	key := batchKey(id)
-	exists, err := s.client.Exists(ctx, key).Result()
+	score := float64(time.Now().UnixNano()) / 1e9
+	res, err := updateStatusScript.Run(ctx, s.client,
+		[]string{batchKey(id), countsKey, runningIndex, cancelledIndex},
+		status, id, fmt.Sprintf("%f", score),
+	).Int()
 	if err != nil {
 		return err
 	}
-	if exists == 0 {
+	if res == 0 {
 		return fmt.Errorf("batch %s not found", id)
 	}
-
-	oldStatus, err := s.client.HGet(ctx, key, "status").Result()
-	if err == redis.Nil {
-		return fmt.Errorf("batch %s not found", id)
-	}
-	if err != nil {
-		return err
-	}
-
-	pipe := s.client.Pipeline()
-	pipe.HSet(ctx, key, "status", status)
-	if status == "success" || status == "complete" || status == "cancelled" {
-		pipe.ZRem(ctx, runningIndex, id)
-	}
-	if oldStatus != "" && oldStatus != status {
-		pipe.HIncrBy(ctx, countsKey, oldStatus, -1)
-		pipe.HIncrBy(ctx, countsKey, status, 1)
-	}
-	if status == "cancelled" {
-		score := float64(time.Now().UnixNano()) / 1e9
-		pipe.ZAdd(ctx, cancelledIndex, redis.Z{Score: score, Member: id})
-	}
-	if _, err := pipe.Exec(ctx); err != nil {
-		return err
-	}
+	// 1 = updated; 2 = already that status; 3 = already terminal — both no-ops
+	// are success for idempotent cancels.
 	return nil
 }
 

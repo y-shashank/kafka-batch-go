@@ -47,6 +47,7 @@ type Ticker struct {
 	lastRecover   time.Time
 	lastPrune     time.Time
 	lastHeartbeat time.Time
+	warnedNonUniq map[string]bool
 }
 
 func (t *Ticker) now() time.Time {
@@ -247,10 +248,17 @@ func (t *Ticker) recover(ctx context.Context, now time.Time) error {
 	return nil
 }
 
+// markDispatchedAttempts bounds the retries when recording a successful
+// enqueue. The job is already in Kafka at that point: a row left 'pending'
+// means the recovery sweep re-enqueues it, which is only deduped for uniq
+// handlers — so a transient MySQL blip must not surrender the mark easily.
+const markDispatchedAttempts = 3
+
 // enqueue pushes one fire and, on success, marks it dispatched. On failure the
 // row stays 'pending' so the recovery sweep retries it. The deterministic job
 // id makes that retry idempotent for uniq handlers.
 func (t *Ticker) enqueue(ctx context.Context, cf ClaimedFire) {
+	t.warnNonUniqHandler(cf)
 	jobID := JobIDForFire(cf.ScheduleID, cf.FireAt)
 	if _, err := t.Enqueuer.Enqueue(ctx, cf.JobType, cf.Args, EnqueueOpts{JobID: jobID, TenantID: cf.TenantID}); err != nil {
 		log.Printf("[kbatch-cron] enqueue schedule=%s job_type=%s fire_at=%s: %v — left pending for recovery",
@@ -259,11 +267,46 @@ func (t *Ticker) enqueue(ctx context.Context, cf ClaimedFire) {
 		return
 	}
 	instrument.CronFired(cf.Name, cf.JobType, jobID, cf.TenantID)
-	if err := t.Store.MarkDispatched(ctx, cf.ScheduleID, cf.FireAt, jobID); err != nil {
-		// Job is enqueued; failing to mark only risks a benign recovery re-enqueue
-		// (same job id ⇒ deduped by uniq handlers).
-		log.Printf("[kbatch-cron] mark dispatched schedule=%s fire_at=%s: %v",
-			cf.Name, cf.FireAt.Format(time.RFC3339), err)
+	var markErr error
+	for attempt := 1; attempt <= markDispatchedAttempts; attempt++ {
+		if markErr = t.Store.MarkDispatched(ctx, cf.ScheduleID, cf.FireAt, jobID); markErr == nil {
+			return
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
+		}
+	}
+	// Job is enqueued but the row stays 'pending': the recovery sweep will
+	// re-enqueue it, which is deduped ONLY for uniq handlers (see
+	// warnNonUniqHandler). Log loudly either way.
+	log.Printf("[kbatch-cron] mark dispatched schedule=%s fire_at=%s failed after %d attempts: %v — recovery may re-enqueue",
+		cf.Name, cf.FireAt.Format(time.RFC3339), markDispatchedAttempts, markErr)
+}
+
+// warnNonUniqHandler logs once per job type when a recurring schedule targets a
+// handler without uniq dedup: a crash (or persistent MarkDispatched failure)
+// between enqueue and mark then double-fires the job on recovery.
+func (t *Ticker) warnNonUniqHandler(cf ClaimedFire) {
+	uc, ok := t.Enqueuer.(UniqChecker)
+	if !ok {
+		return
+	}
+	if t.warnedNonUniq == nil {
+		t.warnedNonUniq = map[string]bool{}
+	}
+	if t.warnedNonUniq[cf.JobType] {
+		return
+	}
+	t.warnedNonUniq[cf.JobType] = true
+	if uniq, known := uc.HandlerUniq(cf.JobType); known && !uniq {
+		log.Printf("[kbatch-cron] WARNING: recurring schedule %q targets handler %q without uniq:true — "+
+			"a crash between enqueue and mark-dispatched re-fires this job on recovery (grace=%s). "+
+			"Set uniq: true on the handler (uniq lock TTL must exceed the recovery grace).",
+			cf.Name, cf.JobType, t.RecoverGrace)
 	}
 }
 

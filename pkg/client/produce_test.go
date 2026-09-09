@@ -85,9 +85,9 @@ func TestWriteScheduleIndexDefaultRetries(t *testing.T) {
 
 func TestProduceInChunksEmpty(t *testing.T) {
 	c := &Client{cfg: DefaultConfig()}
-	n, err := c.produceInChunks(context.Background(), nil)
-	if err != nil || n != 0 {
-		t.Fatalf("n=%d err=%v", n, err)
+	flags, err := c.produceInChunks(context.Background(), nil)
+	if err != nil || flags != nil {
+		t.Fatalf("flags=%v err=%v", flags, err)
 	}
 }
 

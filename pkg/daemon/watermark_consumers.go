@@ -120,6 +120,10 @@ func runWatermarkConsumerLoop(ctx context.Context, spec watermarkConsumerSpec) e
 		health:      spec.health,
 		pauseCtl:    spec.pauseCtl,
 		live:        spec.live,
+		// Cap each poll at the executor's Window so one fetch can never exceed
+		// dispatch capacity (defense in depth alongside the dispatch loop's
+		// flush-and-retry; also bounds worst-case commit-flush latency).
+		maxRecords: cap(spec.watermark.Window),
 		// onPoll flushes any completions that became committable since the last
 		// poll — including on idle polls that return no new records.
 		onPoll: func(context.Context) { spec.watermark.FlushMarks(cl.Client) },

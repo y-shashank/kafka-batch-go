@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -184,21 +185,21 @@ func TestStallHelperBranches(t *testing.T) {
 	releasePollGate(nil)
 	fake := &fakeRebalance{}
 	releasePollGate(fake)
-	if !fake.allowed {
+	if !fake.allowed.Load() {
 		t.Fatal("allow")
 	}
 	closeGroupConsumer(fake)
-	if !fake.closed {
+	if !fake.closed.Load() {
 		t.Fatal("close")
 	}
 }
 
 type fakeRebalance struct {
-	allowed, closed bool
+	allowed, closed atomic.Bool
 }
 
-func (f *fakeRebalance) AllowRebalance()         { f.allowed = true }
-func (f *fakeRebalance) CloseAllowingRebalance() { f.closed = true }
+func (f *fakeRebalance) AllowRebalance()         { f.allowed.Store(true) }
+func (f *fakeRebalance) CloseAllowingRebalance() { f.closed.Store(true) }
 
 func TestAttachConsumerStallGuardClosesClient(t *testing.T) {
 	fake := &fakeRebalance{}
@@ -215,11 +216,11 @@ func TestAttachConsumerStallGuardClosesClient(t *testing.T) {
 		t.Fatalf("cause=%v err=%v", context.Cause(ctx), ctx.Err())
 	}
 	deadline = time.Now().Add(time.Second)
-	for time.Now().Before(deadline) && !(fake.closed && fake.allowed) {
+	for time.Now().Before(deadline) && !(fake.closed.Load() && fake.allowed.Load()) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if !fake.closed || !fake.allowed {
-		t.Fatalf("fake=%+v", fake)
+	if !fake.closed.Load() || !fake.allowed.Load() {
+		t.Fatalf("closed=%v allowed=%v", fake.closed.Load(), fake.allowed.Load())
 	}
 	// Default attach path
 	_, _, stop2 := attachConsumerStallGuard(context.Background(), nil, "x")

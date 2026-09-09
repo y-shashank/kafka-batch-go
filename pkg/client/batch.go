@@ -61,8 +61,6 @@ type Batch struct {
 	meta        map[string]interface{}
 	description string
 	tenantID    string
-	seqCursor   int64
-	seqEnd      int64
 }
 
 // ID returns the batch uuid.
@@ -81,9 +79,14 @@ func (b *Batch) PushJob(ctx context.Context, jobType string, payload map[string]
 		}
 		return "", err
 	}
-	seq, err := b.reserve(ctx, 1)
+	win, err := b.reserve(ctx, 1)
 	if err != nil {
 		noteBatchRejection(err, b.id, jobType)
+		b.client.releaseUniq(entry, jobType, payload, jobID, "")
+		return "", err
+	}
+	seq, err := win.take()
+	if err != nil {
 		b.client.releaseUniq(entry, jobType, payload, jobID, "")
 		return "", err
 	}
@@ -115,9 +118,14 @@ func (b *Batch) PushJobAt(ctx context.Context, runAt interface{}, jobType string
 		}
 		return "", err
 	}
-	seq, err := b.reserve(ctx, 1)
+	win, err := b.reserve(ctx, 1)
 	if err != nil {
 		noteBatchRejection(err, b.id, jobType)
+		b.client.releaseUniq(entry, jobType, payload, jobID, "")
+		return "", err
+	}
+	seq, err := win.take()
+	if err != nil {
 		b.client.releaseUniq(entry, jobType, payload, jobID, "")
 		return "", err
 	}
@@ -166,25 +174,41 @@ type SealResult struct {
 	Outcome string
 }
 
-func (b *Batch) reserve(ctx context.Context, count int64) (int64, error) {
+// seqWindow is a batch_seq range reserved by one AddJobs call. Each push call
+// iterates its OWN window locally: the ranges come from an atomic Redis INCRBY,
+// so concurrent pushes into the same *Batch get disjoint windows and never
+// share cursor state (the old struct-level cursor was overwritten by every
+// reserve — concurrent pushes silently reused or skipped batch_seq values,
+// corrupting the completion bitmap).
+type seqWindow struct {
+	next, end int64
+}
+
+// take returns the next batch_seq from the window.
+func (w *seqWindow) take() (int64, error) {
+	if w.next == 0 || w.end == 0 {
+		return 0, fmt.Errorf("no reserved batch_seq slots")
+	}
+	if w.next > w.end {
+		return 0, fmt.Errorf("reserved too few batch_seq slots")
+	}
+	s := w.next
+	w.next++
+	return s, nil
+}
+
+func (b *Batch) reserve(ctx context.Context, count int64) (seqWindow, error) {
 	res, err := b.client.store.AddJobs(ctx, b.id, count)
 	if err != nil {
-		return 0, err
+		return seqWindow{}, err
 	}
 	switch res.Status {
 	case "closed":
-		return 0, BatchClosedError{BatchID: b.id, Reason: "closed"}
+		return seqWindow{}, BatchClosedError{BatchID: b.id, Reason: "closed"}
 	case "cancelled":
-		return 0, BatchClosedError{BatchID: b.id, Reason: "cancelled"}
+		return seqWindow{}, BatchClosedError{BatchID: b.id, Reason: "cancelled"}
 	case "not_found":
-		return 0, BatchNotFoundError{BatchID: b.id}
+		return seqWindow{}, BatchNotFoundError{BatchID: b.id}
 	}
-	if count == 1 {
-		b.seqCursor = res.SeqStart
-		b.seqEnd = res.SeqEnd
-		return res.SeqStart, nil
-	}
-	b.seqCursor = res.SeqStart
-	b.seqEnd = res.SeqEnd
-	return 0, nil
+	return seqWindow{next: res.SeqStart, end: res.SeqEnd}, nil
 }

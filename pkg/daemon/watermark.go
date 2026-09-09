@@ -62,6 +62,11 @@ type partitionCommit struct {
 	expected int64                 // next offset to commit (the watermark head)
 	inited   bool                  // expected has been seeded from the first record
 	done     map[int64]*kgo.Record // completed offsets >= expected awaiting the prefix
+	// pending holds offsets dispatched but not yet committed or failed. It
+	// dedups redeliveries of an offset whose first dispatch is still in flight:
+	// each duplicate dispatch would take a Window slot that FlushMarks releases
+	// only once per committed offset — a permanent slot leak.
+	pending map[int64]bool
 }
 
 // NewWatermarkExecutor builds an executor sized from the SuperFetch knobs so the
@@ -161,15 +166,31 @@ func (e *WatermarkExecutor) DispatchAndCommit(ctx context.Context, cl recordMark
 		if !e.accepting.Load() {
 			break
 		}
-		select {
-		case <-ctx.Done():
-			// Rebalance/abort: stop dispatching. Undispatched records are never
-			// marked → redelivered → re-run (idempotent).
-			e.FlushMarks(cl)
-			return
-		case e.Window <- struct{}{}:
+	acquire:
+		for {
+			select {
+			case <-ctx.Done():
+				// Rebalance/abort: stop dispatching. Undispatched records are never
+				// marked → redelivered → re-run (idempotent).
+				e.FlushMarks(cl)
+				return
+			case e.Window <- struct{}{}:
+				break acquire
+			case <-time.After(25 * time.Millisecond):
+				// Window full. Successful jobs release their slots only in
+				// FlushMarks, which runs on THIS goroutine — blocking here
+				// forever would deadlock the member as completions pile up
+				// unflushed. Flush the committable prefix and retry.
+				e.FlushMarks(cl)
+			}
 		}
-		e.register(rec)
+		if !e.register(rec) {
+			// Offset already dispatched and not yet committed (redelivery while
+			// the first run is in flight): the first dispatch owns the slot and
+			// the commit; a second would leak one Window slot per duplicate.
+			<-e.Window
+			continue
+		}
 		atomic.AddInt64(&e.inFlight, 1)
 		go e.perform(life, rec, group)
 	}
@@ -179,14 +200,22 @@ func (e *WatermarkExecutor) DispatchAndCommit(ctx context.Context, cl recordMark
 // register seeds the partition tracker for a newly dispatched record. If the
 // record's offset is below the current watermark (redelivery after a rebalance),
 // the tracker resets to it so the prefix re-forms from the redelivered position.
-func (e *WatermarkExecutor) register(rec *kgo.Record) {
+// Returns false when the offset is already dispatched-and-uncommitted (in-flight
+// duplicate) — the caller must skip it and release its Window slot.
+func (e *WatermarkExecutor) register(rec *kgo.Record) bool {
 	key := partitionKey{topic: rec.Topic, partition: rec.Partition}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	pc := e.parts[key]
 	if pc == nil {
-		pc = &partitionCommit{done: make(map[int64]*kgo.Record)}
+		pc = &partitionCommit{done: make(map[int64]*kgo.Record), pending: make(map[int64]bool)}
 		e.parts[key] = pc
+	}
+	if pc.pending == nil {
+		pc.pending = make(map[int64]bool)
+	}
+	if pc.pending[rec.Offset] {
+		return false
 	}
 	if !pc.inited || rec.Offset < pc.expected {
 		pc.expected = rec.Offset
@@ -198,6 +227,8 @@ func (e *WatermarkExecutor) register(rec *kgo.Record) {
 			}
 		}
 	}
+	pc.pending[rec.Offset] = true
+	return true
 }
 
 func (e *WatermarkExecutor) perform(ctx context.Context, rec *kgo.Record, group string) {
@@ -231,11 +262,19 @@ func (e *WatermarkExecutor) noteDone(rec *kgo.Record) {
 	key := partitionKey{topic: rec.Topic, partition: rec.Partition}
 	e.mu.Lock()
 	pc := e.parts[key]
-	if pc != nil && (!pc.inited || rec.Offset >= pc.expected) {
+	tracked := pc != nil && (!pc.inited || rec.Offset >= pc.expected)
+	if tracked {
 		pc.done[rec.Offset] = rec
+	} else if pc != nil {
+		delete(pc.pending, rec.Offset)
 	}
 	e.mu.Unlock()
 	atomic.AddInt64(&e.inFlight, -1)
+	if !tracked {
+		// Stale completion (offset below a reset watermark): FlushMarks will
+		// never commit it, so release its Window slot here or it leaks.
+		<-e.Window
+	}
 }
 
 // fail marks an infra-side failure (Process/Apply error — never a business retry,
@@ -247,6 +286,13 @@ func (e *WatermarkExecutor) noteDone(rec *kgo.Record) {
 func (e *WatermarkExecutor) fail(rec *kgo.Record, group, stage string, err error) {
 	log.Printf("[kbatch-watermark] %s error group=%s topic=%s partition=%d offset=%d: %v — not committing (redelivers on restart)",
 		stage, group, rec.Topic, rec.Partition, rec.Offset, err)
+	key := partitionKey{topic: rec.Topic, partition: rec.Partition}
+	e.mu.Lock()
+	if pc := e.parts[key]; pc != nil {
+		// No longer in flight: a redelivery may re-dispatch this offset.
+		delete(pc.pending, rec.Offset)
+	}
+	e.mu.Unlock()
 	atomic.AddInt64(&e.inFlight, -1)
 	<-e.Window
 }
@@ -271,6 +317,7 @@ func (e *WatermarkExecutor) FlushMarks(cl recordMarker) {
 				break
 			}
 			delete(pc.done, pc.expected)
+			delete(pc.pending, pc.expected)
 			toMark = append(toMark, rec)
 			pc.expected++
 		}

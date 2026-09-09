@@ -123,19 +123,29 @@ type consumerSpec struct {
 }
 
 func collectPollRecords(ctx context.Context, cl *consumerClient, group string, fetches kgo.Fetches, pauseCtl pauseChecker, live *liveness.Reporter) []*kgo.Record {
-	recs := make([]*kgo.Record, 0)
+	recs := make([]*kgo.Record, 0, fetches.NumRecords())
+	var skipped []*kgo.Record
 	fetches.EachRecord(func(rec *kgo.Record) {
 		if pauseCtl != nil && pauseCtl.Paused(ctx, group, rec.Topic, rec.Partition) {
+			skipped = append(skipped, rec)
 			if cl != nil && !pauseCtl.Paused(ctx, group, rec.Topic, 0) {
 				cl.pauseConsumptionPartition(rec.Topic, rec.Partition)
 			}
 			return
 		}
 		if live != nil {
-			live.Heartbeat(ctx, rec.Topic)
+			live.NoteTopic(rec.Topic)
 		}
 		recs = append(recs, rec)
 	})
+	// The poll already advanced the consume cursor past skipped records; pausing
+	// fetches does NOT move it back, so on resume the partition would continue
+	// from the advanced cursor and later marks would commit past the skipped
+	// records — a silent drop (the deferred-pause path rewinds for exactly this
+	// reason). Rewind to the first skipped offset per partition.
+	if len(skipped) > 0 && cl != nil && cl.Client != nil {
+		rewindUndispatched(cl.Client, skipped)
+	}
 	return recs
 }
 
@@ -268,15 +278,33 @@ func runConsumerLoop(ctx context.Context, spec consumerSpec) error {
 		pauseCtl:    spec.pauseCtl,
 		live:        spec.live,
 	}, func(ctx context.Context, recs []*kgo.Record) error {
+		// Per-partition stop-on-failure: once a record fails, its partition is
+		// pause-rewound to that offset, so no LATER offset of the same
+		// partition may be marked this batch (marks are per-partition
+		// high-water — marking past the failed record would commit it away).
+		// This also fixes a pre-existing silent drop: handler errors used to
+		// `continue` without marking, letting the next record's mark commit
+		// past the failed (unmarked) one.
+		type topicPartition struct {
+			topic     string
+			partition int32
+		}
+		stopped := map[topicPartition]bool{}
 		for _, rec := range recs {
+			key := topicPartition{rec.Topic, rec.Partition}
+			if stopped[key] {
+				continue
+			}
 			if err := safeHandle(spec.handle, rec); err != nil {
 				var bp *fairBackpressureError
 				if errors.As(err, &bp) {
 					deferClientPartitionPause(cl, rec, bp.duration)
-					continue
+				} else {
+					log.Printf("[kbatch-daemon] handler error group=%s topic=%s offset=%d: %v — pausing partition for redelivery",
+						spec.group, rec.Topic, rec.Offset, err)
+					deferClientPartitionPause(cl, rec, retryHandlerErrorBackoff)
 				}
-				log.Printf("[kbatch-daemon] handler error group=%s topic=%s offset=%d: %v",
-					spec.group, rec.Topic, rec.Offset, err)
+				stopped[key] = true
 				continue
 			}
 			cl.MarkCommitRecords(rec)
@@ -465,20 +493,27 @@ func filterPriorityRecords(
 	recs []*kgo.Record,
 ) []*kgo.Record {
 	ready := make([]*kgo.Record, 0, len(recs))
+	var skipped []*kgo.Record
 	for _, rec := range recs {
 		if _, ok := specByTopic[rec.Topic]; !ok {
 			continue
 		}
 		if pauseCtl != nil && pauseCtl.Paused(ctx, pc.ConsumerGroup, rec.Topic, rec.Partition) {
+			skipped = append(skipped, rec)
 			if !pauseCtl.Paused(ctx, pc.ConsumerGroup, rec.Topic, 0) {
 				cl.pauseConsumptionPartition(rec.Topic, rec.Partition)
 			}
 			continue
 		}
 		if live != nil {
-			live.Heartbeat(ctx, rec.Topic)
+			live.NoteTopic(rec.Topic)
 		}
 		ready = append(ready, rec)
+	}
+	// Same strand hazard as collectPollRecords: pause without rewind loses the
+	// already-fetched skipped records on resume.
+	if len(skipped) > 0 && cl != nil && cl.Client != nil {
+		rewindUndispatched(cl.Client, skipped)
 	}
 	return ready
 }

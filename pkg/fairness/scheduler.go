@@ -9,6 +9,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/y-shashank/kafka-batch-go/pkg/instrument"
 )
 
 // reclaimClaimTTL bounds how long a reclaim-in-progress marker lives. It only needs to
@@ -73,7 +75,7 @@ func (s *Scheduler) Enqueue(ctx context.Context, tenantID string, payload []byte
 	if err := ValidateLane(s.Lane); err != nil {
 		return false, err
 	}
-	res, err := s.Client.Eval(ctx, EnqueueLua,
+	res, err := enqueueScript.Run(ctx, s.Client,
 		[]string{ringKey(s.Lane), vtimeKey(s.Lane)},
 		tenantID, string(payload), s.Settings.ReadyWindow, readyPrefix(s.Lane),
 	).Int()
@@ -94,7 +96,7 @@ func (s *Scheduler) Checkout(ctx context.Context) (*CheckoutResult, error) {
 	var res []interface{}
 	var err error
 	if s.Lane == LaneTime {
-		res, err = s.Client.Eval(ctx, CheckoutLuaTime,
+		res, err = checkoutTimeScript.Run(ctx, s.Client,
 			[]string{ringKey(s.Lane), leasesKey(s.Lane), weightKey(s.Lane), forwardingKey(s.Lane), forwardingMetaKey(s.Lane)},
 			s.Settings.GlobalConcurrency, s.Settings.MaxInflightPerTenant, readyPrefix(s.Lane),
 			s.Settings.fetchN(), s.Settings.DefaultWeight, weighted,
@@ -102,7 +104,7 @@ func (s *Scheduler) Checkout(ctx context.Context) (*CheckoutResult, error) {
 			"0", s.Settings.EffectiveLeaseTTL(), slotID, leasePrefix(s.Lane),
 		).Slice()
 	} else {
-		res, err = s.Client.Eval(ctx, CheckoutLuaCount,
+		res, err = checkoutCountScript.Run(ctx, s.Client,
 			[]string{ringKey(s.Lane), vtimeKey(s.Lane), leasesKey(s.Lane), weightKey(s.Lane), forwardingKey(s.Lane), forwardingMetaKey(s.Lane)},
 			s.Settings.GlobalConcurrency, s.Settings.MaxInflightPerTenant, readyPrefix(s.Lane),
 			s.Settings.DefaultWeight, s.Settings.fetchN(), weighted,
@@ -129,7 +131,7 @@ func (s *Scheduler) ConfirmForward(ctx context.Context, slotID string) (bool, er
 	if slotID == "" {
 		return false, nil
 	}
-	n, err := s.Client.Eval(ctx, ConfirmForwardLua,
+	n, err := confirmForwardScript.Run(ctx, s.Client,
 		[]string{forwardingKey(s.Lane), forwardingMetaKey(s.Lane)}, slotID,
 	).Int()
 	return n == 1, err
@@ -142,12 +144,12 @@ func (s *Scheduler) AbortForward(ctx context.Context, slotID, tenantID string) (
 	var n int
 	var err error
 	if s.Lane == LaneTime {
-		n, err = s.Client.Eval(ctx, AbortForwardLuaTime,
+		n, err = abortForwardTimeScript.Run(ctx, s.Client,
 			[]string{forwardingKey(s.Lane), forwardingMetaKey(s.Lane), leasesKey(s.Lane), TenantLeaseKey(s.Lane, tenantID)},
 			slotID, tenantID, readyPrefix(s.Lane),
 		).Int()
 	} else {
-		n, err = s.Client.Eval(ctx, AbortForwardLuaCount,
+		n, err = abortForwardCountScript.Run(ctx, s.Client,
 			[]string{forwardingKey(s.Lane), forwardingMetaKey(s.Lane), leasesKey(s.Lane), TenantLeaseKey(s.Lane, tenantID), ringKey(s.Lane), vtimeKey(s.Lane), weightKey(s.Lane)},
 			slotID, tenantID, readyPrefix(s.Lane), s.Settings.DefaultWeight,
 		).Int()
@@ -163,7 +165,7 @@ func (s *Scheduler) Complete(ctx context.Context, tenantID, slotID string, durat
 		if slotID == "" {
 			return nil
 		}
-		_, err := s.Client.Eval(ctx, CompleteLuaCountLease,
+		_, err := completeCountLeaseScript.Run(ctx, s.Client,
 			[]string{leasesKey(s.Lane), TenantLeaseKey(s.Lane, tenantID)},
 			slotID,
 		).Result()
@@ -175,13 +177,13 @@ func (s *Scheduler) Complete(ctx context.Context, tenantID, slotID string, durat
 		inc = durationSec / w
 	}
 	if slotID == "" {
-		_, err := s.Client.Eval(ctx, CompleteLuaTimeLegacy,
+		_, err := completeTimeLegacyScript.Run(ctx, s.Client,
 			[]string{vtimeKey(s.Lane), ringKey(s.Lane)},
 			tenantID, inc, readyPrefix(s.Lane),
 		).Result()
 		return err
 	}
-	_, err := s.Client.Eval(ctx, CompleteLuaTimeLease,
+	_, err := completeTimeLeaseScript.Run(ctx, s.Client,
 		[]string{leasesKey(s.Lane), TenantLeaseKey(s.Lane, tenantID), vtimeKey(s.Lane), ringKey(s.Lane)},
 		tenantID, inc, readyPrefix(s.Lane), slotID,
 	).Result()
@@ -206,7 +208,7 @@ func (s *Scheduler) RenewLease(ctx context.Context, tenantID, slotID string) err
 
 func (s *Scheduler) rearmLease(ctx context.Context, tenantID, slotID string) error {
 	expiry := float64(time.Now().UnixNano())/1e9 + s.Settings.EffectiveLeaseTTL()
-	_, err := s.Client.Eval(ctx, RearmLeaseLua,
+	_, err := rearmLeaseScript.Run(ctx, s.Client,
 		[]string{leasesKey(s.Lane), TenantLeaseKey(s.Lane, tenantID)},
 		slotID, expiry,
 	).Result()
@@ -239,6 +241,9 @@ func (s *Scheduler) ClaimSlotExecution(ctx context.Context, slotID string) (bool
 	}
 	ok, err := s.Client.SetNX(ctx, SlotDedupKey(s.Lane, slotID), "1", time.Duration(s.Settings.slotDedupTTL())*time.Second).Result()
 	if err != nil {
+		// Fail open — but never silently: a redelivered fair slot executes
+		// twice during the Redis brownout.
+		instrument.FairSlotDedupFailedOpen(string(s.Lane), slotID, err)
 		return true, err
 	}
 	return ok, nil
@@ -380,7 +385,7 @@ func (s *Scheduler) ResetVtimeIfQuiescent(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	now := float64(time.Now().UnixNano()) / 1e9
-	n, err := s.Client.Eval(ctx, ResetVtimeIfQuiescentLua,
+	n, err := resetVtimeIfQuiescentScript.Run(ctx, s.Client,
 		[]string{ringKey(s.Lane), vtimeKey(s.Lane), leasesKey(s.Lane), forwardingKey(s.Lane)},
 		fmt.Sprintf("%f", now),
 	).Int()
@@ -464,7 +469,10 @@ func (s *Scheduler) Reset(ctx context.Context) error {
 func (s *Scheduler) activeViewCached() activeView {
 	s.activeMu.Lock()
 	defer s.activeMu.Unlock()
-	if time.Since(s.activeViewAt) < s.Settings.ActiveCountTTL && s.activeView.count > 0 {
+	// Cache zero views too: an idle lane's Checkout runs every IdleSleep
+	// (~50ms), and recomputing the view there means a full-ring ZRANGE plus a
+	// keyspace SCAN per tick, forever, while idle.
+	if time.Since(s.activeViewAt) < s.Settings.ActiveCountTTL && !s.activeViewAt.IsZero() {
 		return s.activeView
 	}
 	s.activeView = s.computeActiveView(context.Background())

@@ -55,7 +55,7 @@ func (s *RedisStore) ScheduleMany(ctx context.Context, entries []ScheduleEntry) 
 
 func (s *RedisStore) ClaimDue(ctx context.Context, now time.Time, leaseSeconds, limit int) ([]string, error) {
 	leaseUntil := epoch(now) + float64(leaseSeconds)
-	res, err := s.client.Eval(ctx, claimDueLua,
+	res, err := claimDueScript.Run(ctx, s.client,
 		[]string{pendingKey, inflightKey},
 		epoch(now), limit, leaseUntil,
 	).Slice()
@@ -79,7 +79,7 @@ func (s *RedisStore) Ack(ctx context.Context, members []string) error {
 }
 
 func (s *RedisStore) Reclaim(ctx context.Context, now time.Time) (int, error) {
-	n, err := s.client.Eval(ctx, reclaimLua,
+	n, err := reclaimScript.Run(ctx, s.client,
 		[]string{inflightKey, pendingKey},
 		epoch(now), s.reclaimLimit,
 	).Int()

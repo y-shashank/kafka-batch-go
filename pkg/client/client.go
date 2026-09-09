@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"log"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
@@ -173,11 +174,20 @@ func (c *Client) CreateBatch(ctx context.Context, opts BatchOptions, populate fu
 	}
 	if populate != nil {
 		popErr := populate(b)
-		_, sealErr := b.Seal(ctx)
 		if popErr != nil {
+			// Sealing anyway would let the partially-pushed jobs converge the
+			// batch and fire on_success for work the caller was told FAILED —
+			// a partial send reporting success. Cancel instead: completions on
+			// a cancelled batch are dropped as duplicates and workers skip its
+			// jobs (skip_cancelled_jobs). Best-effort — if the cancel itself
+			// fails, the batch stays running/unsealed and the reconciler
+			// surfaces it rather than silently finishing it.
+			if cErr := c.store.CancelBatch(ctx, id); cErr != nil {
+				log.Printf("[kbatch-client] cancel after populate failure batch_id=%s: %v", id, cErr)
+			}
 			return b, popErr
 		}
-		if sealErr != nil {
+		if _, sealErr := b.Seal(ctx); sealErr != nil {
 			return b, sealErr
 		}
 	}
@@ -261,6 +271,17 @@ func (c *Client) lookupHandler(jobType string) (config.HandlerEntry, error) {
 		return entry, UnknownHandlerError{JobType: jobType}
 	}
 	return entry, nil
+}
+
+// HandlerUniq reports whether jobType resolves to a handler with effective uniq
+// dedup (handler uniq:true and uniq enabled client-wide). known is false when
+// the job type is not in the manifest.
+func (c *Client) HandlerUniq(jobType string) (uniq bool, known bool) {
+	entry, err := c.lookupHandler(jobType)
+	if err != nil {
+		return false, false
+	}
+	return entry.Uniq && c.cfg.UniqEnabled, true
 }
 
 func (c *Client) produceCallback(ctx context.Context, batch *store.Batch, outcome string) error {

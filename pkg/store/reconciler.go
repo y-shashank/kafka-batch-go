@@ -87,7 +87,7 @@ func (s *RedisStore) MarkFinishedIfRunning(ctx context.Context, id, outcome stri
 	}
 	now := time.Now().UTC()
 	score := fmt.Sprintf("%f", float64(now.UnixNano())/1e9)
-	res, err := s.client.Eval(ctx, markFinishedIfRunningLua,
+	res, err := markFinishedIfRunningScript.Run(ctx, s.client,
 		[]string{batchKey(id), countsKey, runningIndex, doneIndex},
 		outcome, now.Format(time.RFC3339), score, id,
 	).Int()
@@ -110,7 +110,7 @@ func (s *RedisStore) WithReconcilerLock(ctx context.Context, ttl time.Duration, 
 	if ttlSec < 1 {
 		ttlSec = 1
 	}
-	acquired, err := s.client.Eval(ctx, acquireLockLua, []string{reconcilerLockKey}, token, ttlSec).Result()
+	acquired, err := acquireLockScript.Run(ctx, s.client, []string{reconcilerLockKey}, token, ttlSec).Result()
 	if err == redis.Nil {
 		return false, nil
 	}
@@ -121,7 +121,7 @@ func (s *RedisStore) WithReconcilerLock(ctx context.Context, ttl time.Duration, 
 		return false, nil
 	}
 	defer func() {
-		_, _ = s.client.Eval(context.Background(), releaseLockLua, []string{reconcilerLockKey}, token).Result()
+		_, _ = releaseLockScript.Run(context.Background(), s.client, []string{reconcilerLockKey}, token).Result()
 	}()
 	if err := fn(); err != nil {
 		return true, err
@@ -165,12 +165,23 @@ func (s *RedisStore) ReconcileBatchCounts(ctx context.Context) error {
 		}
 		_, _ = pipe.Exec(ctx)
 	}
+	// Atomic swap via temp-key RENAME: the old DEL→HSET left a window where
+	// readers saw an empty hash (triggering full fallback scans) and concurrent
+	// Lua HINCRBYs landed between DEL and HSET were lost.
+	tmp := countsKey + ":rebuild"
 	pipe := s.client.Pipeline()
-	pipe.Del(ctx, countsKey)
+	pipe.Del(ctx, tmp)
+	nonEmpty := false
 	for k, v := range counts {
 		if v > 0 {
-			pipe.HSet(ctx, countsKey, k, v)
+			pipe.HSet(ctx, tmp, k, v)
+			nonEmpty = true
 		}
+	}
+	if nonEmpty {
+		pipe.Rename(ctx, tmp, countsKey)
+	} else {
+		pipe.Del(ctx, countsKey)
 	}
 	_, err = pipe.Exec(ctx)
 	return err

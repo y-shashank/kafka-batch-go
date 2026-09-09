@@ -3,6 +3,7 @@ package schedule
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -95,9 +96,9 @@ func TestPollerRunCancels(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	p := &Poller{
 		Cfg: config.Daemon{
-			ScheduleLeaseSeconds:   60,
-			ScheduleBatchSize:      10,
-			SchedulePollInterval:   20 * time.Millisecond,
+			ScheduleLeaseSeconds:    60,
+			ScheduleBatchSize:       10,
+			SchedulePollInterval:    20 * time.Millisecond,
 			SchedulePollMaxInterval: 50 * time.Millisecond,
 		},
 		Store:  NewRedisStore(rdb, 100),
@@ -141,12 +142,15 @@ func TestPollerTickReadMissThreshold(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	var dltTopic string
+	var dltPayload []byte
 	poller := &Poller{
-		Cfg:    config.Daemon{ScheduleLeaseSeconds: 60, ScheduleBatchSize: 10},
+		Cfg:    config.Daemon{ScheduleLeaseSeconds: 60, ScheduleBatchSize: 10, DeadLetterTopic: "dlt"},
 		Store:  store,
 		Reader: &stubReader{found: map[string][]byte{}}, // not lost, just missing
-		Producer: producerFunc(func(context.Context, string, string, []byte) error {
-			t.Fatal("should not produce")
+		Producer: producerFunc(func(_ context.Context, topic, _ string, payload []byte) error {
+			dltTopic = topic
+			dltPayload = payload
 			return nil
 		}),
 		Router: DaemonRouter{Default: "jobs"},
@@ -156,12 +160,57 @@ func TestPollerTickReadMissThreshold(t *testing.T) {
 	if err != nil || n != 0 {
 		t.Fatalf("tick n=%d err=%v", n, err)
 	}
+	// The threshold must PARK the job on the dead-letter topic, never silently
+	// delete it: read misses are systemic (reader deadline / scan cap), and the
+	// old plain-ack permanently dropped due jobs with no trace.
+	if dltTopic != "dlt" {
+		t.Fatalf("expected DLT park, produced to %q", dltTopic)
+	}
+	if !strings.Contains(string(dltPayload), "schedule_read_miss") || !strings.Contains(string(dltPayload), "j-miss") {
+		t.Fatalf("DLT payload missing metadata: %s", dltPayload)
+	}
 	inflight, err := rdb.ZCard(ctx, inflightKey).Result()
 	if err != nil || inflight != 0 {
-		t.Fatalf("expected ack after threshold, inflight=%d err=%v", inflight, err)
+		t.Fatalf("expected ack after park, inflight=%d err=%v", inflight, err)
 	}
 	if mr.HGet(readMissKey, member) != "" {
 		t.Fatalf("read miss counter should be cleared, got %q", mr.HGet(readMissKey, member))
+	}
+}
+
+// Without a DLT the job must stay leased (retried next sweep) — not deleted.
+func TestPollerTickReadMissThresholdNoDLTLeavesLeased(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	store := NewRedisStore(rdb, 100)
+	ctx := context.Background()
+	now := time.Unix(1300, 0)
+	member := "j-miss2:0:7"
+	for i := 0; i < maxReadMisses-1; i++ {
+		if _, err := store.RecordReadMiss(ctx, member); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Schedule(ctx, "j-miss2", now.Add(-time.Second), 0, 7); err != nil {
+		t.Fatal(err)
+	}
+	poller := &Poller{
+		Cfg:    config.Daemon{ScheduleLeaseSeconds: 60, ScheduleBatchSize: 10},
+		Store:  store,
+		Reader: &stubReader{found: map[string][]byte{}},
+		Producer: producerFunc(func(context.Context, string, string, []byte) error {
+			t.Fatal("no DLT configured — should not produce")
+			return nil
+		}),
+		Router: DaemonRouter{Default: "jobs"},
+		Now:    func() time.Time { return now },
+	}
+	if _, err := poller.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	inflight, err := rdb.ZCard(ctx, inflightKey).Result()
+	if err != nil || inflight != 1 {
+		t.Fatalf("job must stay leased without a DLT, inflight=%d err=%v", inflight, err)
 	}
 }
 

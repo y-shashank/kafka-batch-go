@@ -69,10 +69,34 @@ type DroppedCompletion struct {
 type RedisStore struct {
 	client *redis.Client
 	ttl    time.Duration
+	// finishedTTL is the retention applied to a batch's hash, bitmaps and seq
+	// allocator once it reaches a terminal status. Zero means "same as ttl"
+	// (the historical behavior). Shortening it is the largest ledger RAM lever;
+	// it is safe because the completion Lua's late-event guard treats an event
+	// for a terminal batch whose bitmaps are gone as a duplicate.
+	finishedTTL time.Duration
 }
 
 func NewRedisStore(client *redis.Client, ttl time.Duration) *RedisStore {
 	return &RedisStore{client: client, ttl: ttl}
+}
+
+// NewRedisStoreWithRetention builds a store with a distinct finished-batch TTL.
+// finishedTTL <= 0 or > ttl falls back to ttl.
+func NewRedisStoreWithRetention(client *redis.Client, ttl, finishedTTL time.Duration) *RedisStore {
+	s := &RedisStore{client: client, ttl: ttl}
+	if finishedTTL > 0 && finishedTTL < ttl {
+		s.finishedTTL = finishedTTL
+	}
+	return s
+}
+
+// finishedTTLSeconds returns the terminal retention in seconds (defaults to ttl).
+func (s *RedisStore) finishedTTLSeconds() int {
+	if s.finishedTTL > 0 {
+		return int(s.finishedTTL.Seconds())
+	}
+	return int(s.ttl.Seconds())
 }
 
 // RawClient exposes the underlying Redis client (reconciler summaries, tests).
@@ -87,6 +111,8 @@ func (s *RedisStore) completionKeys(batchID string) []string {
 	return []string{
 		batchKey(batchID), bitmapKey(batchID), runningIndex, doneIndex, countsKey,
 		okBitmapKey(batchID), failBitmapKey(batchID),
+		// KEYS[8]: the seq allocator, expired alongside the batch at terminal.
+		seqKey(batchID),
 	}
 }
 
@@ -99,18 +125,47 @@ func (s *RedisStore) RecordCompletionsBatch(ctx context.Context, events []Comple
 	nowFloat := fmt.Sprintf("%f", float64(time.Now().UnixNano())/1e9)
 	ttlSec := strconv.Itoa(int(s.ttl.Seconds()))
 
-	pipe := s.client.Pipeline()
-	cmds := make([]*redis.Cmd, len(events))
-	for i, e := range events {
+	finishedTTLSec := strconv.Itoa(s.finishedTTLSeconds())
+	completionArgs := func(e CompletionEvent) []interface{} {
 		op := e.Status
 		if op != "success" && op != "failed" && op != "executed" {
 			op = "failed"
 		}
-		cmds[i] = pipe.Eval(ctx, batchDoneJobLua, s.completionKeys(e.BatchID),
-			e.BatchSeq, op, ttlSec, now, nowFloat)
+		return []interface{}{e.BatchSeq, op, ttlSec, now, nowFloat, finishedTTLSec}
 	}
-	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+
+	pipe := s.client.Pipeline()
+	cmds := make([]*redis.Cmd, len(events))
+	for i, e := range events {
+		cmds[i] = batchDoneJobScript.EvalSha(ctx, pipe, s.completionKeys(e.BatchID), completionArgs(e)...)
+	}
+	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil && !redis.HasErrorPrefix(err, "NOSCRIPT") {
 		return out, err
+	}
+
+	// EVALSHA fails with NOSCRIPT until the script is cached (first call after
+	// boot, SCRIPT FLUSH, failover). Retry only the failed commands with EVAL,
+	// which executes and caches the script in one round trip. Never re-run
+	// commands that succeeded: the completion Lua is applied exactly once per
+	// seq, so a re-run would misreport as "duplicate".
+	var retryIdx []int
+	for i, cmd := range cmds {
+		if cmd.Err() != nil && redis.HasErrorPrefix(cmd.Err(), "NOSCRIPT") {
+			retryIdx = append(retryIdx, i)
+		}
+	}
+	if len(retryIdx) > 0 {
+		rpipe := s.client.Pipeline()
+		rcmds := make([]*redis.Cmd, len(retryIdx))
+		for j, i := range retryIdx {
+			rcmds[j] = batchDoneJobScript.Eval(ctx, rpipe, s.completionKeys(events[i].BatchID), completionArgs(events[i])...)
+		}
+		if _, err := rpipe.Exec(ctx); err != nil && err != redis.Nil {
+			return out, err
+		}
+		for j, i := range retryIdx {
+			cmds[i] = rcmds[j]
+		}
 	}
 
 	type fire struct {
@@ -122,7 +177,16 @@ func (s *RedisStore) RecordCompletionsBatch(ctx context.Context, events []Comple
 	for i, cmd := range cmds {
 		res, err := cmd.Slice()
 		if err != nil {
-			return out, err
+			// The EVAL already executed (counters mutated, callback claims
+			// stamped) — aborting here would discard fire signals collected
+			// from earlier events, and the reconciler skips claimed batches, so
+			// those callbacks would only surface via replay. Record the drop
+			// and keep processing the rest.
+			out.Dropped = append(out.Dropped, DroppedCompletion{
+				BatchID: events[i].BatchID, JobID: events[i].JobID,
+				BatchSeq: events[i].BatchSeq, Reason: "decode: " + err.Error(),
+			})
+			continue
 		}
 		code, _ := res[0].(int64)
 		payload, _ := res[1].(string)
@@ -206,7 +270,7 @@ func (s *RedisStore) ClaimCallback(ctx context.Context, batchID, nodeID string, 
 	if len(kind) > 0 && kind[0] != "" {
 		k = kind[0]
 	}
-	res, err := s.client.Eval(ctx, claimCallbackLua,
+	res, err := claimCallbackScript.Run(ctx, s.client,
 		[]string{batchKey(batchID), doneIndex},
 		now, nodeID, batchID, k,
 	).Int()
@@ -220,7 +284,7 @@ func (s *RedisStore) RecordCallbackRunner(ctx context.Context, batchID, nodeID s
 	if s == nil || s.client == nil || batchID == "" || nodeID == "" {
 		return nil
 	}
-	_, err := s.client.Eval(ctx, recordCallbackRunnerLua, []string{batchKey(batchID)}, nodeID).Result()
+	_, err := recordCallbackRunnerScript.Run(ctx, s.client, []string{batchKey(batchID)}, nodeID).Result()
 	return err
 }
 

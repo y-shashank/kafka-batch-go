@@ -1,6 +1,24 @@
 package fairness
 
+import "github.com/redis/go-redis/v9"
+
 // Lua scripts mirror lib/kafka_batch/fairness/scheduler.rb (wire-compatible).
+
+// Script wrappers so call sites use EVALSHA (with automatic EVAL fallback on
+// NOSCRIPT) instead of shipping the full Lua source on every invocation.
+var (
+	enqueueScript               = redis.NewScript(EnqueueLua)
+	checkoutTimeScript          = redis.NewScript(CheckoutLuaTime)
+	checkoutCountScript         = redis.NewScript(CheckoutLuaCount)
+	confirmForwardScript        = redis.NewScript(ConfirmForwardLua)
+	abortForwardTimeScript      = redis.NewScript(AbortForwardLuaTime)
+	abortForwardCountScript     = redis.NewScript(AbortForwardLuaCount)
+	completeCountLeaseScript    = redis.NewScript(CompleteLuaCountLease)
+	completeTimeLegacyScript    = redis.NewScript(CompleteLuaTimeLegacy)
+	completeTimeLeaseScript     = redis.NewScript(CompleteLuaTimeLease)
+	rearmLeaseScript            = redis.NewScript(RearmLeaseLua)
+	resetVtimeIfQuiescentScript = redis.NewScript(ResetVtimeIfQuiescentLua)
+)
 
 const EnqueueLua = `
 local ring    = KEYS[1]

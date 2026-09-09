@@ -339,3 +339,34 @@ func WorksetUnreclaimable(reason string) {
 		"reason": reason,
 	}, 0)
 }
+
+// UniqClaimFailedOpen fires when a uniq-lock claim could not reach Redis and
+// the enqueue proceeded as if the lock were acquired (fail-open). During a
+// Redis brownout a retrying upstream can mass-enqueue duplicates with no other
+// trace — alert on this event for non-idempotent workloads.
+func UniqClaimFailedOpen(workerClass, jobID string, count int, err error) {
+	Emit("uniq.claim_failed_open", map[string]interface{}{
+		"worker_class": workerClass,
+		"job_id":       jobID,
+		"count":        count,
+		"error_message": errString(err),
+	}, 0)
+}
+
+// FairSlotDedupFailedOpen fires when the fair-slot execution dedup could not
+// reach Redis and the slot was treated as won — a redelivered fair message will
+// execute twice during the brownout.
+func FairSlotDedupFailedOpen(lane, slotID string, err error) {
+	Emit("fairness.slot_dedup_failed_open", map[string]interface{}{
+		"lane":          lane,
+		"slot_id":       slotID,
+		"error_message": errString(err),
+	}, 0)
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}

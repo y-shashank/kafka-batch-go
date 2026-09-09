@@ -28,39 +28,56 @@ func (c *Client) chunkSize() int {
 	return c.cfg.ProduceChunkSize
 }
 
-func (c *Client) produceInChunks(ctx context.Context, records []kafkaclient.ProduceRecord) (int, error) {
+// produceInChunks produces records and returns per-input produced flags.
+// Deliveries complete out of input order, so on error the flags — not any
+// prefix — say which records are durably in Kafka.
+func (c *Client) produceInChunks(ctx context.Context, records []kafkaclient.ProduceRecord) ([]bool, error) {
 	if len(records) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 	size := c.chunkSize()
+	produced := make([]bool, len(records))
 	producedTotal := 0
 	for i := 0; i < len(records); i += size {
 		end := i + size
 		if end > len(records) {
 			end = len(records)
 		}
-		chunk := records[i:end]
-		dels, err := c.prod.ProduceManySync(ctx, chunk)
-		if err != nil {
-			producedTotal += len(dels)
-			return producedTotal, &PartialProduceError{
-				Message:       err.Error(),
-				ProducedCount: producedTotal,
+		outs, err := c.prod.ProduceManySync(ctx, records[i:end])
+		for j, o := range outs {
+			if o.Err == nil {
+				produced[i+j] = true
+				producedTotal++
 			}
 		}
-		producedTotal += len(chunk)
-		_ = dels
+		if err != nil {
+			return produced, &PartialProduceError{
+				Message:       err.Error(),
+				ProducedCount: producedTotal,
+				Produced:      produced,
+			}
+		}
 	}
-	return producedTotal, nil
+	return produced, nil
 }
 
+// scheduleMessages produces to the scheduled topic and writes the schedule
+// index. A message counts as produced only when BOTH succeed: the poller fires
+// exclusively from index rows, so a Kafka-only record never dispatches and must
+// be rolled back by the caller. Each index row carries its own record's
+// broker-assigned partition/offset (correlated by identity, never position).
 func (c *Client) scheduleMessages(ctx context.Context, messages []protocol.JobMessage, runAt time.Time, batchID string) error {
 	if len(messages) == 0 {
 		return nil
 	}
 	topic := c.cfg.resolveTopic(c.cfg.ScheduledTopic)
 	size := c.chunkSize()
+	produced := make([]bool, len(messages))
 	producedTotal := 0
+
+	fail := func(msg string) error {
+		return &PartialProduceError{Message: msg, ProducedCount: producedTotal, Produced: produced}
+	}
 
 	for i := 0; i < len(messages); i += size {
 		end := i + size
@@ -72,32 +89,39 @@ func (c *Client) scheduleMessages(ctx context.Context, messages []protocol.JobMe
 		for j, msg := range chunk {
 			raw, err := json.Marshal(msg)
 			if err != nil {
-				return err
+				return fail("marshal scheduled job: " + err.Error())
 			}
 			records[j] = kafkaclient.ProduceRecord{Topic: topic, Key: msg.JobID, Payload: raw}
 		}
 
-		dels, err := c.prod.ProduceManySync(ctx, records)
-		if err != nil {
-			delivered := len(dels)
-			if delivered > 0 {
-				entries := scheduleEntriesFrom(chunk[:delivered], dels, runAt, batchID)
-				if werr := c.writeScheduleIndex(ctx, entries, batchID, chunk[0].JobID, delivered); werr != nil {
-					return werr
-				}
-				producedTotal += delivered
-			}
-			return &PartialProduceError{
-				Message:       err.Error(),
-				ProducedCount: producedTotal,
-			}
-		}
+		outs, perr := c.prod.ProduceManySync(ctx, records)
 
-		entries := scheduleEntriesFrom(chunk, dels, runAt, batchID)
-		if err := c.writeScheduleIndex(ctx, entries, batchID, chunk[0].JobID, len(entries)); err != nil {
-			return err
+		entries := make([]schedule.ScheduleEntry, 0, len(chunk))
+		okIdx := make([]int, 0, len(chunk))
+		for j, o := range outs {
+			if o.Err != nil {
+				continue
+			}
+			entries = append(entries, schedule.ScheduleEntry{
+				JobID: chunk[j].JobID, RunAt: runAt, BatchID: batchID,
+				Partition: o.Delivery.Partition, Offset: o.Delivery.Offset,
+			})
+			okIdx = append(okIdx, i+j)
 		}
-		producedTotal += len(chunk)
+		if len(entries) > 0 {
+			if werr := c.writeScheduleIndex(ctx, entries, batchID, chunk[0].JobID, len(entries)); werr != nil {
+				// Produced to Kafka but not indexed → will never fire. Earlier
+				// chunks keep their produced flags; only this chunk rolls back.
+				return fail(werr.Error())
+			}
+			for _, gi := range okIdx {
+				produced[gi] = true
+			}
+			producedTotal += len(okIdx)
+		}
+		if perr != nil {
+			return fail(perr.Error())
+		}
 	}
 
 	workerClass := messages[0].WorkerClass
@@ -109,15 +133,13 @@ func (c *Client) scheduleMessages(ctx context.Context, messages []protocol.JobMe
 	return nil
 }
 
-func scheduleEntriesFrom(msgs []protocol.JobMessage, dels []kafkaclient.Delivery, runAt time.Time, batchID string) []schedule.ScheduleEntry {
-	out := make([]schedule.ScheduleEntry, len(msgs))
-	for i, msg := range msgs {
-		out[i] = schedule.ScheduleEntry{
-			JobID: msg.JobID, RunAt: runAt, BatchID: batchID,
-			Partition: dels[i].Partition, Offset: dels[i].Offset,
-		}
+// producedFlags extracts per-input produced flags from a bulk produce error.
+// nil means nothing was durably produced.
+func producedFlags(err error) []bool {
+	if pe, ok := err.(*PartialProduceError); ok {
+		return pe.Produced
 	}
-	return out
+	return nil
 }
 
 func (b *Batch) planPushes(ctx context.Context, jobType string, payloads []map[string]interface{}) (config.HandlerEntry, []pushPlan, []string, error) {
@@ -152,24 +174,19 @@ func (b *Batch) planPushes(ctx context.Context, jobType string, payloads []map[s
 	return entry, plans, jobIDs, nil
 }
 
-func (b *Batch) nextBatchSeq() (int64, error) {
-	if b.seqCursor == 0 || b.seqEnd == 0 {
-		return 0, BatchClosedError{BatchID: b.id, Reason: "no reserved batch_seq slots"}
-	}
-	if b.seqCursor > b.seqEnd {
-		return 0, BatchClosedError{BatchID: b.id, Reason: "reserved too few batch_seq slots"}
-	}
-	seq := b.seqCursor
-	b.seqCursor++
-	return seq, nil
-}
-
-func (b *Batch) rollbackPlans(ctx context.Context, entry config.HandlerEntry, jobType string, plans []pushPlan, produced int) {
-	for i := produced; i < len(plans); i++ {
-		p := plans[i]
+// rollbackPlans releases uniq locks and returns reserved total_jobs for every
+// plan NOT marked produced. produced is indexed 1:1 with plans; nil rolls back
+// everything. Rolling back a produced plan would release a live job's uniq lock
+// and shrink total_jobs below the completions that will arrive — never guess.
+func (b *Batch) rollbackPlans(ctx context.Context, entry config.HandlerEntry, jobType string, plans []pushPlan, produced []bool) {
+	unproduced := int64(0)
+	for i, p := range plans {
+		if i < len(produced) && produced[i] {
+			continue
+		}
 		b.client.releaseUniq(entry, jobType, p.payload, p.jobID, p.fp)
+		unproduced++
 	}
-	unproduced := int64(len(plans) - produced)
 	if unproduced > 0 {
 		_, _ = b.client.store.AddJobs(ctx, b.id, -unproduced)
 	}
@@ -189,7 +206,8 @@ func (b *Batch) PushManyJobs(ctx context.Context, jobType string, payloads []map
 		return jobIDs, nil
 	}
 
-	if _, err := b.reserve(ctx, int64(len(plans))); err != nil {
+	win, err := b.reserve(ctx, int64(len(plans)))
+	if err != nil {
 		for _, p := range plans {
 			b.client.releaseUniq(entry, jobType, p.payload, p.jobID, p.fp)
 		}
@@ -199,14 +217,14 @@ func (b *Batch) PushManyJobs(ctx context.Context, jobType string, payloads []map
 	tid := opts.tenantID(b.tenantID)
 	records := make([]kafkaclient.ProduceRecord, 0, len(plans))
 	for _, p := range plans {
-		seq, err := b.nextBatchSeq()
+		seq, err := win.take()
 		if err != nil {
-			b.rollbackPlans(ctx, entry, jobType, plans, 0)
+			b.rollbackPlans(ctx, entry, jobType, plans, nil)
 			return nil, err
 		}
 		msg, err := b.client.buildMessage(entry, jobType, p.payload, p.jobID, &b.id, opts, &seq)
 		if err != nil {
-			b.rollbackPlans(ctx, entry, jobType, plans, 0)
+			b.rollbackPlans(ctx, entry, jobType, plans, nil)
 			return nil, err
 		}
 		if tid != "" && msg.TenantID == nil {
@@ -214,7 +232,7 @@ func (b *Batch) PushManyJobs(ctx context.Context, jobType string, payloads []map
 		}
 		raw, err := json.Marshal(msg)
 		if err != nil {
-			b.rollbackPlans(ctx, entry, jobType, plans, 0)
+			b.rollbackPlans(ctx, entry, jobType, plans, nil)
 			return nil, err
 		}
 		route := b.client.routeFor(entry, p.jobID, tid, &b.id)
@@ -227,7 +245,6 @@ func (b *Batch) PushManyJobs(ctx context.Context, jobType string, payloads []map
 		b.rollbackPlans(ctx, entry, jobType, plans, produced)
 		return nil, err
 	}
-	_ = produced
 	return jobIDs, nil
 }
 
@@ -244,7 +261,8 @@ func (b *Batch) PushManyJobsAt(ctx context.Context, runAt interface{}, jobType s
 		return jobIDs, nil
 	}
 
-	if _, err := b.reserve(ctx, int64(len(plans))); err != nil {
+	win, err := b.reserve(ctx, int64(len(plans)))
+	if err != nil {
 		for _, p := range plans {
 			b.client.releaseUniq(entry, jobType, p.payload, p.jobID, p.fp)
 		}
@@ -255,14 +273,14 @@ func (b *Batch) PushManyJobsAt(ctx context.Context, runAt interface{}, jobType s
 	at := clampRunAt(runAt, b.client.cfg.MaxScheduleHorizon)
 	messages := make([]protocol.JobMessage, 0, len(plans))
 	for _, p := range plans {
-		seq, err := b.nextBatchSeq()
+		seq, err := win.take()
 		if err != nil {
-			b.rollbackPlans(ctx, entry, jobType, plans, 0)
+			b.rollbackPlans(ctx, entry, jobType, plans, nil)
 			return nil, err
 		}
 		msg, err := b.client.buildMessage(entry, jobType, p.payload, p.jobID, &b.id, opts, &seq)
 		if err != nil {
-			b.rollbackPlans(ctx, entry, jobType, plans, 0)
+			b.rollbackPlans(ctx, entry, jobType, plans, nil)
 			return nil, err
 		}
 		if tid != "" && msg.TenantID == nil {
@@ -272,11 +290,7 @@ func (b *Batch) PushManyJobsAt(ctx context.Context, runAt interface{}, jobType s
 	}
 
 	if err := b.client.scheduleMessages(ctx, messages, at, b.id); err != nil {
-		produced := 0
-		if pe, ok := err.(*PartialProduceError); ok {
-			produced = pe.ProducedCount
-		}
-		b.rollbackPlans(ctx, entry, jobType, plans, produced)
+		b.rollbackPlans(ctx, entry, jobType, plans, producedFlags(err))
 		return nil, err
 	}
 	return jobIDs, nil
