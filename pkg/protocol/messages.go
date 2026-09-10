@@ -17,6 +17,10 @@ func DecodeJSONMap(raw string) map[string]interface{} {
 	return m
 }
 
+// IntPtr returns a pointer to n. Handy for optional envelope fields like
+// JobMessage.MaxRetries where an explicit 0 must be distinguishable from absent.
+func IntPtr(n int) *int { return &n }
+
 // JobMessage is the Kafka job envelope (Ruby Batch.build_message_for).
 type JobMessage struct {
 	JobID                string                 `json:"job_id"`
@@ -24,8 +28,13 @@ type JobMessage struct {
 	JobType              string                 `json:"job_type"`
 	WorkerClass          string                 `json:"worker_class"`
 	Payload              map[string]interface{} `json:"payload"`
-	Attempt      int                    `json:"attempt"`
-	MaxRetries   int                    `json:"max_retries"`
+	Attempt int `json:"attempt"`
+	// MaxRetries is a pointer so an explicit 0 ("run once, never retry") is
+	// distinguishable from absent. Absent (nil) means "use the configured
+	// default"; a non-nil value — including 0 — is honored as-is (Ruby parity,
+	// which uses data.fetch("max_retries", default)). omitempty drops only nil,
+	// so an explicit 0 still travels on the wire as "max_retries":0.
+	MaxRetries *int `json:"max_retries,omitempty"`
 	EnqueuedAt   string                 `json:"enqueued_at,omitempty"`
 	TenantID     *string                `json:"tenant_id,omitempty"`
 	BatchSeq     *int64                 `json:"batch_seq,omitempty"`

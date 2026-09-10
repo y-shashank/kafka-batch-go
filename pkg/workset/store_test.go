@@ -67,6 +67,26 @@ func TestClaimCompleteFence(t *testing.T) {
 	}
 }
 
+// M5: a direct caller passing a too-short LeaseTTL must still get a lease that
+// outlives the reclaim window (hbTTL + grace + reclaim buffer), so a crashed
+// consumer's payload can't expire before reclaim re-produces it (job loss).
+func TestClaimEnforcesLeaseFloor(t *testing.T) {
+	st, mr := testStore(t)
+	ctx := context.Background()
+	res, err := st.Claim(ctx, ClaimParams{
+		JobID: "j1", Payload: []byte(`{"job_id":"j1"}`), Topic: "jobs",
+		Partition: 0, Offset: 1, ConsumerID: "c1",
+		LeaseTTL: time.Second, // far below the safe floor
+	})
+	if err != nil || !res.Won {
+		t.Fatalf("claim won=%v err=%v", res.Won, err)
+	}
+	floor := defaultHeartbeatTTL + DefaultOrphanGrace + reclaimSafetyBuffer
+	if ttl := mr.TTL(jobKey("j1")); ttl < floor {
+		t.Fatalf("job lease TTL=%s below floor=%s — TTL inversion not prevented", ttl, floor)
+	}
+}
+
 func TestClaimSetsLiveKey(t *testing.T) {
 	st, mr := testStore(t)
 	ctx := context.Background()

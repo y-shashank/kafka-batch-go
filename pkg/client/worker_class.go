@@ -97,7 +97,7 @@ func (c *Client) buildWorkerMessage(entry config.HandlerEntry, jobType, workerCl
 		WorkerClass: workerClass,
 		Payload:     payload,
 		Attempt:     0,
-		MaxRetries:  c.maxRetries(entry),
+		MaxRetries:  intPtr(c.maxRetries(entry)),
 		EnqueuedAt:  protocol.NowISO(),
 	}
 	if tid := opts.tenantID(""); tid != "" {

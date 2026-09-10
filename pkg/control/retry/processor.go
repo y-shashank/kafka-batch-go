@@ -34,6 +34,17 @@ type Outcome struct {
 	DLTPayload   []byte
 	DLTKey       string
 	Event        *protocol.EventMessage
+	// AckCancelJobID, when non-empty, is a cancelled job whose id must be removed
+	// from the cancel set — but only AFTER the outcome is durably produced and the
+	// record is committed. Acknowledging inside Process (before the failed event /
+	// DLT is durable) let a produce failure redeliver the record with the id
+	// already gone, so ShouldSkip would return false and the cancelled job would
+	// run. The caller acks this only once applyRetryOutcome succeeds.
+	AckCancelJobID string
+	// Failure, when non-empty, is a per-job failure row to persist for the Web UI
+	// (expired-in-retry job). Mirrors the job/expiry consumers; the default
+	// Redis-backed store has no FailureRecorder so this is a no-op there.
+	Failure *jobexpiry.FailureRecord
 }
 
 func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.SourceCoords) (Outcome, error) {
@@ -55,7 +66,10 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 		if ev := failedEvent(m, src); ev != nil {
 			out.Event = ev
 		}
-		p.Cancel.Acknowledge(ctx, jobID)
+		// Defer the cancel-set Acknowledge until after the record is durably
+		// handled/committed (see Outcome.AckCancelJobID). Acknowledging here would
+		// let a produce failure redeliver a cancelled job that then runs.
+		out.AckCancelJobID = jobID
 		return out, nil
 	}
 
@@ -75,6 +89,9 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 		out.Event = drop.Event
 		out.DLTPayload = drop.DLTPayload
 		out.DLTKey = drop.DLTKey
+		// Persist the failure row (Web UI parity with the job/expiry consumers).
+		// The other two expiry paths record this; retry previously dropped it.
+		out.Failure = drop.Failure
 		return out, nil
 	}
 

@@ -82,6 +82,19 @@ func (p *Processor) Process(ctx context.Context, raw []byte) (Outcome, error) {
 	if p.Invoker == nil {
 		return out, nil
 	}
+	// Idempotency guard (M1): the partition consumer commits a whole poll batch
+	// atomically, so a later record's transient error — or a rebalance/restart —
+	// redelivers the entire batch. Preclaimed callbacks skip ClaimCallback, so
+	// without this guard an already-invoked callback would fire again. Claim the
+	// per-kind invoke marker exactly once; a loser (already invoked) skips.
+	if p.Store != nil {
+		won, err := p.Store.MarkCallbackInvoked(ctx, cb.BatchID, claimKind(cb.Outcome))
+		if err != nil {
+			log.Printf("[kbatch-daemon] callback invoke-guard batch_id=%s: %v", cb.BatchID, err)
+		} else if !won {
+			return out, nil // already invoked by a prior (redelivered) attempt
+		}
+	}
 	if err := p.Invoker.Invoke(ctx, cb); err != nil {
 		log.Printf("[kbatch-daemon] callback invoke batch_id=%s: %v", cb.BatchID, err)
 		method := callbackMethod(cb)

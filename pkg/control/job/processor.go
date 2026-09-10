@@ -259,9 +259,11 @@ func buildFairDeferPayload(raw []byte, retryAt time.Time, retryTo string) ([]byt
 
 func (p *Processor) handleFailure(ctx context.Context, job protocol.JobMessage, raw []byte, src protocol.SourceCoords, execErr error) (Outcome, error) {
 	out := Outcome{CommitOffset: true}
-	maxRetries := job.MaxRetries
-	if maxRetries == 0 {
-		maxRetries = p.Cfg.MaxRetries
+	// Absent max_retries → configured default; an explicit value (including 0,
+	// "run once") is honored (Ruby data.fetch parity). See protocol.JobMessage.
+	maxRetries := p.Cfg.MaxRetries
+	if job.MaxRetries != nil {
+		maxRetries = *job.MaxRetries
 	}
 
 	if nonRetryable(execErr) {

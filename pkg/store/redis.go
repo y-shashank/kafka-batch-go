@@ -277,6 +277,28 @@ func (s *RedisStore) ClaimCallback(ctx context.Context, batchID, nodeID string, 
 	return res == 1, err
 }
 
+// MarkCallbackInvoked claims the right to invoke a batch callback of the given
+// kind ("success" or "complete") exactly once. Returns true only for the first
+// caller — used to make callback invocation idempotent so a whole-batch
+// redelivery (or a preclaimed callback that skips ClaimCallback) cannot re-fire
+// an already-run callback. A nil/unconfigured store or Redis error returns true
+// (fail-open: prefer at-least-once invocation over silently dropping a callback).
+func (s *RedisStore) MarkCallbackInvoked(ctx context.Context, batchID, kind string) (bool, error) {
+	if s == nil || s.client == nil || batchID == "" {
+		return true, nil
+	}
+	field := "complete_callback_invoked_at"
+	if kind == "success" {
+		field = "success_callback_invoked_at"
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := invokeCallbackScript.Run(ctx, s.client, []string{batchKey(batchID)}, field, now).Int()
+	if err != nil {
+		return true, err
+	}
+	return res == 1, nil
+}
+
 // RecordCallbackRunner writes callback_dispatched_by for the UI "Callback ran on"
 // field. Needed when events Lua already preclaimed claim stamps (preclaimed:true)
 // so ClaimCallback is skipped and would leave the field blank.

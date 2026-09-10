@@ -32,7 +32,26 @@ const (
 	defaultLeaseTTL    = 2 * time.Minute
 	defaultHeartbeatTTL = 180 * time.Second
 	producedMarkerTTL  = time.Hour
+	// reclaimSafetyBuffer covers the reclaim-loop interval (default 30s) plus a
+	// margin, used by the lease-TTL floor below.
+	reclaimSafetyBuffer = 60 * time.Second
 )
+
+// floorLeaseTTL enforces the invariant that a claim's payload lease must outlive
+// the window in which reclaim can act on a dead consumer: lease >
+// heartbeat_ttl + orphan_grace + reclaim_interval. Reclaim only re-produces a
+// crashed consumer's in-flight jobs once its live:consumer heartbeat has expired
+// (up to hbTTL after death); if the payload lease expires first, ListOrphans
+// finds an index entry with no payload and can only prune it — the job is lost
+// (its Kafka offset was already committed at claim). The shipped daemon raises
+// the lease before claiming (pkg/daemon/superfetch.go), but enforcing the floor
+// here too means a direct pkg/workset.Store caller cannot bypass the invariant.
+func floorLeaseTTL(lease, hbTTL, grace time.Duration) time.Duration {
+	if min := hbTTL + grace + reclaimSafetyBuffer; lease < min {
+		return min
+	}
+	return lease
+}
 
 // Entry is one in-flight job owned by a consumer.
 type Entry struct {
@@ -126,6 +145,7 @@ func (s *Store) Claim(ctx context.Context, p ClaimParams) (ClaimResult, error) {
 		hbTTL = defaultHeartbeatTTL
 	}
 	grace := resolveGrace(p.StealGrace)
+	ttl = floorLeaseTTL(ttl, hbTTL, grace)
 	fence := uuid.NewString()
 	now := time.Now().UTC()
 	entry := &Entry{
@@ -207,6 +227,7 @@ func (s *Store) ClaimMany(ctx context.Context, params []ClaimParams) ([]ClaimRes
 			hbTTL = defaultHeartbeatTTL
 		}
 		grace := resolveGrace(p.StealGrace)
+		ttl = floorLeaseTTL(ttl, hbTTL, grace)
 		fence := uuid.NewString()
 		entry := &Entry{
 			JobID:         p.JobID,

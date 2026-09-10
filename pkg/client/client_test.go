@@ -62,7 +62,7 @@ func TestBuildMessageGoHandler(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if msg.WorkerClass != "go:echo" || msg.MaxRetries != 5 {
+	if msg.WorkerClass != "go:echo" || (msg.MaxRetries == nil || *msg.MaxRetries != 5) {
 		t.Fatalf("msg %+v", msg)
 	}
 	if msg.UniqFP == "" {

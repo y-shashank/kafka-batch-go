@@ -47,7 +47,7 @@ func TestProcessSuccessEmitsEvent(t *testing.T) {
 	seq := int64(1)
 	raw, _ := json.Marshal(protocol.JobMessage{
 		JobID: "j1", BatchID: &batchID, JobType: "test.echo", WorkerClass: "go:test.echo",
-		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3, BatchSeq: &seq,
+		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: protocol.IntPtr(3), BatchSeq: &seq,
 	})
 
 	p := &Processor{Cfg: config.DefaultDaemon(), Store: st, Producer: &memProducer{}}
@@ -75,7 +75,7 @@ func TestProcessHandlerErrorSchedulesRetry(t *testing.T) {
 
 	raw, _ := json.Marshal(protocol.JobMessage{
 		JobID: "j1", JobType: "test.fail", WorkerClass: "go:test.fail",
-		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3,
+		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: protocol.IntPtr(3),
 	})
 
 	cfg := config.DefaultDaemon()
@@ -106,7 +106,7 @@ func TestProcessHandlerErrorEmitsExecutedForBatch(t *testing.T) {
 	seq := int64(1)
 	raw, _ := json.Marshal(protocol.JobMessage{
 		JobID: "j1", BatchID: &batchID, JobType: "test.fail2", WorkerClass: "go:test.fail2",
-		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3, BatchSeq: &seq,
+		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: protocol.IntPtr(3), BatchSeq: &seq,
 	})
 
 	cfg := config.DefaultDaemon()
@@ -160,7 +160,7 @@ func TestProcessRubyRuntimeJobDLTWithoutRetry(t *testing.T) {
 
 	raw, _ := json.Marshal(protocol.JobMessage{
 		JobID: "j1", JobType: "ruby.missing", WorkerClass: "Missing",
-		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3,
+		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: protocol.IntPtr(3),
 	})
 	manifest := config.Manifest{Handlers: map[string]config.HandlerEntry{
 		"ruby.missing": {Runtime: "ruby", Topic: "jobs"},
@@ -203,7 +203,7 @@ func TestProcessCancelledBatchSkipsHandlerViaCache(t *testing.T) {
 	seq := int64(1)
 	raw, _ := json.Marshal(protocol.JobMessage{
 		JobID: "j1", BatchID: &batchID, JobType: "test.cancel", WorkerClass: "go:test.cancel",
-		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3, BatchSeq: &seq,
+		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: protocol.IntPtr(3), BatchSeq: &seq,
 	})
 
 	cache := cancellation.New(2*time.Minute, st.CancelledBatchIDs)
@@ -250,7 +250,7 @@ func TestProcessRetriesExhaustedHookBeforeDLT(t *testing.T) {
 
 	raw, _ := json.Marshal(protocol.JobMessage{
 		JobID: "j1", JobType: "test.exhaust", WorkerClass: "go:test.exhaust",
-		Payload: map[string]interface{}{}, Attempt: 3, MaxRetries: 3,
+		Payload: map[string]interface{}{}, Attempt: 3, MaxRetries: protocol.IntPtr(3),
 	})
 	p := &Processor{Cfg: config.DefaultDaemon(), Store: st, Producer: &memProducer{}}
 	out, err := p.Process(context.Background(), raw, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 9})
@@ -262,6 +262,35 @@ func TestProcessRetriesExhaustedHookBeforeDLT(t *testing.T) {
 	}
 	if out.DLTPayload == nil {
 		t.Fatal("expected DLT after hook")
+	}
+}
+
+// M3: an explicit max_retries:0 ("run once") must be honored — the failing job
+// goes terminal (DLT) immediately, NOT retried up to the config default.
+func TestProcessExplicitZeroMaxRetriesRunsOnce(t *testing.T) {
+	kbatch.Reset()
+	kbatch.Register("test.once", func(ctx *kbatch.Context) error {
+		return &kbatch.HandlerError{Class: "Boom", Message: "boom"}
+	})
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := store.NewRedisStore(rdb, time.Hour)
+
+	raw, _ := json.Marshal(protocol.JobMessage{
+		JobID: "j1", JobType: "test.once", WorkerClass: "go:test.once",
+		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: protocol.IntPtr(0),
+	})
+	// Config default is high; the explicit 0 must win.
+	p := &Processor{Cfg: config.DefaultDaemon(), Store: st, Producer: &memProducer{}}
+	out, err := p.Process(context.Background(), raw, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.RetryTopic != "" || out.RetryPayload != nil {
+		t.Fatalf("max_retries:0 must not retry, got retry to %q", out.RetryTopic)
+	}
+	if out.DLTPayload == nil {
+		t.Fatal("max_retries:0 failure should go terminal (DLT)")
 	}
 }
 
@@ -282,7 +311,7 @@ func TestProcessRetryDoesNotCacheRetryingInRedis(t *testing.T) {
 	seq := int64(1)
 	rawFail, _ := json.Marshal(protocol.JobMessage{
 		JobID: "j1", BatchID: &batchID, JobType: "test.flip", WorkerClass: "go:test.flip",
-		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3,
+		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: protocol.IntPtr(3),
 		BatchSeq: &seq,
 	})
 	p := &Processor{Cfg: config.DefaultDaemon(), Store: st, Producer: &memProducer{},
@@ -301,7 +330,7 @@ func TestProcessRetryDoesNotCacheRetryingInRedis(t *testing.T) {
 
 	rawOK, _ := json.Marshal(protocol.JobMessage{
 		JobID: "j1", BatchID: &batchID, JobType: "test.flip", WorkerClass: "go:test.flip",
-		Payload: map[string]interface{}{}, Attempt: 1, MaxRetries: 3,
+		Payload: map[string]interface{}{}, Attempt: 1, MaxRetries: protocol.IntPtr(3),
 		BatchSeq: &seq,
 	})
 	out, err = p.Process(context.Background(), rawOK, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 11})
@@ -359,7 +388,7 @@ func TestProcessJobLiveness(t *testing.T) {
 
 	raw, _ := json.Marshal(protocol.JobMessage{
 		JobID: "j1", JobType: "test.live", WorkerClass: "go:test.live",
-		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3,
+		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: protocol.IntPtr(3),
 	})
 	p := &Processor{Cfg: config.DefaultDaemon(), Store: st, Producer: &memProducer{}, Liveness: rep}
 	_, err := p.Process(context.Background(), raw, protocol.SourceCoords{Topic: "jobs", Partition: 1, Offset: 12})

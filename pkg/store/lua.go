@@ -189,6 +189,17 @@ end
 return won
 `
 
+// invokeCallbackLua claims the right to INVOKE a batch callback of one kind
+// exactly once, even across redeliveries. This is distinct from the dispatch
+// claim stamp: a preclaimed callback skips ClaimCallback, so without this guard a
+// whole-batch redelivery (a later record's transient error, or a rebalance /
+// restart) would re-invoke an already-run callback. Returns 1 for the first
+// caller only; 0 if already invoked. If the batch hash is gone (expired) there is
+// nothing to dedup against, so it returns 1 (invoke) rather than silently drop.
+const invokeCallbackLua = `
+if redis.call('EXISTS', KEYS[1]) == 0 then return 1 end
+return redis.call('HSETNX', KEYS[1], ARGV[1], ARGV[2])`
+
 // EXISTS-guarded write of callback_dispatched_by (UI "Callback ran on").
 // Used when ledger Lua already preclaimed claim stamps so ClaimCallback is skipped.
 const recordCallbackRunnerLua = `
@@ -347,6 +358,7 @@ return 1
 var (
 	batchDoneJobScript          = redis.NewScript(batchDoneJobLua)
 	claimCallbackScript         = redis.NewScript(claimCallbackLua)
+	invokeCallbackScript        = redis.NewScript(invokeCallbackLua)
 	recordCallbackRunnerScript  = redis.NewScript(recordCallbackRunnerLua)
 	createBatchScript           = redis.NewScript(createBatchLua)
 	addJobsScript               = redis.NewScript(addJobsLua)

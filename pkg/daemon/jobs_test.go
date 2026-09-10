@@ -61,7 +61,7 @@ func TestJobHandlerPathBatchSuccessEmitsEvent(t *testing.T) {
 	raw, _ := json.Marshal(protocol.JobMessage{
 		JobID: "j1", BatchID: &batchID, BatchSeq: &seq,
 		JobType: "test.echo", WorkerClass: "go:test.echo",
-		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3,
+		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: protocol.IntPtr(3),
 	})
 	prod, err := runJobHandler(t, raw, cfg, st)
 	if err != nil {

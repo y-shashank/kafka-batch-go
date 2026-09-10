@@ -155,8 +155,19 @@ func TestProcessSkipsCancelledBeforePause(t *testing.T) {
 	if out.Event == nil || out.Event.Status != "failed" {
 		t.Fatalf("expected failed event, got %+v", out.Event)
 	}
+	// Process must NOT ack the cancel set itself — it defers to the caller via
+	// AckCancelJobID so the ack only happens after the outcome is durably
+	// committed (M6). The id therefore stays in the set until the caller acks.
+	if out.AckCancelJobID != "j1" {
+		t.Fatalf("expected AckCancelJobID=j1, got %q", out.AckCancelJobID)
+	}
+	if !cancel.Cancelled(ctx, "j1") {
+		t.Fatal("Process must not ack the cancel set before durable commit")
+	}
+	// Simulate the caller acking after a successful applyRetryOutcome.
+	cancel.Acknowledge(ctx, out.AckCancelJobID)
 	if cancel.Cancelled(ctx, "j1") {
-		t.Fatal("should acknowledge cancel")
+		t.Fatal("caller ack should have removed the id")
 	}
 }
 

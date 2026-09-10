@@ -22,7 +22,7 @@ func (c *Client) buildMessage(entry config.HandlerEntry, jobType string, payload
 		WorkerClass:          workerName,
 		Payload:              payload,
 		Attempt:    0,
-		MaxRetries: c.maxRetries(entry),
+		MaxRetries: intPtr(c.maxRetries(entry)),
 		EnqueuedAt: protocol.NowISO(),
 	}
 	if tid := opts.tenantID(""); tid != "" {
@@ -52,6 +52,8 @@ func workerClassName(entry config.HandlerEntry, jobType string) string {
 	}
 	return "go:" + jobType
 }
+
+func intPtr(n int) *int { return &n }
 
 func (c *Client) maxRetries(entry config.HandlerEntry) int {
 	if entry.MaxRetries > 0 {

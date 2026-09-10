@@ -23,7 +23,7 @@ func TestRunRetriesExhaustedInvokesHook(t *testing.T) {
 	job := protocol.JobMessage{
 		JobID: "j1", BatchID: &batchID, JobType: "test.hook",
 		WorkerClass: "go:test.hook", Payload: map[string]interface{}{"x": 1},
-		Attempt: 3, MaxRetries: 3,
+		Attempt: 3, MaxRetries: protocol.IntPtr(3),
 	}
 	if !RunRetriesExhausted(job, &HandlerError{Class: "Boom", Message: "boom"}, 3) {
 		t.Fatal("expected hook to run")

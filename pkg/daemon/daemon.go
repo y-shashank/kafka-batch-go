@@ -212,7 +212,28 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 			if err != nil {
 				return err
 			}
-			return applyRetryOutcome(ctx, cfg, prod, out, src)
+			if err := applyRetryOutcome(ctx, cfg, prod, out, src); err != nil {
+				// Not durably handled — do NOT ack the cancel set (else a
+				// cancelled job would run on redelivery) and let it redeliver.
+				return err
+			}
+			// Durable now: safe to ack the cancel set (M6) and persist the
+			// expired-in-retry failure row (M2). Both best-effort.
+			if out.AckCancelJobID != "" {
+				retryCancel.Acknowledge(ctx, out.AckCancelJobID)
+			}
+			if out.Failure != nil && failures != nil {
+				_ = failures.RecordFailure(ctx, store.FailureEntry{
+					BatchID:      out.Failure.BatchID,
+					JobID:        out.Failure.JobID,
+					WorkerClass:  out.Failure.WorkerClass,
+					ErrorClass:   out.Failure.ErrorClass,
+					ErrorMessage: out.Failure.ErrorMessage,
+					Attempt:      out.Failure.Attempt,
+					Status:       out.Failure.Status,
+				})
+			}
+			return nil
 		}, consumerHealth, nil, live, loopHealth)
 	log.Printf("kbatch retry consumer group=%s topics=%v (one client)",
 		retryGroup, retryTopics)

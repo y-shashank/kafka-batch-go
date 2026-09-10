@@ -209,3 +209,36 @@ func TestProcessMalformedCallbackJSON(t *testing.T) {
 		t.Fatalf("failed=%d dlt_events=%d dlt_calls=%d", failed, dlt, dltSpy.calls)
 	}
 }
+
+// M1: a preclaimed callback that is re-delivered (whole-batch redelivery) must
+// be invoked only ONCE — the per-kind invoke marker dedups the second attempt.
+func TestPreclaimedCallbackInvokedOnceAcrossRedelivery(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := store.NewRedisStore(rdb, time.Hour)
+
+	batchID := "cb-redeliver"
+	now := time.Now().UTC().Format(time.RFC3339)
+	mr.HSet("kafka_batch:b:"+batchID,
+		"id", batchID, "status", "success", "total_jobs", "1",
+		"completed_count", "1", "failed_count", "0", "locked_at", now,
+		// Events Lua preclaimed the dispatch stamps already.
+		"complete_callback_dispatched_at", now, "success_callback_dispatched_at", now,
+	)
+
+	inv := &spyInvoker{}
+	p := &Processor{Store: st, Invoker: inv, NodeID: "node-1"}
+	raw, _ := json.Marshal(protocol.CallbackMessage{
+		BatchID: batchID, Outcome: "success", Preclaimed: true, TotalJobs: 1, CompletedCount: 1,
+	})
+
+	// First delivery invokes; a redelivery of the same preclaimed message must not.
+	for i := 0; i < 3; i++ {
+		if _, err := p.Process(context.Background(), raw); err != nil {
+			t.Fatalf("process %d: %v", i, err)
+		}
+	}
+	if len(inv.calls) != 1 {
+		t.Fatalf("preclaimed callback invoked %d times, want 1", len(inv.calls))
+	}
+}
